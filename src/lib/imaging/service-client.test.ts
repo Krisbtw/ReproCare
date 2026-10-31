@@ -164,3 +164,15 @@ test("checkHealth validates the shape", async () => {
   const bad = await checkHealth("http://svc", async () => fakeResponse(200, { status: "ok" }));
   assert.equal(bad.ok, false);
 });
+
+test("service-client passes Authorization header when token is supplied", async () => {
+  let passedAuth: string | undefined;
+  const fakeFetch = (async (_url: string, init?: RequestInit) => {
+    passedAuth = (init?.headers as Record<string, string>)?.["Authorization"];
+    return fakeResponse(200, service());
+  }) as unknown as typeof fetch;
+
+  const res = await inspectWithService("http://svc", [{ name: "s0.dcm", bytes: new Uint8Array(4) }], fakeFetch, 5000, "my-secret-token");
+  assert.ok(res.ok);
+  assert.equal(passedAuth, "Bearer my-secret-token");
+});

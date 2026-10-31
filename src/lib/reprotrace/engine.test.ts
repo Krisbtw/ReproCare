@@ -150,3 +150,26 @@ test("explanations do not invent a report", () => {
   assert.ok(bare.paragraphs.every((p) => !p.text.includes("diagnosed")));
   assert.equal(longestOf(null, 12), 12);
 });
+
+test("follow-up registration supports non-provisional match when verified", () => {
+  const regTransform = {
+    translationMm: [1, 1, -1] as [number, number, number],
+    rotation: [
+      [1, 0, 0],
+      [0, 1, 0],
+      [0, 0, 1],
+    ] as [[number, number, number], [number, number, number], [number, number, number]],
+    centerOfRotationMm: [2, 8, 18] as [number, number, number],
+    movingCentroidMm: [3, 9, 17] as [number, number, number],
+  };
+
+  const supported = matchStudies([priorA], [nextA], { supported: true, transform: regTransform });
+  assert.equal(supported[0]?.category, "likely_same");
+  assert.equal(supported[0]?.provisional, false);
+  assert.ok(supported[0]?.rationale.includes("Rigid follow-up image registration verified"));
+
+  const unsupported = matchStudies([priorA], [nextA], { supported: false });
+  assert.notEqual(unsupported[0]?.category, "likely_same");
+  assert.equal(unsupported[0]?.provisional, true);
+  assert.ok(unsupported[0]?.rationale.includes("spatial correspondence could not be established"));
+});

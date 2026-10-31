@@ -214,8 +214,15 @@ export const setRole = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     await ensure(sql, context.userId);
+    const current = await roleOf(sql, context.userId);
+    if (current === "patient" && (data === "clinician" || data === "admin")) {
+      throw new Error("Unauthorized: Role escalation is not permitted. Only an administrator can assign clinician or admin roles.");
+    }
+    if (current === "clinician" && data === "admin") {
+      throw new Error("Unauthorized: Clinicians cannot self-escalate to administrator.");
+    }
     await sql`update profiles set role = ${data} where user_id = ${context.userId}`;
-    await audit(sql, context.userId, "set_role", "profile", context.userId, `Lens set to ${data}. This does not create another account.`);
+    await audit(sql, context.userId, "set_role", "profile", context.userId, `Role set to ${data}.`);
     return { ok: true };
   });
 
@@ -286,8 +293,10 @@ export const addCycle = createServerFn({ method: "POST" })
   })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    const owned = await sql`select id from patients where id = ${data.patientId} and user_id = ${context.userId}`;
+    const role = await roleOf(sql, context.userId);
+    const owned = await sql<{ id: string; is_self: boolean }>`select id, is_self from patients where id = ${data.patientId} and user_id = ${context.userId}`;
     if (!owned.length) throw new Error("Record not found.");
+    if (role === "patient" && !owned[0].is_self) throw new Error("Patient view can add cycles only on your own record.");
     const id = crypto.randomUUID();
     await sql`insert into cycles (id, user_id, patient_id, start_date, length_days, flow, note)
       values (${id}, ${context.userId}, ${data.patientId}, ${data.startDate}, ${data.lengthDays}, ${data.flow}, ${data.note})`;
@@ -309,8 +318,10 @@ export const addLab = createServerFn({ method: "POST" })
   })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    const owned = await sql`select id from patients where id = ${data.patientId} and user_id = ${context.userId}`;
+    const role = await roleOf(sql, context.userId);
+    const owned = await sql<{ id: string; is_self: boolean }>`select id, is_self from patients where id = ${data.patientId} and user_id = ${context.userId}`;
     if (!owned.length) throw new Error("Record not found.");
+    if (role === "patient" && !owned[0].is_self) throw new Error("Patient view can add lab records only on your own record.");
     const id = crypto.randomUUID();
     await sql`insert into labs (id, user_id, patient_id, observed_on, analyte, value_text, unit, reference_text, source_note)
       values (${id}, ${context.userId}, ${data.patientId}, ${data.observedOn}, ${data.analyte}, ${data.valueText}, ${data.unit}, ${data.referenceText}, ${"Entered in the workspace. Not interpreted."})`;
@@ -329,6 +340,16 @@ export const addReview = createServerFn({ method: "POST" })
     const sql = await getSql();
     const role = await roleOf(sql, context.userId);
     if (role === "patient") throw new Error("Verification is a clinician action.");
+    if (data.targetType === "finding_version") {
+      const v = await sql`select id from finding_versions where id = ${data.targetId} and user_id = ${context.userId}`;
+      if (!v.length) throw new Error("Finding version not found or not owned.");
+    } else if (data.targetType === "correspondence") {
+      const c = await sql`select id from correspondences where id = ${data.targetId} and user_id = ${context.userId}`;
+      if (!c.length) throw new Error("Correspondence proposal not found or not owned.");
+    } else if (data.targetType === "discrepancy") {
+      const d = await sql`select id from discrepancies where id = ${data.targetId} and user_id = ${context.userId}`;
+      if (!d.length) throw new Error("Discrepancy not found or not owned.");
+    }
     const id = crypto.randomUUID();
     await sql`insert into reviews (id, user_id, target_type, target_id, status, note)
       values (${id}, ${context.userId}, ${data.targetType}, ${data.targetId}, ${data.status}, ${data.note || "Reviewed."})`;
@@ -347,7 +368,8 @@ export const correctVersion = createServerFn({ method: "POST" })
   })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    if ((await roleOf(sql, context.userId)) === "patient") throw new Error("Edits are a clinician action.");
+    const role = await roleOf(sql, context.userId);
+    if (role === "patient") throw new Error("Edits are a clinician action.");
     const rows = await sql<Record<string, unknown>>`select * from finding_versions where id = ${data.versionId} and user_id = ${context.userId}`;
     const current = rows[0];
     if (!current) throw new Error("Version not found.");
@@ -375,19 +397,51 @@ export const correctVersion = createServerFn({ method: "POST" })
 export const saveLabMeasurement = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .validator(
-    (input: { findingId: string; axes: [number, number, number]; longest: number; sliceIndex: number; reason: string; evidenceNote: string }) => {
+    (input: {
+      findingId: string;
+      axes: [number, number, number];
+      longest: number;
+      sliceIndex: number;
+      reason: string;
+      evidenceNote: string;
+      studyId?: string | null;
+      seriesId?: string | null;
+      centroidMm?: [number, number, number] | null;
+      frame?: string | null;
+      newStudy?: {
+        patientId: string;
+        modality?: string;
+        studyDate?: string;
+        description?: string;
+        accession?: string;
+        sourceNote?: string;
+      };
+      newSeries?: {
+        seriesNumber?: number;
+        description?: string;
+        plane?: string;
+        sliceCount?: number;
+        pixelSpacingMm?: string;
+        sliceThicknessMm?: number;
+      };
+    }) => {
       if (!Array.isArray(input.axes) || input.axes.length !== 3 || input.axes.some((n) => !Number.isFinite(n) || n <= 0 || n > 300)) {
         throw new Error("Axes must be three positive millimetre values.");
       }
       if (!Number.isFinite(input.longest) || input.longest <= 0 || input.longest > 300) throw new Error("Longest extent must be 0 to 300 mm.");
       if (!Number.isInteger(input.sliceIndex) || input.sliceIndex < 0 || input.sliceIndex > 5000) throw new Error("Slice index is not valid.");
       if (input.reason.trim().length < 8) throw new Error("Say why the measurement was recorded.");
-      return { ...input, reason: input.reason.trim().slice(0, 500), evidenceNote: input.evidenceNote.trim().slice(0, 1500) };
+      return {
+        ...input,
+        reason: input.reason.trim().slice(0, 500),
+        evidenceNote: input.evidenceNote.trim().slice(0, 1500),
+      };
     },
   )
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    if ((await roleOf(sql, context.userId)) === "patient") throw new Error("Recording a measurement is a clinician action.");
+    const role = await roleOf(sql, context.userId);
+    if (role === "patient") throw new Error("Recording a measurement is a clinician action.");
     const id = await insertLabVersion(sql, context.userId, data);
     await audit(sql, context.userId, "new_version", "finding_version", id, "Volume lab measurement recorded as a new version. Prior versions were not overwritten.");
     return { ok: true, id };
@@ -401,13 +455,31 @@ export const decideCorrespondence = createServerFn({ method: "POST" })
   })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    if ((await roleOf(sql, context.userId)) === "patient") throw new Error("Correspondence decisions are a clinician action.");
+    const role = await roleOf(sql, context.userId);
+    if (role === "patient") throw new Error("Correspondence decisions are a clinician action.");
     const rows = await sql`select id from correspondences where id = ${data.correspondenceId} and user_id = ${context.userId}`;
     if (!rows.length) throw new Error("Proposal not found.");
     const id = crypto.randomUUID();
     await sql`insert into correspondence_decisions (id, user_id, correspondence_id, decision, note)
       values (${id}, ${context.userId}, ${data.correspondenceId}, ${data.decision}, ${data.note || "Decision recorded. Findings were not merged."})`;
     await audit(sql, context.userId, "correspondence_decision", "correspondence", data.correspondenceId, `${data.decision}. Records were not merged.`);
+    return { ok: true };
+  });
+
+export const resolveDiscrepancy = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { discrepancyId: string; resolution: string; note: string }) => {
+    if (!["acknowledged", "resolved", "dismissed"].includes(input.resolution)) throw new Error("Unknown resolution.");
+    return { ...input, note: input.note.trim().slice(0, 400) };
+  })
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    const role = await roleOf(sql, context.userId);
+    if (role === "patient") throw new Error("Discrepancy resolution is a clinician action.");
+    const rows = await sql`select id from discrepancies where id = ${data.discrepancyId} and user_id = ${context.userId}`;
+    if (!rows.length) throw new Error("Discrepancy not found or not owned.");
+    await sql`update discrepancies set active = false where id = ${data.discrepancyId} and user_id = ${context.userId}`;
+    await audit(sql, context.userId, "resolve_discrepancy", "discrepancy", data.discrepancyId, `${data.resolution}: ${data.note}`);
     return { ok: true };
   });
 
@@ -436,8 +508,10 @@ export const exportRecord = createServerFn({ method: "POST" })
   .validator((patientId: string) => patientId)
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    const patient = await sql`select * from patients where id = ${data} and user_id = ${context.userId}`;
+    const role = await roleOf(sql, context.userId);
+    const patient = await sql<{ id: string; is_self: boolean }>`select * from patients where id = ${data} and user_id = ${context.userId}`;
     if (!patient[0]) throw new Error("Record not found.");
+    if (role === "patient" && !patient[0].is_self) throw new Error("Patient view can export only your own record.");
     const studies = await sql`select * from studies where patient_id = ${data} and user_id = ${context.userId}`;
     const findings = await sql`select * from findings where patient_id = ${data} and user_id = ${context.userId}`;
     const findingIds = (findings as { id: string }[]).map((f) => f.id);

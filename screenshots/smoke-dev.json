@@ -1,0 +1,38 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "AnatomyBridge",
+      "hasCanvas": false,
+      "bodyTextLen": 89,
+      "bodyTextHash": "98a6f9ab481b0545db6e81b1926a217411f07d9c8e94d58d946064ab34b4abd0",
+      "bodyTextPrefix": "AnatomyBridge Checking your session The synthetic clinic opens o",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "C:\\Users\\krisj\\Desktop\\Medtech\\screenshots\\smoke-dev.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "AnatomyBridge",
+      "hasCanvas": false,
+      "bodyTextLen": 240,
+      "bodyTextHash": "8732ab0dd76a03232a47ae4cbee4160b21543403b4cefcc9b3cdc4f7c93c5b52",
+      "bodyTextPrefix": "AnatomyBridge Sign in to the synthetic clinic Accounts are real.",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "C:\\Users\\krisj\\Desktop\\Medtech\\screenshots\\smoke-dev-mobile.png"
+    }
+  },
+  "brandWarnings": [
+    "BRAND NOTE: no custom public/og.jpg — the platform will serve the og.grok.me placeholder. Custom cards are the default for games of every kind (DOM board/word games included), whimsical apps, creative tools, and brand-forward pages — only plain utilities (converters, CRUD trackers, admin dashboards) keep the placeholder. If this app is not a plain utility, finish the brand-asset pass per \\workspace\\.grok\\skills\\og\\SKILL.md."
+  ],
+  "authWarnings": [],
+  "verdictFile": "C:\\Users\\krisj\\Desktop\\Medtech\\screenshots\\smoke-dev.json"
+}

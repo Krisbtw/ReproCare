@@ -55,3 +55,77 @@ test("second record makes v3; other user's finding and unknown finding are refus
   await assert.rejects(() => insertLabVersion(sql, "u2", input), /Finding not found/);
   await assert.rejects(() => insertLabVersion(sql, "u1", { ...input, findingId: "nope" }), /Finding not found/);
 });
+
+test("genuinely links newly uploaded study and records patient coordinates in centroid_mm", async () => {
+  const { pg, sql } = await makeDb();
+  await pg.exec(`
+    insert into studies (id,user_id,patient_id,modality,study_date,description,accession,source_note)
+      values ('s2','u1','p1','MR','2026-06-15','Follow-up pelvic MRI','ACC-002','DICOM upload');
+    insert into series (id,user_id,study_id,series_number,description,plane)
+      values ('ser2','u1','s2',2,'T2 Sagittal','sagittal');
+  `);
+
+  const id = await insertLabVersion(sql, "u1", {
+    ...input,
+    studyId: "s2",
+    seriesId: "ser2",
+    centroidMm: [-12.5, 45.0, 108.2],
+    frame: "dicom_lps",
+    reason: "Measured on follow-up study",
+  });
+
+  const row = (await pg.query("select * from finding_versions where id = $1", [id])).rows[0] as Record<string, unknown>;
+  assert.equal(row.study_id, "s2");
+  const obs = row.observed_on instanceof Date ? row.observed_on.toISOString().slice(0, 10) : String(row.observed_on).slice(0, 10);
+  assert.equal(obs, "2026-06-15");
+  assert.equal(row.frame, "dicom_lps");
+  assert.equal(row.centroid_mm, "[-12.5,45,108.2]");
+
+  const ev = (await pg.query("select * from evidence_links where finding_version_id = $1", [id])).rows[0] as Record<string, unknown>;
+  assert.equal(ev.study_id, "s2");
+  assert.equal(ev.series_id, "ser2");
+});
+
+test("creates and links newly registered study and series with provenance", async () => {
+  const { pg, sql } = await makeDb();
+  const id = await insertLabVersion(sql, "u1", {
+    ...input,
+    centroidMm: [10, 20, 30],
+    frame: "dicom_lps",
+    reason: "New study uploaded during clinic visit",
+    newStudy: {
+      patientId: "p1",
+      modality: "MR",
+      studyDate: "2026-07-20",
+      description: "Pelvic MRI with IV Contrast",
+      accession: "ACC-UPLOAD-01",
+      sourceNote: "Real DICOM upload",
+    },
+    newSeries: {
+      seriesNumber: 3,
+      description: "T2 Axial Pelvis",
+      plane: "axial",
+      sliceCount: 48,
+      pixelSpacingMm: "0.8\\0.8",
+      sliceThicknessMm: 3.0,
+    },
+  });
+
+  const row = (await pg.query("select * from finding_versions where id = $1", [id])).rows[0] as Record<string, unknown>;
+  assert.notEqual(row.study_id, "s1");
+  const obs = row.observed_on instanceof Date ? row.observed_on.toISOString().slice(0, 10) : String(row.observed_on).slice(0, 10);
+  assert.equal(obs, "2026-07-20");
+  assert.equal(row.frame, "dicom_lps");
+
+  const study = (await pg.query("select * from studies where id = $1", [row.study_id])).rows[0] as Record<string, unknown>;
+  assert.equal(study.accession, "ACC-UPLOAD-01");
+  assert.equal(study.description, "Pelvic MRI with IV Contrast");
+
+  const ev = (await pg.query("select * from evidence_links where finding_version_id = $1", [id])).rows[0] as Record<string, unknown>;
+  assert.equal(ev.study_id, row.study_id);
+  assert.ok(ev.series_id);
+
+  const series = (await pg.query("select * from series where id = $1", [ev.series_id])).rows[0] as Record<string, unknown>;
+  assert.equal(series.description, "T2 Axial Pelvis");
+  assert.equal(series.slice_count, 48);
+});

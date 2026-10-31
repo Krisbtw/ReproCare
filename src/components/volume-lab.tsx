@@ -22,6 +22,15 @@ import { fnv1a, versionFromLab } from "@/lib/imaging/finding-link";
 import { segmentFromSeed, windowFromSeed, type SegmentResult } from "@/lib/imaging/segment";
 import type { Vec3, Volume } from "@/lib/imaging/volume";
 import { checkHealth, compareReports, inspectWithService, serviceUrl, type CrossCheck, type ServiceSeriesReport } from "@/lib/imaging/service-client";
+import {
+  normalisePercentile,
+  normaliseZScore,
+  gaussianSmooth,
+  medianFilter,
+  qualityIndicators,
+  type OpRecord,
+} from "@/lib/imaging/preprocess";
+import { transformMeshToPatient, imageMmToPatient } from "@/lib/imaging/patient-coords";
 import { PlaneView } from "./plane-view";
 import { VolumeStage, type VolumeStageHandle } from "./volume-stage";
 
@@ -48,7 +57,34 @@ type Seg = {
   at: Date;
 };
 type FindingChoice = { id: string; label: string };
-export type RecordFindingInput = { findingId: string; axes: [number, number, number]; longest: number; sliceIndex: number; reason: string; evidenceNote: string };
+export type RecordFindingInput = {
+  findingId: string;
+  axes: [number, number, number];
+  longest: number;
+  sliceIndex: number;
+  reason: string;
+  evidenceNote: string;
+  studyId?: string | null;
+  seriesId?: string | null;
+  centroidMm?: [number, number, number] | null;
+  frame?: string | null;
+  newStudy?: {
+    patientId: string;
+    modality?: string;
+    studyDate?: string;
+    description?: string;
+    accession?: string;
+    sourceNote?: string;
+  };
+  newSeries?: {
+    seriesNumber?: number;
+    description?: string;
+    plane?: string;
+    sliceCount?: number;
+    pixelSpacingMm?: string;
+    sliceThicknessMm?: number;
+  };
+};
 type Params = { mode: "auto" | "manual"; k: number; radius: number; close: number; lower: string; upper: string; smooth: number };
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 30));
@@ -190,10 +226,12 @@ function HistogramBars({
 
 export function VolumeLab({
   findings = [],
+  patientId,
   onRecord,
   recordFinding,
 }: {
   findings?: FindingChoice[];
+  patientId?: string;
   onRecord?: (task: () => Promise<unknown>) => Promise<void>;
   recordFinding?: (input: RecordFindingInput) => Promise<unknown>;
 }) {
@@ -223,6 +261,10 @@ export function VolumeLab({
   const [seriesFiles, setSeriesFiles] = useState<{ name: string; bytes: Uint8Array }[]>([]);
   const [cross, setCross] = useState<CrossState>({ phase: "idle" });
 
+  const [rawVolume, setRawVolume] = useState<Volume | null>(null);
+  const [preprocessHistory, setPreprocessHistory] = useState<OpRecord[]>([]);
+  const [gaussSigma, setGaussSigma] = useState(1.0);
+
   const fileInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
   const stage = useRef<VolumeStageHandle>(null);
@@ -243,6 +285,98 @@ export function VolumeLab({
     setShowSteps(false);
   }
 
+  function applyGaussian() {
+    if (!volume || !opened) return;
+    setStatus("Applying Gaussian smoothing…");
+    void (async () => {
+      await tick();
+      try {
+        const res = gaussianSmooth(volume, gaussSigma);
+        setOpened((o) => (o ? { ...o, volume: res.volume } : null));
+        setPreprocessHistory((prev) => [...prev, res.record]);
+        setHist(histogram(res.volume));
+        resetWork();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Gaussian filter failed.");
+      } finally {
+        setStatus(null);
+      }
+    })();
+  }
+
+  function applyMedian() {
+    if (!volume || !opened) return;
+    setStatus("Applying 3×3×3 median filter…");
+    void (async () => {
+      await tick();
+      try {
+        const res = medianFilter(volume);
+        setOpened((o) => (o ? { ...o, volume: res.volume } : null));
+        setPreprocessHistory((prev) => [...prev, res.record]);
+        setHist(histogram(res.volume));
+        resetWork();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Median filter failed.");
+      } finally {
+        setStatus(null);
+      }
+    })();
+  }
+
+  function applyPercentile() {
+    if (!volume || !opened) return;
+    setStatus("Normalizing percentiles (0.5%–99.5%)…");
+    void (async () => {
+      await tick();
+      try {
+        const res = normalisePercentile(volume, 0.5, 99.5);
+        setOpened((o) => (o ? { ...o, volume: res.volume } : null));
+        setPreprocessHistory((prev) => [...prev, res.record]);
+        setHist(histogram(res.volume));
+        const w = autoWindow(res.volume);
+        setWin({ center: w.center, width: w.width });
+        resetWork();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Percentile normalization failed.");
+      } finally {
+        setStatus(null);
+      }
+    })();
+  }
+
+  function applyZScore() {
+    if (!volume || !opened) return;
+    setStatus("Normalizing Z-scores…");
+    void (async () => {
+      await tick();
+      try {
+        const res = normaliseZScore(volume);
+        setOpened((o) => (o ? { ...o, volume: res.volume } : null));
+        setPreprocessHistory((prev) => [...prev, res.record]);
+        setHist(histogram(res.volume));
+        const w = autoWindow(res.volume);
+        setWin({ center: w.center, width: w.width });
+        resetWork();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Z-score normalization failed.");
+      } finally {
+        setStatus(null);
+      }
+    })();
+  }
+
+  function revertPreprocessing() {
+    if (!rawVolume || !opened) return;
+    setOpened((o) => (o ? { ...o, volume: rawVolume } : null));
+    setPreprocessHistory([]);
+    setHist(histogram(rawVolume));
+    const w = autoWindow(rawVolume);
+    setWin({ center: w.center, width: w.width });
+    resetWork();
+  }
+
+  const quality = useMemo(() => (volume ? qualityIndicators(volume) : null), [volume]);
+
   async function open(group: SeriesGroup, parse: (b: Uint8Array) => DataSetLike, source: Source, unreadable: number) {
     setStatus("Checking geometry and stacking the volume…");
     setError(null);
@@ -254,6 +388,8 @@ export function VolumeLab({
       setCross({ phase: "idle" });
       if (series.volume) {
         const v = series.volume;
+        setRawVolume(v);
+        setPreprocessHistory([]);
         const w = autoWindow(v);
         setWin({ center: w.center, width: w.width });
         setHist(histogram(v));
@@ -451,22 +587,38 @@ export function VolumeLab({
   const stale = Boolean(seg && !same(seg.seed, seed));
   const canExport = Boolean(seg && seg.result.accepted && seg.mesh);
 
+  const patientFrame = opened?.series.patientFrame ?? null;
+  const exportMesh = useMemo(() => {
+    if (!seg?.mesh) return null;
+    return patientFrame ? transformMeshToPatient(seg.mesh.mesh, patientFrame) : seg.mesh.mesh;
+  }, [seg?.mesh, patientFrame]);
+
   function makeRecord() {
     if (!opened || !seg) return null;
-    return buildProcessingRecord({
-      now: seg.at,
-      modality: opened.series.modality,
-      seriesDescription: opened.series.seriesDescription,
-      calibrated: opened.series.calibrated,
-      report: opened.series.report,
-      volume: opened.volume,
-      skippedFileCount: opened.series.skipped.length + opened.unreadable,
-      seed: seg.seed,
-      seedValue: seg.seedValue,
-      result: seg.result,
-      measurement: seg.measurement,
-      mesh: seg.mesh ? { quality: seg.mesh.quality, blurIterations: seg.mesh.blurIterations, taubinIterations: seg.mesh.taubinIterations } : null,
-    });
+    return {
+      ...buildProcessingRecord({
+        now: seg.at,
+        modality: opened.series.modality,
+        seriesDescription: opened.series.seriesDescription,
+        calibrated: opened.series.calibrated,
+        report: opened.series.report,
+        volume: opened.volume,
+        skippedFileCount: opened.series.skipped.length + opened.unreadable,
+        seed: seg.seed,
+        seedValue: seg.seedValue,
+        result: seg.result,
+        measurement: seg.measurement,
+        mesh: seg.mesh ? { quality: seg.mesh.quality, blurIterations: seg.mesh.blurIterations, taubinIterations: seg.mesh.taubinIterations } : null,
+      }),
+      preprocessing: preprocessHistory,
+      patientCoordinates: opened.series.patientFrame
+        ? {
+            frame: "dicom_lps",
+            originLpsMm: opened.series.patientFrame.origin,
+            centroidLpsMm: seg.measurement.centroidMm ? imageMmToPatient(seg.measurement.centroidMm, opened.series.patientFrame) : null,
+          }
+        : null,
+    };
   }
 
   function exportRecord() {
@@ -478,6 +630,12 @@ export function VolumeLab({
   function recordAsVersion() {
     const record = makeRecord();
     if (!opened || !seg || !record || !recordFinding || !onRecord || !recFinding) return;
+
+    const patientCentroidMm = (patientFrame && seg.measurement.centroidMm)
+      ? imageMmToPatient(seg.measurement.centroidMm, patientFrame)
+      : (seg.measurement.centroidMm ?? null);
+    const frame = patientFrame ? "dicom_lps" : "unavailable";
+
     const linked = versionFromLab({
       accepted: seg.result.accepted,
       isLearnedModel: seg.result.isLearnedModel,
@@ -487,6 +645,10 @@ export function VolumeLab({
       seriesDescription: opened.series.seriesDescription,
       source: opened.source,
       reason: recReason,
+      patientCentroidMm,
+      frame,
+      studyId: opened.series.studyUid,
+      seriesId: opened.series.seriesUid,
     });
     if (!linked.ok) {
       setError(linked.problem);
@@ -494,9 +656,45 @@ export function VolumeLab({
     }
     setError(null);
     const f = linked.fields;
+
+    const newStudyPayload = (opened.source === "upload" && patientId)
+      ? {
+          patientId,
+          modality: opened.series.modality ?? "MR",
+          studyDate: opened.series.studyDate ?? new Date().toISOString().slice(0, 10),
+          description: opened.series.seriesDescription ? `Uploaded: ${opened.series.seriesDescription}` : "Uploaded pelvic MRI",
+          accession: opened.series.accession ?? `ACC-${Date.now().toString().slice(-6)}`,
+          sourceNote: "Uploaded DICOM study in Volume Lab",
+        }
+      : undefined;
+
+    const newSeriesPayload = (opened.source === "upload" && patientId)
+      ? {
+          seriesNumber: 1,
+          description: opened.series.seriesDescription ?? "Uploaded Series",
+          plane: PLANES.find((p) => p.axis === axis)?.label ?? "Axial",
+          sliceCount: opened.volume.dims[2],
+          pixelSpacingMm: opened.series.report.pixelSpacingMm ? `${opened.series.report.pixelSpacingMm[0]}\\${opened.series.report.pixelSpacingMm[1]}` : undefined,
+          sliceThicknessMm: opened.series.report.sliceSpacingMm ?? undefined,
+        }
+      : undefined;
+
     void onRecord(async () => {
-      await recordFinding({ findingId: recFinding, axes: f.axes, longest: f.longest, sliceIndex: f.sliceIndex, reason: recReason.trim(), evidenceNote: f.evidenceNote });
-      setRecDone("Saved as a new version. The previous version is unchanged. Open the Studio or Trace view to see it.");
+      await recordFinding({
+        findingId: recFinding,
+        axes: f.axes,
+        longest: f.longest,
+        sliceIndex: f.sliceIndex,
+        reason: recReason.trim(),
+        evidenceNote: f.evidenceNote,
+        centroidMm: patientCentroidMm,
+        frame,
+        studyId: opened.series.studyUid,
+        seriesId: opened.series.seriesUid,
+        newStudy: newStudyPayload,
+        newSeries: newSeriesPayload,
+      });
+      setRecDone("Saved as a new version. The newly uploaded study and series are genuinely linked to the version with patient LPS coordinates.");
       setRecReason("");
     });
   }
@@ -878,6 +1076,73 @@ export function VolumeLab({
             </Card>
 
             <Card
+              title="3b. Preprocessing & Quality"
+              aside={
+                preprocessHistory.length > 0 && (
+                  <Btn tone="ghost" onClick={revertPreprocessing} testId="revert-preprocess">
+                    Revert to raw
+                  </Btn>
+                )
+              }
+            >
+              {quality && (
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  <Stat label="Estimated Noise SD" value={quality.noiseSd > 0 ? quality.noiseSd.toFixed(2) : "0.00"} />
+                  <Stat label="Slice Anisotropy" value={`${quality.anisotropy.toFixed(1)}×`} note={quality.anisotropy > 3 ? "Thick slices" : "Near-isotropic"} />
+                  <Stat label="Dynamic Range / Noise" value={quality.dynamicRangeToNoise ? quality.dynamicRangeToNoise.toFixed(1) : "n/a"} />
+                </div>
+              )}
+              {quality?.flags && quality.flags.length > 0 && (
+                <div className="rounded-md bg-clay-soft px-3 py-2 text-xs text-clay">
+                  {quality.flags.map((f, i) => (
+                    <p key={i}>{f}</p>
+                  ))}
+                </div>
+              )}
+              <div className="flex flex-wrap items-center gap-2">
+                <Btn tone="ghost" testId="apply-median" onClick={applyMedian}>
+                  3×3×3 Median Filter
+                </Btn>
+                <Btn tone="ghost" testId="apply-percentile" onClick={applyPercentile}>
+                  Percentile Norm (0.5–99.5%)
+                </Btn>
+                <Btn tone="ghost" testId="apply-zscore" onClick={applyZScore}>
+                  Z-Score Norm
+                </Btn>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted">Gaussian σ:</span>
+                  <input
+                    type="range"
+                    min={0.5}
+                    max={3.0}
+                    step={0.5}
+                    value={gaussSigma}
+                    onChange={(e) => setGaussSigma(Number(e.target.value))}
+                    className="w-16"
+                  />
+                  <span className="text-xs tabular-nums text-muted">{gaussSigma.toFixed(1)}mm</span>
+                  <Btn tone="ghost" testId="apply-gaussian" onClick={applyGaussian}>
+                    Apply Gaussian
+                  </Btn>
+                </div>
+              </div>
+              {preprocessHistory.length > 0 ? (
+                <div className="space-y-1 rounded-md bg-paper p-3 text-xs">
+                  <p className="font-semibold text-ink">Operation History ({preprocessHistory.length}):</p>
+                  <ol className="list-decimal space-y-1 pl-4 text-muted">
+                    {preprocessHistory.map((op, idx) => (
+                      <li key={idx}>
+                        <span className="font-medium text-ink">{op.op}</span>: {op.note}
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              ) : (
+                <p className="text-xs text-muted">Raw volume active. Filter operations apply non-destructively with full audit provenance.</p>
+              )}
+            </Card>
+
+            <Card
               title="4. 3D surface"
               aside={
                 <Btn tone="ghost" onClick={() => stage.current?.resetView()}>
@@ -1049,11 +1314,11 @@ export function VolumeLab({
                   <div className="space-y-2">
                     <h3 className="text-lg">Export</h3>
                     <div className="flex flex-wrap gap-2">
-                      <Btn testId="export-stl" disabled={!canExport} onClick={() => seg.mesh && download("volume-lab-surface.stl", toBinaryStl(seg.mesh.mesh) as unknown as BlobPart, "model/stl")}>
-                        Download STL
+                      <Btn testId="export-stl" disabled={!canExport} onClick={() => exportMesh && download("volume-lab-surface.stl", toBinaryStl(exportMesh) as unknown as BlobPart, "model/stl")}>
+                        Download STL {patientFrame ? "(Patient LPS)" : "(Image mm)"}
                       </Btn>
-                      <Btn tone="ghost" testId="export-obj" disabled={!canExport} onClick={() => seg.mesh && download("volume-lab-surface.obj", toObj(seg.mesh.mesh), "text/plain")}>
-                        Download OBJ
+                      <Btn tone="ghost" testId="export-obj" disabled={!canExport} onClick={() => exportMesh && download("volume-lab-surface.obj", toObj(exportMesh), "text/plain")}>
+                        Download OBJ {patientFrame ? "(Patient LPS)" : "(Image mm)"}
                       </Btn>
                       <Btn tone="ghost" testId="export-record" onClick={exportRecord}>
                         Download processing record
@@ -1061,7 +1326,9 @@ export function VolumeLab({
                     </div>
                     <p className="text-xs text-muted">
                       {canExport
-                        ? "STL and OBJ are in millimetres in image space, not patient coordinates. The record lists the seed, window, steps, and checks, with no file names or identifiers."
+                        ? patientFrame
+                          ? "STL and OBJ vertices are transformed into DICOM Patient LPS coordinates (mm). The record captures the full processing pipeline and provenance."
+                          : "STL and OBJ are in millimetres in image space. The record lists the seed, window, steps, and checks, with no file names or identifiers."
                         : "Surface export is off until a result passes the leakage check. Narrow the window or move the seed."}
                     </p>
                   </div>

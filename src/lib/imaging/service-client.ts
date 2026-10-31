@@ -52,6 +52,13 @@ export function serviceUrl(raw: string | null | undefined): string | null {
   }
 }
 
+/** Configured bearer token or API key for authenticating with the imaging service. */
+export function serviceToken(raw?: string | null | undefined): string | null {
+  const envVal = (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_IMAGING_SERVICE_TOKEN;
+  const t = typeof raw === "string" ? raw.trim() : typeof envVal === "string" ? envVal.trim() : "";
+  return t.length > 0 ? t : null;
+}
+
 const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 const numOrNull = (v: unknown): number | null => (isNum(v) ? v : null);
 
@@ -220,10 +227,18 @@ async function detailOf(res: Response): Promise<string> {
   return res.statusText || "no detail";
 }
 
-export async function checkHealth(base: string, fetchImpl: FetchLike = fetch, timeoutMs = 8000): Promise<ServiceResult<ServiceHealth>> {
+export async function checkHealth(
+  base: string,
+  fetchImpl: FetchLike = fetch,
+  timeoutMs = 8000,
+  token?: string | null,
+): Promise<ServiceResult<ServiceHealth>> {
+  const authToken = serviceToken(token);
+  const headers: Record<string, string> = {};
+  if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
   try {
     return await withTimeout(timeoutMs, async (signal) => {
-      const res = await fetchImpl(`${base}/health`, { method: "GET", signal });
+      const res = await fetchImpl(`${base}/health`, { method: "GET", headers, signal });
       if (!res.ok) return { ok: false, error: `Service answered ${res.status}: ${await detailOf(res)}` };
       const j = (await res.json()) as Partial<ServiceHealth>;
       if (typeof j.status !== "string" || typeof j.any_model_connected !== "boolean") return { ok: false, error: "The service answered, but not with the expected health shape." };
@@ -239,6 +254,7 @@ export async function inspectWithService(
   files: { name: string; bytes: Uint8Array }[],
   fetchImpl: FetchLike = fetch,
   timeoutMs = SERVICE_TIMEOUT_MS,
+  token?: string | null,
 ): Promise<ServiceResult<ServiceSeriesReport>> {
   if (files.length === 0) return { ok: false, error: "No files to send." };
   if (files.length > SERVICE_MAX_FILES) return { ok: false, error: `The service accepts at most ${SERVICE_MAX_FILES} files per request; this series has ${files.length}.` };
@@ -251,9 +267,12 @@ export async function inspectWithService(
     copy.set(f.bytes);
     form.append("files", new Blob([copy.buffer], { type: "application/dicom" }), `slice-${String(i).padStart(4, "0")}.dcm`);
   });
+  const authToken = serviceToken(token);
+  const headers: Record<string, string> = {};
+  if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
   try {
     return await withTimeout(timeoutMs, async (signal) => {
-      const res = await fetchImpl(`${base}/series/inspect`, { method: "POST", body: form, signal });
+      const res = await fetchImpl(`${base}/series/inspect`, { method: "POST", headers, body: form, signal });
       if (!res.ok) return { ok: false, error: `Service answered ${res.status}: ${await detailOf(res)}` };
       const parsed = parseServiceReport(await res.json());
       if (!parsed) return { ok: false, error: "The service answered, but the report was not in the expected shape. It was not used." };

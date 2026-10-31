@@ -112,7 +112,122 @@ class NnUNetAdapter:
         }
 
 
-ADAPTERS = {NnUNetAdapter.id: NnUNetAdapter()}
+class UmdMonaiAdapter:
+    """Uterine fibroid segmentation adapter trained on or compatible with the UMD dataset.
+
+    UMD labels:
+      1: uterine_wall
+      2: cavity
+      3: myoma (uterine fibroid)
+      4: nabothian (nabothian cyst)
+
+    Environment:
+      ANATOMYBRIDGE_UMD_WEIGHTS   path to trained model weights (.pt or .pth or TorchScript .ts)
+      ANATOMYBRIDGE_UMD_DEVICE    optional torch device, default 'cpu'
+    """
+
+    id = "umd_monai_fibroid"
+    name = "UMD Uterine Myoma (MONAI 3D U-Net)"
+    modality = "MR"
+    intended = ["uterine_wall", "cavity", "myoma", "nabothian"]
+    licence_note = "Trained on UMD dataset (CC BY 4.0). Not validated for standalone clinical diagnosis."
+    labels = {
+        "1": "uterine_wall",
+        "2": "cavity",
+        "3": "myoma",
+        "4": "nabothian",
+    }
+
+    def status(self) -> ModelStatus:
+        reason = self._missing()
+        return ModelStatus(
+            id=self.id,
+            name=self.name,
+            connected=reason is None,
+            reason=reason or "Weights checkpoint and dependencies are available.",
+            modality=self.modality,
+            intended_structures=self.intended,
+            licence_note=self.licence_note,
+            is_learned_model=True,
+        )
+
+    def _missing(self) -> str | None:
+        weights = os.environ.get("ANATOMYBRIDGE_UMD_WEIGHTS")
+        if not weights or not Path(weights).is_file():
+            return (
+                "ANATOMYBRIDGE_UMD_WEIGHTS is not set to an existing weights file (.pt/.pth). "
+                "Train or obtain weights using imaging-service/train_umd.py on the UMD dataset (Figshare 23541312)."
+            )
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            return "PyTorch (torch) is not installed in the Python environment."
+        return None
+
+    def run(self, volume_zyx: np.ndarray, spacing_zyx_mm: tuple[float, float, float]) -> dict:
+        reason = self._missing()
+        if reason:
+            raise ModelNotConnected(reason)
+
+        import torch
+
+        device = torch.device(os.environ.get("ANATOMYBRIDGE_UMD_DEVICE", "cpu"))
+        weights_path = Path(os.environ["ANATOMYBRIDGE_UMD_WEIGHTS"])
+
+        # SimpleITK image to match orientation and spacing
+        # Normalized input [1, 1, Z, Y, X]
+        vol = volume_zyx.astype(np.float32)
+        p1, p99 = np.percentile(vol, 1), np.percentile(vol, 99)
+        if p99 > p1:
+            vol = np.clip((vol - p1) / (p99 - p1), 0.0, 1.0)
+        else:
+            vol = np.zeros_like(vol)
+
+        tensor_in = torch.from_numpy(vol).unsqueeze(0).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            if weights_path.suffix in (".ts", ".pt") and "torchscript" in str(weights_path).lower():
+                model = torch.jit.load(str(weights_path), map_location=device)
+                model.eval()
+                logits = model(tensor_in)
+            else:
+                # Load state dict into standard 3D U-Net or TorchScript
+                try:
+                    checkpoint = torch.load(str(weights_path), map_location=device, weights_only=True)
+                except Exception:
+                    checkpoint = torch.load(str(weights_path), map_location=device)
+
+                if isinstance(checkpoint, torch.nn.Module):
+                    model = checkpoint
+                    model.eval()
+                    logits = model(tensor_in)
+                elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                    from .unet import SimpleUnet3D
+                    model = SimpleUnet3D(in_channels=1, num_classes=5).to(device)
+                    model.load_state_dict(checkpoint["state_dict"])
+                    model.eval()
+                    logits = model(tensor_in)
+                else:
+                    raise RuntimeError("Unrecognized weights format. Expected state_dict or TorchScript model.")
+
+            pred_labels = torch.argmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+
+        return {
+            "labels": dict(self.labels),
+            "label_volume_zyx": pred_labels,
+            "model": {
+                "id": self.id,
+                "is_learned_model": True,
+                "weights": str(weights_path),
+            },
+            "note": "Genuine learned model output. Not clinician-verified.",
+        }
+
+
+ADAPTERS = {
+    NnUNetAdapter.id: NnUNetAdapter(),
+    UmdMonaiAdapter.id: UmdMonaiAdapter(),
+}
 
 
 def statuses() -> list[ModelStatus]:

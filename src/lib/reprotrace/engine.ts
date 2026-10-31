@@ -1,5 +1,8 @@
 /** ReproTrace rules. Proposals only — nothing here merges findings. */
 
+import type { RegistrationTransform } from "../imaging/registration.ts";
+import { transformPoint } from "../imaging/registration.ts";
+
 export const ENGINE_VERSION = "reprotrace-rules-1";
 
 export type MatchCategory =
@@ -123,7 +126,11 @@ function pairScore(a: Snap, b: Snap): { score: number; category: MatchCategory; 
 }
 
 /** Pair observations between two spatially described studies. Does not merge records. */
-export function matchStudies(prior: Snap[], next: Snap[]): Proposal[] {
+export function matchStudies(
+  prior: Snap[],
+  next: Snap[],
+  registration?: { supported: boolean; transform?: RegistrationTransform } | null,
+): Proposal[] {
   const candidates: {
     i: number;
     j: number;
@@ -131,11 +138,35 @@ export function matchStudies(prior: Snap[], next: Snap[]): Proposal[] {
     category: MatchCategory;
     notes: string[];
   }[] = [];
-  prior.forEach((a, i) => {
-    next.forEach((b, j) => {
+  let evaluatedNext = next;
+  const priorRegistered = prior.map((p) => (registration?.supported ? { ...p, frame: "image_registered" as Frame } : p));
+  if (registration?.supported && registration.transform) {
+    const tx = registration.transform;
+    evaluatedNext = next.map((s) => ({
+      ...s,
+      frame: "image_registered" as Frame,
+      centroidMm: s.centroidMm ? transformPoint(s.centroidMm, tx) : null,
+    }));
+  }
+
+  priorRegistered.forEach((a, i) => {
+    evaluatedNext.forEach((b, j) => {
       const scored = pairScore(a, b);
       if (!scored || scored.score < PAIR_FLOOR) return;
-      candidates.push({ i, j, ...scored });
+
+      let cat = scored.category;
+      const notes = [...scored.notes];
+
+      if (registration) {
+        if (registration.supported) {
+          notes.push("Rigid follow-up image registration verified; spatial correspondence is supported");
+        } else {
+          notes.push("Follow-up image registration was attempted but spatial correspondence could not be established");
+          if (cat === "likely_same") cat = "uncertain";
+        }
+      }
+
+      candidates.push({ i, j, score: scored.score, category: cat, notes });
     });
   });
   candidates.sort((a, b) => b.score - a.score);
@@ -146,8 +177,8 @@ export function matchStudies(prior: Snap[], next: Snap[]): Proposal[] {
     if (usedPrior.has(c.i) || usedNext.has(c.j)) continue;
     usedPrior.add(c.i);
     usedNext.add(c.j);
-    const a = prior[c.i];
-    const b = next[c.j];
+    const a = priorRegistered[c.i];
+    const b = evaluatedNext[c.j];
     proposals.push({
       fromId: a.id,
       toId: b.id,
@@ -156,7 +187,7 @@ export function matchStudies(prior: Snap[], next: Snap[]): Proposal[] {
       category: c.category,
       score: Number(c.score.toFixed(2)),
       rationale: `${c.notes.join(". ")}.`,
-      provisional: a.frame !== "image_registered" || b.frame !== "image_registered",
+      provisional: a.frame !== "image_registered" || b.frame !== "image_registered" || (registration ? !registration.supported : false),
     });
   }
   prior.forEach((a, i) => {

@@ -20,6 +20,8 @@ export type TextResult = {
   /** Share of printable characters. Low values mean the decoder probably did not understand the file. */
   printableRatio: number;
   usable: boolean;
+  isScanned?: boolean;
+  imageCount?: number;
 };
 
 export const MAX_REPORT_FILE_BYTES = 15 * 1024 * 1024;
@@ -230,7 +232,7 @@ export function textFromContentStream(content: string): string {
   return out;
 }
 
-export async function decodePdf(bytes: Uint8Array): Promise<{ text: string; warnings: string[] }> {
+export async function decodePdf(bytes: Uint8Array): Promise<{ text: string; warnings: string[]; isScanned?: boolean; images?: number }> {
   const warnings: string[] = [];
   const raw = new TextDecoder("latin1").decode(bytes);
   if (/\/Encrypt\b/.test(raw)) throw new Error("Encrypted PDF files are not read.");
@@ -273,10 +275,15 @@ export async function decodePdf(bytes: Uint8Array): Promise<{ text: string; warn
     if (!/\bBT\b/.test(content)) continue;
     texts.push(textFromContentStream(content));
   }
+  const extractedText = texts.join("\n");
+  const isScanned = images > 0 && extractedText.trim().length < 80;
+  if (isScanned) {
+    warnings.push("SCANNED PDF LIMITATION: This document contains image-only or scanned pages. In-browser OCR is not supported; text could not be extracted automatically. Please upload a digital text-based PDF or paste text directly.");
+  }
   if (images > 0) warnings.push(`${images} embedded image${images === 1 ? "" : "s"} skipped. Scanned pages are not read (no OCR).`);
   if (unsupportedFilters > 0) warnings.push(`${unsupportedFilters} stream${unsupportedFilters === 1 ? "" : "s"} used an unsupported filter and were skipped.`);
   warnings.push("PDF text is read from simple content streams only. Fonts with custom encodings may come out garbled; check the preview.");
-  return { text: texts.join("\n"), warnings };
+  return { text: extractedText, warnings, isScanned, images };
 }
 
 /** Entry point. Refuses unknown or mismatched content instead of guessing. */
@@ -297,5 +304,7 @@ export async function extractReportText(name: string, bytes: Uint8Array): Promis
   const ratio = printableRatio(text);
   const usable = text.length >= 20 && ratio >= 0.9;
   if (!usable) warnings.push("Little readable text was recovered. The report cannot be used for extraction as it is.");
-  return { kind: byName, text, warnings, printableRatio: Number(ratio.toFixed(3)), usable };
+  const isScanned = Boolean((decoded as { isScanned?: boolean }).isScanned ?? (byName === "pdf" && text.length < 50 && decoded.warnings.some((w) => w.includes("embedded image"))));
+  const imageCount = (decoded as { images?: number }).images ?? 0;
+  return { kind: byName, text, warnings, printableRatio: Number(ratio.toFixed(3)), usable, isScanned, imageCount };
 }

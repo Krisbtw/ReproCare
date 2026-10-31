@@ -65,6 +65,32 @@ class Health(BaseModel):
     any_model_connected: bool
 
 
+def verify_service_auth(
+    auth_header: str | None = Header(None, alias="Authorization"),
+    api_key_header: str | None = Header(None, alias="X-API-Key"),
+) -> bool:
+    """Verifies service authentication if ANATOMYBRIDGE_SERVICE_API_KEY is configured in the environment.
+
+    Supports either:
+      Authorization: Bearer <token>
+      X-API-Key: <token>
+    When ANATOMYBRIDGE_SERVICE_API_KEY is unset, requests proceed without authentication (for local preview/dev).
+    """
+    expected = os.environ.get("ANATOMYBRIDGE_SERVICE_API_KEY")
+    if not expected:
+        return True
+
+    provided = None
+    if auth_header and auth_header.startswith("Bearer "):
+        provided = auth_header[7:].strip()
+    elif api_key_header:
+        provided = api_key_header.strip()
+
+    if not provided or provided != expected:
+        raise HTTPException(401, "Unauthorized: valid service API key or Bearer token is required.")
+    return True
+
+
 class MaskScoreRequest(BaseModel):
     spacing_zyx_mm: tuple[float, float, float] = Field(description="Voxel spacing in mm, order z, y, x")
     prediction: list[list[list[int]]] = Field(description="Binary mask as nested lists, shape z,y,x")
@@ -77,7 +103,7 @@ def health() -> Health:
 
 
 @app.get("/models")
-def list_models() -> list[dict]:
+def list_models(auth_ok: bool = Depends(verify_service_auth)) -> list[dict]:
     return [m.__dict__ for m in models.statuses()]
 
 
@@ -96,14 +122,20 @@ async def _read_files(files: list[UploadFile]) -> list[bytes]:
 
 
 @app.post("/series/inspect")
-async def inspect_series(files: list[UploadFile] = File(...)) -> dict:
+async def inspect_series(
+    files: list[UploadFile] = File(...),
+    auth_ok: bool = Depends(verify_service_auth),
+) -> dict:
     """Geometry report for one DICOM series. Patient tags are not returned."""
     report, _ = series.inspect(await _read_files(files))
     return report.to_dict()
 
 
 @app.post("/metrics/score")
-def score_masks(req: MaskScoreRequest) -> dict:
+def score_masks(
+    req: MaskScoreRequest,
+    auth_ok: bool = Depends(verify_service_auth),
+) -> dict:
     pred = np.array(req.prediction, dtype=bool)
     ref = np.array(req.reference, dtype=bool)
     if pred.ndim != 3 or pred.shape != ref.shape:
@@ -112,7 +144,11 @@ def score_masks(req: MaskScoreRequest) -> dict:
 
 
 @app.post("/segment/{model_id}")
-async def segment(model_id: str, files: list[UploadFile] = File(...)) -> dict:
+async def segment(
+    model_id: str,
+    files: list[UploadFile] = File(...),
+    auth_ok: bool = Depends(verify_service_auth),
+) -> dict:
     adapter = models.ADAPTERS.get(model_id)
     if adapter is None:
         raise HTTPException(404, f"Unknown model '{model_id}'.")

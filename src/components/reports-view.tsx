@@ -296,6 +296,16 @@ export function ReportsView({
                 <Tag tone={draft.raw.usable ? "pine" : "clay"}>{draft.raw.usable ? "readable text recovered" : "little readable text"}</Tag>
                 <Tag tone={draft.deid.redactions.length ? "pine" : "ink"}>{`${draft.deid.redactions.length} redaction${draft.deid.redactions.length === 1 ? "" : "s"}`}</Tag>
               </div>
+              {draft.raw.isScanned && (
+                <div className="rounded-md border border-clay bg-clay-soft p-3 text-sm text-clay" role="alert">
+                  <p className="font-semibold">Scanned Document Detected (No In-Browser OCR)</p>
+                  <p className="mt-1 text-xs">
+                    This file contains scanned image pages with little extractable digital text stream.
+                    ReproCare operates entirely client-side without third-party cloud OCR models.
+                    Please provide a text-encoded PDF, DOCX, or plain text report for automated rule extraction.
+                  </p>
+                </div>
+              )}
               {draft.raw.warnings.length > 0 && (
                 <ul className="list-disc space-y-1 pl-5 text-xs text-muted">
                   {draft.raw.warnings.map((w, i) => (

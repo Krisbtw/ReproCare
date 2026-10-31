@@ -23,6 +23,11 @@ export type LabLinkInput = {
   seriesDescription: string | null;
   source: "sample" | "upload";
   reason: string;
+  studyId?: string | null;
+  seriesId?: string | null;
+  seriesUid?: string | null;
+  patientCentroidMm?: [number, number, number] | null;
+  frame?: "dicom_lps" | "image_registered" | "schematic" | "unavailable";
 };
 
 export type LabLinkFields = {
@@ -30,12 +35,14 @@ export type LabLinkFields = {
   longest: number;
   volumeMl: number;
   segmentationSource: string;
-  frame: "unavailable";
-  centroidMm: null;
-  modelId: null;
+  frame: "dicom_lps" | "image_registered" | "schematic" | "unavailable";
+  centroidMm: [number, number, number] | null;
+  modelId: string | null;
   sliceIndex: number;
   changeReason: string;
   evidenceNote: string;
+  studyId?: string | null;
+  seriesId?: string | null;
 };
 
 export type LabLinkResult = { ok: true; fields: LabLinkFields } | { ok: false; problem: string };
@@ -62,23 +69,29 @@ export function versionFromLab(input: LabLinkInput): LabLinkResult {
   const axes: [number, number, number] = [m.axesMm[0], m.axesMm[1], m.axesMm[2]];
   if (axes.some((n) => !Number.isFinite(n) || n <= 0 || n > 300)) return { ok: false, problem: "Measured extents are outside 0 to 300 mm." };
   const where = input.source === "sample" ? "the synthetic sample" : "a locally loaded series";
+  const centroid = input.patientCentroidMm ?? null;
+  const frame = input.frame ?? (centroid ? "dicom_lps" : "unavailable");
+
   return {
     ok: true,
     fields: {
       axes,
       longest: m.longestMm,
       volumeMl: m.volumeMl,
-      segmentationSource: LAB_SEGMENTATION_SOURCE,
-      frame: "unavailable",
-      centroidMm: null,
-      modelId: null,
+      segmentationSource: input.isLearnedModel ? "monai_umd_model" : LAB_SEGMENTATION_SOURCE,
+      frame,
+      centroidMm: centroid,
+      modelId: input.isLearnedModel ? "umd_monai_fibroid" : null,
       sliceIndex: input.seed[2],
       changeReason: `Volume lab: ${reason}`,
       evidenceNote:
         `Measured in ${where}${input.seriesDescription ? ` (${input.seriesDescription})` : ""} by classical seeded region growing, not a trained model. ` +
         `Seed slice index ${input.seed[2]} in that series' own stack. Processing record hash ${input.recordHash}. ` +
-        `The series is not stored here and has not been shown to be the study this finding cites. Centroid withheld: image-index coordinates are not registered to the stored frame. ` +
+        (input.studyId ? `Linked to study ${input.studyId}. ` : `The series is not stored here and has not been shown to be the study this finding cites. `) +
+        (centroid ? `Centroid recorded in DICOM LPS coordinates [${centroid.map((v) => v.toFixed(1)).join(", ")}] mm. ` : `Centroid withheld: image-index coordinates are not registered to the stored frame. `) +
         `Principal-axis extents, not a caliper plane.`,
+      studyId: input.studyId ?? null,
+      seriesId: input.seriesId ?? null,
     },
   };
 }

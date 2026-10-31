@@ -276,6 +276,7 @@ export function ClinicApp() {
           {labOpened && role !== "patient" && (
             <div hidden={view !== "lab"}>
               <VolumeLab
+                patientId={patient ? s(patient, "id") : undefined}
                 findings={
                   patient
                     ? (data?.findings as Bag[])

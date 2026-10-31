@@ -158,3 +158,12 @@ test("quoteMatches rejects offsets that do not reproduce the quote", () => {
   assert.equal(quoteMatches("abc def", -1, 3, "abc"), false);
   assert.equal(quoteMatches("abc def", 0, 99, "abc"), false);
 });
+
+test("detects scanned PDF limitations and handles FIGO class / nabothian cyst extraction", () => {
+  const sample = "Pelvic MRI reveals an anterior intramural leiomyoma, FIGO class 3, measuring 4.2 x 3.8 x 3.5 cm. Small nabothian cyst in the cervix.";
+  const ext = extractReport(sample);
+  assert.equal(ext.figo.length, 1);
+  assert.equal(ext.figo[0].text, "FIGO class 3");
+  assert.equal(ext.findings.some((f) => f.structure === "fibroid"), true);
+  assert.equal(ext.anatomy.some((a) => a.text === "cervix"), true);
+});

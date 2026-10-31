@@ -62,11 +62,12 @@ const TERMS: Term[] = [
   { re: /\b(follicles?|polycystic|PCOM)\b/i, structure: "ovarian follicles", organ: "ovary", pathway: "pcos" },
   { re: /\b(cysts?|cystic lesion|dermoid|cystadenoma)\b/i, structure: "ovarian cyst", organ: "ovary", pathway: "ovarian_cyst" },
   { re: /\b(endometrium|endometrial (?:thickness|stripe|lining))\b/i, structure: "endometrium", organ: "uterus", pathway: "general" },
+  { re: /\b(nabothian(?:\s+cysts?)?)\b/i, structure: "nabothian cyst", organ: "cervix", pathway: "general" },
   { re: /\b(uterus|uterine)\b/i, structure: "uterus", organ: "uterus", pathway: "general" },
   { re: /\b(ovary|ovaries)\b/i, structure: "ovary", organ: "ovary", pathway: "general" },
 ];
 
-const ANATOMY = /\b(uterus|uterine|myometri(?:um|al)|endometri(?:um|al)|cervix|cervical|fundus|fundal|corpus|anterior wall|posterior wall|ovary|ovaries|adnexa(?:l)?|pouch of douglas|rectovaginal|uterosacral|bladder|rectum|sigmoid|fallopian tube|serosa(?:l)?|submucosal|intramural|subserosal|pedunculated)\b/gi;
+const ANATOMY = /\b(uterus|uterine|myometri(?:um|al)|endometri(?:um|al)|cervix|cervical|fundus|fundal|corpus|anterior wall|posterior wall|ovary|ovaries|adnexa(?:l)?|pouch of douglas|rectovaginal|uterosacral|bladder|rectum|sigmoid|fallopian tube|serosa(?:l)?|submucosal|intramural|subserosal|pedunculated|nabothian)\b/gi;
 
 const MEAS = /(\d+(?:\.\d+)?)(?:\s*[x×*]\s*(\d+(?:\.\d+)?))?(?:\s*[x×*]\s*(\d+(?:\.\d+)?))?\s*(mm|cm|ml|mL|cc)\b/g;
 
@@ -189,7 +190,7 @@ export function extractReport(text: string): Extraction {
   }
 
   const figo: Span[] = [];
-  for (const m of text.matchAll(/\bFIGO\s*(?:type\s*)?([0-8](?:\s*-\s*[0-8])?)\b/gi)) {
+  for (const m of text.matchAll(/\bFIGO\s*(?:type\s*|class\s*)?([0-8](?:\s*-\s*[0-8])?)\b/gi)) {
     figo.push({ start: m.index ?? 0, end: (m.index ?? 0) + m[0].length, text: m[0] });
   }
 
