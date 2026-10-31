@@ -1,0 +1,34 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Figtree", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Newsreader", ui-serif, Georgia, serif;
+  --color-paper: #f3efe6;
+  --color-card: #fffcf6;
+  --color-ink: #1b242f;
+  --color-ink-soft: #3d4856;
+  --color-muted: #6d645b;
+  --color-line: #e3d9cb;
+  --color-pine: #1e4a42;
+  --color-pine-soft: #e6f0ec;
+  --color-clay: #9a4634;
+  --color-clay-soft: #f8ebe6;
+  --color-mist: #8d8376;
+  --radius-sm: 0.5rem;
+  --radius-md: 0.85rem;
+  --radius-lg: 1.15rem;
+}
+
+@layer base {
+  html { -webkit-font-smoothing: antialiased; }
+  body {
+    background: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+  }
+  h1, h2, h3 { font-family: var(--font-serif); text-wrap: balance; }
+  p { text-wrap: pretty; }
+  button:not(:disabled), [role="button"]:not(:disabled) { cursor: pointer; }
+  button:disabled { cursor: not-allowed; }
+  :focus-visible { outline: 2px solid var(--color-pine); outline-offset: 2px; }
+}

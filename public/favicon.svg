@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="AnatomyBridge">
+  <rect width="32" height="32" rx="8" fill="#1e4a42"/>
+  <path d="M5 23.5h22" fill="none" stroke="#9a4634" stroke-width="3" stroke-linecap="round"/>
+  <path d="M8 23.5c0-6 3.6-10.5 8-10.5s8 4.5 8 10.5" fill="none" stroke="#f3efe6" stroke-width="3.25" stroke-linecap="round"/>
+</svg>
