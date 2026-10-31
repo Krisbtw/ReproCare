@@ -22,6 +22,8 @@ export type StudyRow = {
   accession: string;
   synthetic: boolean;
   source_note: string;
+  quote_start?: number | null;
+  quote_end?: number | null;
 };
 
 export type SeriesRow = {
@@ -45,6 +47,7 @@ export type ReportRow = {
   author_role: string;
   body: string;
   synthetic: boolean;
+  source_kind?: string;
 };
 
 export type FindingRow = {
@@ -209,6 +212,22 @@ export type AuditRow = {
   detail: string;
 };
 
+export type ExtractionRow = {
+  id: string;
+  report_id: string;
+  file_name: string;
+  file_kind: string;
+  content_sha256: string;
+  deid_method: string;
+  redaction_count: number;
+  redaction_kinds: string;
+  extractor: string;
+  /** JSON of reports/extract.ts Extraction. */
+  extraction: string;
+  warnings: string;
+  created_at: string;
+};
+
 export type ModelRow = { id: string; name: string; status: string; note: string };
 
 export type Workspace = {
@@ -230,6 +249,7 @@ export type Workspace = {
   consents: ConsentRow[];
   uploads: UploadRow[];
   audit: AuditRow[];
+  extractions: ExtractionRow[];
   models: ModelRow[];
   engineVersion: string;
 };

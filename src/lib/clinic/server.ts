@@ -4,6 +4,7 @@ import { authMiddleware } from "@/lib/auth/middleware";
 import { ENGINE_VERSION } from "../reprotrace/engine";
 import { insertLabVersion } from "./lab-version";
 import { applyMenarcheYear } from "./menarche";
+import { ingestReport, linkReportQuote, type IngestInput, type QuoteLinkInput } from "../reports/store";
 import type { ExportPayload, VersionRow, Workspace } from "./types";
 import {
   CYCLES,
@@ -139,7 +140,7 @@ export const getWorkspace = createServerFn({ method: "GET" })
     const sql = await getSql();
     await ensure(sql, context.userId);
     const userId = context.userId;
-    const [profiles, patients, studies, series, reports, findings, versions, evidence, symptoms, cycles, labs, correspondences, decisions, discrepancies, reviews, consents, uploads, auditRows] =
+    const [profiles, patients, studies, series, reports, findings, versions, evidence, symptoms, cycles, labs, correspondences, decisions, discrepancies, reviews, consents, uploads, auditRows, extractions] =
       await Promise.all([
         sql<{ user_id: string; display_name: string; role: string; active_patient_id: string | null }>`select user_id, display_name, role, active_patient_id from profiles where user_id = ${userId}`,
         sql`select * from patients where user_id = ${userId} order by code`,
@@ -159,6 +160,7 @@ export const getWorkspace = createServerFn({ method: "GET" })
         sql`select * from consents where user_id = ${userId} order by created_at`,
         sql`select id, patient_id, received_at, file_name, transfer_syntax, metadata, warnings, identifiers_withheld from dicom_uploads where user_id = ${userId} order by received_at desc limit 12`,
         sql`select * from audit_events where user_id = ${userId} order by at desc limit 40`,
+        sql`select id, report_id, file_name, file_kind, content_sha256, deid_method, redaction_count, redaction_kinds, extractor, extraction, warnings, created_at from report_extractions where user_id = ${userId} order by created_at desc`,
       ]);
     const versionsOut: VersionRow[] = (versions as Record<string, unknown>[]).map((v) => ({
       ...(v as object),
@@ -191,6 +193,7 @@ export const getWorkspace = createServerFn({ method: "GET" })
       consents: consents as Workspace["consents"],
       uploads: uploads as Workspace["uploads"],
       audit: auditRows as Workspace["audit"],
+      extractions: extractions as Workspace["extractions"],
       models: MODELS.map((model) => ({
         id: model.id,
         name: model.name,
@@ -465,4 +468,38 @@ export const resetWorkspace = createServerFn({ method: "POST" })
     await seed(sql, context.userId);
     await audit(sql, context.userId, "reset", "workspace", context.userId, "Synthetic workspace reset. Earlier audit events were kept.");
     return { ok: true };
+  });
+
+export const uploadReport = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: IngestInput) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    if ((await roleOf(sql, context.userId)) === "patient") throw new Error("Report upload is a clinician action in this prototype.");
+    // validateIngest, ownership checks, a second de-identification pass and extraction live in reports/store.ts.
+    const res = await ingestReport(sql, context.userId, data);
+    await audit(
+      sql,
+      context.userId,
+      "upload_report",
+      "report",
+      res.reportId,
+      `De-identified ${data.fileKind.toUpperCase()} text stored (sha256 ${data.sha256.slice(0, 12)}…). Original file not stored. ${res.extraction.measurements.length} measurement(s), ${res.extraction.findings.length} finding sentence(s) extracted by rules.`,
+    );
+    return { ok: true, reportId: res.reportId, studyId: res.studyId };
+  });
+
+export const linkReportEvidence = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: QuoteLinkInput) => {
+    if (!Number.isInteger(input.start) || !Number.isInteger(input.end)) throw new Error("Quote offsets are not valid.");
+    if (typeof input.quote !== "string" || input.quote.length < 1 || input.quote.length > 1200) throw new Error("Quote length is not valid.");
+    return input;
+  })
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    if ((await roleOf(sql, context.userId)) === "patient") throw new Error("Linking evidence is a clinician action.");
+    const id = await linkReportQuote(sql, context.userId, data);
+    await audit(sql, context.userId, "link_evidence", "finding_version", data.findingVersionId, `Report quote [${data.start}, ${data.end}) linked. The version itself was not changed.`);
+    return { ok: true, id };
   });

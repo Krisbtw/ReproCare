@@ -20,6 +20,8 @@ import {
   setActivePatient,
   setMenarcheYear,
   setRole,
+  uploadReport,
+  linkReportEvidence,
 } from "@/lib/clinic/server";
 import { explainPlain } from "@/lib/clinic/plain";
 import { checkMenarcheYear, cycleBand, outsideBand, pcosContext } from "@/lib/clinic/pcos-context";
@@ -28,15 +30,17 @@ import { CourseView } from "./course-view";
 import { ResearchView } from "./research-view";
 import { SliceBoard } from "./slice-board";
 import { VolumeLab } from "./volume-lab";
+import { ReportsView } from "./reports-view";
 import type { SliceMark } from "@/lib/imaging/phantom";
 import type { Workspace } from "@/lib/clinic/types";
 
-type View = "board" | "people" | "studio" | "lab" | "course" | "trace" | "context" | "methods" | "admin";
+type View = "board" | "people" | "studio" | "reports" | "lab" | "course" | "trace" | "context" | "methods" | "admin";
 
 const NAV: { id: View; label: string }[] = [
   { id: "board", label: "Board" },
   { id: "people", label: "Records" },
   { id: "studio", label: "Studio" },
+  { id: "reports", label: "Reports" },
   { id: "lab", label: "Volume lab" },
   { id: "course", label: "Timeline" },
   { id: "trace", label: "ReproTrace" },
@@ -286,6 +290,17 @@ export function ClinicApp() {
           )}
           {view === "lab" && role === "patient" && (
             <p className="rounded-lg border border-line bg-card p-4 text-ink-soft">The volume lab is a clinician tool. Switch the lens to Clinician to use it.</p>
+          )}
+          {view === "reports" && patient && (
+            <ReportsView
+              data={data}
+              patient={patient}
+              clinician={role !== "patient"}
+              busy={busy}
+              run={run}
+              upload={(input) => uploadReport({ data: input })}
+              link={(input) => linkReportEvidence({ data: input })}
+            />
           )}
           {view === "course" && patient && <CourseView data={data} patient={patient} onStudio={() => setView("studio")} />}
           {view === "trace" && patient && <Trace data={data} patient={patient} clinician={role !== "patient"} busy={busy} run={run} />}

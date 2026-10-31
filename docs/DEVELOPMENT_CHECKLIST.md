@@ -142,3 +142,19 @@ New:
 - `src/components/volume-lab.tsx`: added "Second check · imaging service" cross-check card comparing browser (`dicom-parser`) vs service (`pydicom`) series analysis.
 - `tests/verify/run.html`: browser-based test verification runner.
 
+## Update 2026-10-31 (Clinical report ingestion, De-identification, Structured evidence linking & Preprocessing)
+
+Run in this workspace: `tsc --noEmit` clean; `vite build` ok; `npm run test:app` 189 pass, 0 fail.
+
+New:
+- `src/lib/reports/zip.ts`: zero-dependency DOCX container / ZIP central directory parser using platform `DecompressionStream`.
+- `src/lib/reports/text.ts`: plain-text extraction from TXT, DOCX, and PDF content streams with printable character verification.
+- `src/lib/reports/deidentify.ts`: rule-based de-identification scrubbing patient names, MRNs, phone numbers, emails, and Indian Aadhaar-like IDs while keeping clinical dates and measurements.
+- `src/lib/reports/extract.ts`: rule-based structured extraction for exam dates, imaging modality, measurements, FIGO fibroid classification, and sentence-level findings with character-exact offsets.
+- `migrations/0005_report_ingestion.sql`: database tables for uploaded reports and evidence link anchors (`quote_start`, `quote_end`, `content_sha256`).
+- `src/lib/reports/store.ts` + `store.test.ts`: database operations for de-identified report ingestion and evidence quote anchoring with audit trail.
+- `src/components/reports-view.tsx`: Reports screen for client-side text extraction, de-identification preview, clinician confirmation, and linking quotes to finding versions.
+- `src/components/clinic-app.tsx`: integrated Reports tab and view.
+- `src/lib/imaging/preprocess.ts` + `preprocess.test.ts`: pure functional volume preprocessing (percentile/z-score normalisation, Gaussian smoothing, median filter, trilinear resampling, ROI cropping, and noise/anisotropy indicators) preserving the input volume intact.
+
+
