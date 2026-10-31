@@ -18,10 +18,11 @@ import {
   resetWorkspace,
   saveDicomMeta,
   setActivePatient,
+  setMenarcheYear,
   setRole,
 } from "@/lib/clinic/server";
 import { explainPlain } from "@/lib/clinic/plain";
-import { pcosContext } from "@/lib/clinic/pcos-context";
+import { checkMenarcheYear, cycleBand, outsideBand, pcosContext } from "@/lib/clinic/pcos-context";
 import { AnatomyStage, type AnatomyItem } from "./anatomy-stage";
 import { CourseView } from "./course-view";
 import { ResearchView } from "./research-view";
@@ -861,8 +862,36 @@ function Context({
   const symptoms = (data.symptoms as Bag[]).filter((x) => s(x, "patient_id") === pid);
   const cycles = (data.cycles as Bag[]).filter((x) => s(x, "patient_id") === pid);
   const labs = (data.labs as Bag[]).filter((x) => s(x, "patient_id") === pid);
-  const yob = Number(s(patient, "year_of_birth"));
-  const pcos = s(patient, "pathway") === "pcos" ? pcosContext(s(patient, "year_of_birth") === "" ? null : yob, new Date().getFullYear()) : null;
+  const yob = num(patient, "year_of_birth");
+  const storedMenarche = num(patient, "menarche_year");
+  const thisYear = new Date().getFullYear();
+  const isPcos = s(patient, "pathway") === "pcos";
+  const pcos = isPcos ? pcosContext(yob, thisYear, storedMenarche) : null;
+  const band = pcos ? cycleBand(pcos.gynAge) : null;
+  const [menarcheText, setMenarcheText] = useState(storedMenarche == null ? "" : String(storedMenarche));
+  const [menarcheReason, setMenarcheReason] = useState("");
+  const [menarcheProblem, setMenarcheProblem] = useState<string | null>(null);
+  useEffect(() => {
+    setMenarcheText(storedMenarche == null ? "" : String(storedMenarche));
+    setMenarcheProblem(null);
+  }, [pid, storedMenarche]);
+  function saveMenarche(clear: boolean) {
+    const value = clear ? null : Number(menarcheText);
+    if (value !== null) {
+      const check = checkMenarcheYear(value, yob, thisYear);
+      if (!check.ok) {
+        setMenarcheProblem(check.problem);
+        return;
+      }
+    }
+    if (menarcheReason.trim().length < 4) {
+      setMenarcheProblem("Say where the year came from (for example: patient-reported at visit).");
+      return;
+    }
+    setMenarcheProblem(null);
+    void run(() => setMenarcheYear({ data: { patientId: pid, menarcheYear: value, reason: menarcheReason } }));
+    setMenarcheReason("");
+  }
   const [region, setRegion] = useState(REGIONS[0]);
   const [intensity, setIntensity] = useState(4);
   const [description, setDescription] = useState("");
@@ -885,7 +914,25 @@ function Context({
           <ul className="mt-2 list-disc space-y-1 pl-5 text-ink-soft">
             {pcos.lines.map((line) => <li key={line}>{line}</li>)}
           </ul>
+          <p className="mt-2 text-xs text-muted" data-testid="pcos-basis">
+            Based on: {pcos.basis === "menarche" ? "stored first-period year" : pcos.basis === "birth-year" ? "year of birth only (app threshold)" : "nothing usable"}. Source: 2023 international PCOS guideline, as summarised in docs/RESEARCH_REPORT.md.
+          </p>
         </aside>
+      )}
+      {isPcos && (
+        <section className="space-y-2 rounded-lg border border-line bg-card p-4" aria-label="Year of first period">
+          <h2 className="text-xl">Year of first period</h2>
+          <p className="text-sm text-ink-soft">
+            Stored as a year only. Currently: <span className="font-medium text-ink" data-testid="menarche-stored">{storedMenarche ?? "not recorded"}</span>. Every change is written to the audit log with the earlier value.
+          </p>
+          <form className="grid gap-2 md:grid-cols-[8rem_minmax(0,1fr)_auto_auto]" onSubmit={(e) => { e.preventDefault(); saveMenarche(false); }}>
+            <input className="min-h-11 rounded-md border border-line bg-paper px-2" inputMode="numeric" placeholder="e.g. 2011" aria-label="Year of first period" value={menarcheText} onChange={(e) => setMenarcheText(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))} />
+            <input className="min-h-11 rounded-md border border-line bg-paper px-2" placeholder="Source, e.g. patient-reported at visit" aria-label="Source of the year" value={menarcheReason} onChange={(e) => setMenarcheReason(e.target.value)} />
+            <Button type="submit" disabled={busy || menarcheText.length !== 4}>Save year</Button>
+            <Button tone="ghost" disabled={busy || storedMenarche == null} onClick={() => saveMenarche(true)}>Clear</Button>
+          </form>
+          {menarcheProblem && <p role="alert" className="rounded-md bg-clay-soft px-3 py-2 text-sm text-clay">{menarcheProblem}</p>}
+        </section>
       )}
       <div className="grid gap-4 lg:grid-cols-2">
         <section className="space-y-3 rounded-lg border border-line bg-card p-4">
@@ -917,8 +964,21 @@ function Context({
               ))}
             </div>
           )}
+          {band && (
+            <p className="rounded-md bg-paper px-3 py-2 text-xs text-ink-soft" data-testid="cycle-band">
+              {band.status === "band" ? `Guideline range shown for reading only. ${band.label} The app does not label anyone from this.` : band.reason}
+            </p>
+          )}
           <ul className="space-y-1 text-sm text-ink-soft">
-            {cycles.map((c) => <li key={s(c, "id")}>{s(c, "start_date")} · {s(c, "length_days")} days · {s(c, "flow")}. {s(c, "note")}</li>)}
+            {cycles.map((c) => {
+              const out = band ? outsideBand(num(c, "length_days"), band) : null;
+              return (
+                <li key={s(c, "id")}>
+                  {s(c, "start_date")} · {s(c, "length_days")} days · {s(c, "flow")}. {s(c, "note")}
+                  {out === true && <span className="ml-2"><Chip tone="clay">Outside guideline range</Chip></span>}
+                </li>
+              );
+            })}
           </ul>
           <form className="grid gap-2" onSubmit={(e) => { e.preventDefault(); void run(() => addCycle({ data: { patientId: pid, startDate: new Date().toISOString().slice(0, 10), lengthDays, flow, note } })); }}>
             <input className="min-h-11 rounded-md border border-line bg-paper px-2" type="number" min={1} max={120} value={lengthDays} onChange={(e) => setLengthDays(Number(e.target.value))} aria-label="Cycle length in days" />

@@ -11,6 +11,7 @@ import os
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from . import metrics, models, series
@@ -26,6 +27,36 @@ app = FastAPI(
         "fronts optional segmentation models. It does not diagnose. No model weights are bundled."
     ),
 )
+
+
+def cors_origins(raw: str | None) -> list[str]:
+    """Explicit browser origins allowed to call this service, from ANATOMYBRIDGE_CORS_ORIGINS (comma-separated).
+
+    Default is none: a browser on another origin cannot read responses unless an operator lists it.
+    A wildcard is refused on purpose, because the service has no authentication of its own.
+    """
+    if not raw:
+        return []
+    out: list[str] = []
+    for part in raw.split(","):
+        o = part.strip().rstrip("/")
+        if not o or o == "*":
+            continue
+        if not (o.startswith("http://") or o.startswith("https://")):
+            continue
+        out.append(o)
+    return out
+
+
+_ORIGINS = cors_origins(os.environ.get("ANATOMYBRIDGE_CORS_ORIGINS"))
+if _ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_ORIGINS,
+        allow_methods=["GET", "POST"],
+        allow_headers=["content-type"],
+        allow_credentials=False,
+    )
 
 
 class Health(BaseModel):

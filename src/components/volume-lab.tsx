@@ -21,6 +21,7 @@ import { measureMask, type MaskMeasurement } from "@/lib/imaging/metrics";
 import { fnv1a, versionFromLab } from "@/lib/imaging/finding-link";
 import { segmentFromSeed, windowFromSeed, type SegmentResult } from "@/lib/imaging/segment";
 import type { Vec3, Volume } from "@/lib/imaging/volume";
+import { checkHealth, compareReports, inspectWithService, serviceUrl, type CrossCheck, type ServiceSeriesReport } from "@/lib/imaging/service-client";
 import { PlaneView } from "./plane-view";
 import { VolumeStage, type VolumeStageHandle } from "./volume-stage";
 
@@ -51,6 +52,15 @@ export type RecordFindingInput = { findingId: string; axes: [number, number, num
 type Params = { mode: "auto" | "manual"; k: number; radius: number; close: number; lower: string; upper: string; smooth: number };
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 30));
+
+/** Optional Python imaging service. Unset = the cross-check card explains how to enable it and sends nothing. */
+const SERVICE_BASE = serviceUrl((import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_IMAGING_SERVICE_URL);
+
+type CrossState =
+  | { phase: "idle" }
+  | { phase: "running" }
+  | { phase: "done"; service: ServiceSeriesReport; check: CrossCheck; at: Date; modelConnected: boolean | null }
+  | { phase: "failed"; error: string };
 const same = (a: Vec3 | null, b: Vec3 | null) => (a && b ? a[0] === b[0] && a[1] === b[1] && a[2] === b[2] : a === b);
 const fmt = (n: number | null | undefined, digits = 1) => (n == null || !Number.isFinite(n) ? "n/a" : n.toFixed(digits));
 
@@ -209,6 +219,9 @@ export function VolumeLab({
   const [recFinding, setRecFinding] = useState("");
   const [recReason, setRecReason] = useState("");
   const [recDone, setRecDone] = useState<string | null>(null);
+  // Files of the series currently shown, kept only in memory so they can be sent for the optional second check.
+  const [seriesFiles, setSeriesFiles] = useState<{ name: string; bytes: Uint8Array }[]>([]);
+  const [cross, setCross] = useState<CrossState>({ phase: "idle" });
 
   const fileInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
@@ -237,6 +250,8 @@ export function VolumeLab({
     try {
       const series = loadSeries(group.files, parse);
       resetWork();
+      setSeriesFiles(group.files);
+      setCross({ phase: "idle" });
       if (series.volume) {
         const v = series.volume;
         const w = autoWindow(v);
@@ -486,6 +501,25 @@ export function VolumeLab({
     });
   }
 
+  async function runCrossCheck() {
+    if (!SERVICE_BASE || !shown || seriesFiles.length === 0) return;
+    setCross({ phase: "running" });
+    const health = await checkHealth(SERVICE_BASE);
+    const res = await inspectWithService(SERVICE_BASE, seriesFiles);
+    if (!res.ok) {
+      setCross({ phase: "failed", error: res.error });
+      return;
+    }
+    const browserRead = Math.max(0, seriesFiles.length - shown.series.skipped.length);
+    setCross({
+      phase: "done",
+      service: res.value,
+      check: compareReports(shown.series.report, browserRead, res.value),
+      at: new Date(),
+      modelConnected: health.ok ? health.value.any_model_connected : null,
+    });
+  }
+
   const shown = opened ?? (reportOnly ? { series: reportOnly.series, source: reportOnly.source, unreadable: reportOnly.unreadable, volume: null } : null);
   const report = shown?.series.report ?? null;
   const plane = PLANES.find((p) => p.axis === axis)!;
@@ -643,6 +677,74 @@ export function VolumeLab({
             </details>
           )}
           <p className="text-xs text-muted">Missing slices are reported, never repaired: interpolated slices would put invented pixels under a measurement.</p>
+        </Card>
+      )}
+
+      {report && shown && (
+        <Card
+          title="Second check · imaging service"
+          aside={
+            <div className="flex flex-wrap gap-2">
+              <Tag>Optional</Tag>
+              {cross.phase === "done" && <Tag tone={cross.check.agreeing === cross.check.comparable ? "pine" : "clay"}>{`${cross.check.agreeing}/${cross.check.comparable} agree`}</Tag>}
+            </div>
+          }
+        >
+          <div data-testid="cross-check">
+            {!SERVICE_BASE ? (
+              <p className="text-sm text-ink-soft">
+                Not configured. To get an independent geometry check from the Python service (pydicom), run <code>imaging-service</code> with <code>ANATOMYBRIDGE_CORS_ORIGINS</code> set to this site&apos;s origin and build the app with <code>VITE_IMAGING_SERVICE_URL</code>. Nothing is sent while this is unset.
+              </p>
+            ) : (
+              <div className="space-y-3">
+                <p className="text-sm text-ink-soft">
+                  Sends the {seriesFiles.length} file{seriesFiles.length === 1 ? "" : "s"} of this series to <span className="font-medium text-ink">{SERVICE_BASE}</span> for a separate geometry check. File names are replaced with neutral ones. The service reads them in memory, returns no patient tags, and stores nothing. The service has no login of its own, so use it only on a trusted network.
+                  {shown.source === "upload" && " Send only de-identified or synthetic data."}
+                </p>
+                <Btn tone="ghost" disabled={busy || cross.phase === "running" || seriesFiles.length === 0} testId="cross-check-run" onClick={() => void runCrossCheck()}>
+                  {cross.phase === "running" ? "Checking…" : cross.phase === "done" ? "Check again" : "Send for a second check"}
+                </Btn>
+                {cross.phase === "failed" && (
+                  <p role="alert" className="rounded-md bg-clay-soft px-3 py-2 text-sm text-clay">{cross.error} The browser result above is unaffected.</p>
+                )}
+                {cross.phase === "done" && (
+                  <div className="space-y-2">
+                    <p className="text-sm font-medium text-ink">{cross.check.summary}</p>
+                    <div className="overflow-x-auto">
+                      <table className="w-full min-w-[34rem] text-left text-sm">
+                        <thead className="text-xs text-muted">
+                          <tr>
+                            <th className="py-1 pr-3 font-medium">Item</th>
+                            <th className="py-1 pr-3 font-medium">Browser (dicom-parser)</th>
+                            <th className="py-1 pr-3 font-medium">Service (pydicom)</th>
+                            <th className="py-1 font-medium">Result</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {cross.check.rows.map((r) => (
+                            <tr key={r.item} className="border-t border-line align-top">
+                              <td className="py-1 pr-3 text-ink">
+                                {r.item}
+                                {r.note && <span className="block text-xs text-muted">{r.note}</span>}
+                              </td>
+                              <td className="py-1 pr-3 tabular-nums text-ink-soft">{r.browser}</td>
+                              <td className="py-1 pr-3 tabular-nums text-ink-soft">{r.service}</td>
+                              <td className="py-1">
+                                {r.agree === null ? <Tag>Not comparable</Tag> : r.agree ? <Tag tone="pine">Agree</Tag> : <Tag tone="clay">Disagree</Tag>}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <p className="text-xs text-muted">
+                      Checked {cross.at.toLocaleTimeString()}. Segmentation model on the service: {cross.modelConnected == null ? "unknown (health check failed)" : cross.modelConnected ? "connected" : "not connected"}. This check is about geometry only. It is not a segmentation and not clinical validation.
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </Card>
       )}
 

@@ -1,0 +1,1135 @@
+Me install packages now, then run tests, typecheck, build.
+
+Me status: install, typecheck, build all pass (62 tests ok). Now adding PCOS adolescent guard, then DB append-only triggers.
+
+Me status: writing DB append-only triggers (migration 0003), fixing reset so it keeps audit log, adding tests.
+
+Me status: 133 app tests pass, tsc clean. Now rebuild, update docs and checklist, then decide on Python imaging service.
+
+Wording differed ("template state"). Retrying with exact text.
+
+Me status: Python service works (25 tests pass, metrics check out by hand). Now tighten weak tests, export OpenAPI, write service docs, update checklist, zip.
+
+Done. Package: `anatomybridge-volume-lab-v4.zip`.
+
+**Verified this session (the last one only wrote code)**
+- `npm ci` worked. `tsc --noEmit` is clean. `vite build` succeeds.
+- `npm run test:app`: 133 pass, 0 fail.
+- Python service: 25 pytest pass.
+
+**Built**
+- **PCOS adolescent guard.** The Context view now shows a note for PCOS patients.
+  - Under 20 by year of birth: possible-adolescent note.
+  - No usable year of birth: age-unknown note.
+  - Adult: ovarian appearance shown as a recorded finding only.
+  - The age-20 line is my own choice. The guideline counts time since first period, which the app does not store, and the note says so.
+  - Ultrasound is never shown as support for a PCOS label.
+  - 6 tests. Not seen in a browser.
+- **Database append-only rules** (`migrations/0003_append_only.sql`).
+  - Triggers refuse UPDATE, TRUNCATE and direct DELETE on `finding_versions`, `reviews`, `correspondence_decisions` and `audit_events`.
+  - Deleting a whole patient still cascades, so erasure and admin reset still work.
+  - `resetWorkspace` no longer deletes audit rows. It keeps the old trail and adds a "reset" line.
+  - 6 tests on PGlite only, not a real Postgres server. A table owner or superuser can drop the triggers.
+- **Python imaging service** (`imaging-service/`).
+  - `/series/inspect` checks series geometry without returning patient tags. This is tested.
+  - `/metrics/score` and `python -m app.score` compute Dice, HD95 and surface distance with physical spacing. Shifted-ball checks gave 5.0 mm and 6.0 mm on anisotropic spacing.
+  - Includes a Dockerfile and a generated `openapi.json`.
+  - The nnU-Net adapter answers 503 with no mask unless you supply weights and a label map. Its prediction code has never run.
+  - The web app does not call this service yet.
+- **`npm test` was hiding the app tests.** The failing scaffold tests stopped the `&&` chain before the AnatomyBridge tests ran. It is now `test:app` then `test:scaffold`.
+
+**Still failing or not done**
+- `test:scaffold`: 14 of 197 fail. I read the cause for 11. The PWA/meta tests expect the template name "Wild Race", and the auth tests expect the unmodified template. I did not read the other 3 and did not fix any.
+- No browser drive of any screen, because no browser is installable here.
+- No real MRI and no UMD data, because figshare is not reachable from this sandbox. So there is still no real-data Dice.
+- No trained model and no MONAI adapter.
+- RBAC is still a demonstration lens.
+- Patent claims, the DPDP Gazette and CDSCO primary documents are still unread.
+
+**Next, in order**
+1. Click through the Volume lab, the "record as version" button and the PCOS note in a browser.
+2. Download UMD under its licence, run nnU-Net or any mask through `python -m app.score`, and get the first real number.
+3. Make the web app call the imaging service.
+4. Store first-period date so the PCOS rule follows the guideline instead of an age line. This is what u have done so far in my project continue the initial prompt which i'm attaching below whatever is remaining # MASTER PROJECT DEVELOPMENT PROMPT
+# ANATOMYBRIDGE — AI-POWERED, EVIDENCE-LINKED WOMEN'S REPRODUCTIVE HEALTHCARE PLATFORM
+
+## YOUR ROLE
+
+Act as a multidisciplinary product development team consisting of:
+
+1. Senior Healthcare Software Architect
+2. Medical Imaging and DICOM Specialist
+3. AI/ML Engineer specializing in medical imaging
+4. Biomedical Image Processing Researcher
+5. Full-Stack Software Engineer
+6. Database and Backend Architect
+7. Medical Data Security Specialist
+8. Clinical Workflow and UX Designer
+9. Healthcare Research Analyst
+10. Software Testing and Quality Assurance Engineer
+
+You are responsible for researching, architecting, designing and implementing the complete AnatomyBridge application.
+
+Do not give me merely a project proposal, theoretical architecture, basic dashboard or frontend mockup.
+
+I want a complete, functional, well-structured software project with a working backend, frontend, database, AI integration architecture, medical imaging pipeline, 3D visualization, evidence management and documentation.
+
+Use your highest available reasoning capability. Work systematically, verify your decisions and produce implementation-ready code.
+
+---
+
+# PART 1 — PROJECT IDENTITY AND OBJECTIVE
+
+## Project name
+
+AnatomyBridge
+
+## Project subtitle
+
+An AI-Powered, Evidence-Linked Platform for Personalised Women's Reproductive Healthcare.
+
+## Central innovation engine
+
+ReproTrace — Reproductive Anatomical Evidence Reconciliation Engine.
+
+## Project overview
+
+Women experiencing reproductive health conditions such as:
+
+- Polycystic Ovary Syndrome (PCOS)
+- Endometriosis
+- Uterine Fibroids
+- Ovarian Cysts
+
+often undergo multiple medical examinations, imaging studies, laboratory assessments and clinical consultations.
+
+However, imaging findings, clinical reports, symptoms, menstrual history and laboratory measurements are frequently documented separately.
+
+AnatomyBridge aims to connect these different sources of information through patient-specific anatomical visualization and an evidence-linked clinical intelligence system.
+
+The platform should process suitable medical imaging data, including MRI and supported volumetric ultrasound, to generate interactive 3D reproductive anatomical representations.
+
+It should connect anatomical findings with their original medical evidence, clinical reports, patient-reported symptoms and historical examinations.
+
+The core technical contribution is ReproTrace, which focuses on:
+
+1. Evidence-to-Anatomy Traceability.
+2. Cross-Examination Anatomical Finding Matching.
+3. Imaging and Clinical Discrepancy Detection.
+4. Versioned Anatomical Memory.
+5. Longitudinal Reproductive Health Evidence Management.
+
+The system should help patients understand their medical information and help healthcare professionals review findings. It must not autonomously diagnose conditions or prescribe treatment.
+
+---
+
+# PART 2 — RESEARCH BEFORE DEVELOPMENT
+
+Do not immediately start coding.
+
+First conduct a detailed investigation of the existing research, products, software systems, datasets, patents and technical approaches relevant to this project.
+
+Use web research wherever available.
+
+## A. Existing product research
+
+Investigate at least:
+
+- Visible Patient
+- Myomatlas
+- 3D Slicer
+- MONAI
+- TotalSegmentator
+- OHIF Viewer
+- Existing PCOS healthcare applications
+- AI-based endometriosis imaging platforms
+- Fibroid segmentation platforms
+- Ovarian cyst imaging and classification solutions
+- Medical imaging annotation and longitudinal tracking software
+
+Find additional competitors and research platforms rather than restricting yourself to this list.
+
+For each existing solution, identify:
+
+1. What it does.
+2. Its technology stack.
+3. Its imaging capabilities.
+4. Its AI capabilities.
+5. Its anatomical visualization capabilities.
+6. Whether it supports longitudinal examination comparisons.
+7. Whether it supports source-level evidence tracking.
+8. Its limitations.
+9. How AnatomyBridge could differ.
+
+## B. Academic research investigation
+
+Search published papers from 2020–2026, giving priority to 2024–2026 research.
+
+Investigate these areas:
+
+- AI-based reproductive imaging.
+- 3D pelvic anatomical reconstruction.
+- MRI and volumetric ultrasound segmentation.
+- PCOS AI assessment.
+- Endometriosis lesion segmentation.
+- Uterine fibroid segmentation and FIGO classification.
+- Ovarian cyst analysis.
+- Medical image registration.
+- Cross-examination lesion correspondence.
+- Clinical report extraction.
+- Medical evidence provenance.
+- Longitudinal medical image analysis.
+- Uncertainty-aware medical AI.
+- Versioned anatomical records.
+
+For each relevant study, provide:
+
+- Paper title.
+- Authors.
+- Publication year.
+- Journal or conference.
+- DOI or official URL.
+- Methodology.
+- Dataset used.
+- Results.
+- Limitations.
+- Relevance to AnatomyBridge.
+
+Do not invent research papers, publication dates, authors, performance metrics or citations.
+
+Clearly distinguish peer-reviewed papers, preprints, commercial products, patents and experimental prototypes.
+
+## C. Patent investigation
+
+Search relevant patent databases, particularly:
+
+- Google Patents.
+- WIPO PATENTSCOPE.
+- Indian Patent Office resources.
+- USPTO.
+
+Investigate patents related to:
+
+- Female pelvic digital twins.
+- Reproductive anatomical visualization.
+- Medical imaging evidence linking.
+- Longitudinal lesion tracking.
+- Cross-modal anatomical correspondence.
+- Versioned medical findings.
+
+For every relevant patent, distinguish:
+
+- Application versus granted patent.
+- Jurisdiction.
+- Filing and publication dates.
+- Legal status, where verifiable.
+- Relevant independent claims.
+- Potential technical overlap.
+
+Do not make definitive legal conclusions about infringement or patentability.
+
+## D. Research gap analysis
+
+Create a feature comparison matrix with these columns:
+
+Existing solution | Existing functionality | Limitation | AnatomyBridge proposed contribution | Validation method.
+
+Identify which aspects are already established and which specific technical contributions are worth investigating.
+
+Do not claim that something is entirely new without supporting evidence.
+
+If the proposed innovation is not sufficiently differentiated, explain what must change before proceeding.
+
+## E. Dataset research
+
+Find actual publicly accessible medical datasets for all four conditions.
+
+Investigate:
+
+- UMD Uterine Myoma MRI Dataset.
+- Public endometriosis MRI or ultrasound datasets.
+- PCOS ultrasound datasets.
+- Ovarian cyst and adnexal lesion datasets.
+- Relevant multimodal clinical datasets.
+
+For each dataset, verify:
+
+- Data modality.
+- Number of subjects and scans.
+- Annotation availability.
+- Whether patient-level records are linked.
+- Whether longitudinal examinations are available.
+- File format.
+- Download procedure.
+- Licence and permitted use.
+- Known dataset limitations.
+
+Never assume that a dataset contains patient-linked longitudinal examinations simply because it contains multiple images.
+
+Recommend the most suitable dataset for the first working prototype.
+
+Do not download or use copyrighted, restricted or identifiable patient data without authorization.
+
+## REQUIRED RESEARCH OUTPUT
+
+Before implementation, produce:
+
+1. Existing systems analysis.
+2. Research literature review.
+3. Patent landscape summary.
+4. Dataset comparison.
+5. Genuine research-gap assessment.
+6. Feasibility assessment.
+7. Recommended MVP scope.
+8. Final technical differentiation statement.
+
+Then proceed with development. Do not stop after writing the research report.
+
+---
+
+# PART 3 — PRODUCT ARCHITECTURE
+
+Build AnatomyBridge as one integrated application with four condition-specific modules and one shared intelligence engine.
+
+## Shared platform components
+
+1. Patient Management.
+2. Medical Imaging Management.
+3. DICOM and Volumetric Image Processing.
+4. AI Segmentation.
+5. 3D Anatomical Reconstruction.
+6. Clinical Report Management.
+7. Anatomy-to-Evidence Linking.
+8. Symptom and Menstrual Tracking.
+9. Longitudinal Health Monitoring.
+10. ReproTrace Intelligence Engine.
+11. Anatomical Memory.
+12. Interactive 3D Viewer.
+13. Clinical Review and Verification.
+14. Patient-Friendly Explanations.
+15. Audit and Security Management.
+
+## Module 1 — PCOS
+
+PCOS must primarily follow a reproductive, hormonal and metabolic health workflow.
+
+Features:
+
+- Menstrual cycle tracking.
+- Irregular cycle documentation.
+- Patient-reported symptoms.
+- Relevant hormonal laboratory result tracking.
+- Metabolic parameter tracking.
+- Relevant ultrasound findings.
+- Ovarian follicular morphology visualization where appropriate.
+- Longitudinal clinical summaries.
+- Personalised, evidence-based educational information.
+
+Do not diagnose PCOS solely from ovarian imaging.
+
+Implement clinical information management in accordance with established PCOS guidelines.
+
+## Module 2 — Endometriosis
+
+Features:
+
+- Pelvic MRI upload.
+- Relevant ultrasound upload where supported.
+- Identification of visible anatomical structures.
+- AI-assisted identification and segmentation of visible lesions.
+- 3D visualization of the uterus, ovaries and surrounding pelvic structures.
+- Spatial relationship mapping.
+- Clinician annotations.
+- Source-image linking.
+- Follow-up examination comparison.
+- Uncertainty and image-quality indicators.
+
+Do not claim that the absence of visible lesions excludes endometriosis.
+
+## Module 3 — Uterine Fibroids
+
+Features:
+
+- Pelvic MRI processing.
+- Uterus and fibroid segmentation.
+- Separate fibroid identification.
+- Measurements and volume calculation.
+- Location classification using FIGO terminology only when supported by the available imaging and clinical review.
+- 3D uterus and fibroid visualization.
+- Link each fibroid to its source imaging and clinical report.
+- Compare follow-up examinations.
+- Preserve previous measurements and annotations.
+
+This should be the primary fully functional medical-imaging demonstration.
+
+## Module 4 — Ovarian Cysts
+
+Features:
+
+- Suitable ovarian imaging upload.
+- Ovary and visible cyst segmentation.
+- Cyst measurements.
+- Location and anatomical relationship visualization.
+- Source-image linking.
+- Clinician-reviewed imaging characterization.
+- Follow-up comparison.
+- Uncertainty reporting.
+
+Do not generate autonomous cancer diagnoses or unsupported malignancy risk scores.
+
+---
+
+# PART 4 — THE CENTRAL INNOVATION: REPROTRACE
+
+This is the most important component of the project.
+
+Do not implement ReproTrace as merely a collection of dashboard cards.
+
+Develop a proper evidence and anatomical finding management architecture.
+
+## Innovation 1 — Anatomy-to-Evidence Intelligence
+
+Every anatomical finding should be represented as a structured object.
+
+For example, when a user selects a fibroid in the 3D visualization, display:
+
+- Finding ID.
+- Anatomical structure.
+- Anatomical coordinates.
+- Associated 3D mesh.
+- Original imaging study.
+- Source series.
+- Relevant DICOM image references.
+- Original source slices.
+- Radiology report.
+- Clinical observations.
+- Measurements.
+- AI-generated segmentation.
+- AI model and version.
+- Clinician verification status.
+- Assessment date.
+
+The user should be able to move between:
+
+3D anatomical finding → Original medical image → Corresponding clinical report → Historical finding record.
+
+Do not invent a source citation when no source is available.
+
+## Innovation 2 — Cross-Examination Anatomical Finding Matching
+
+Implement a system that attempts to determine whether an anatomical finding observed in a new examination corresponds to an existing finding.
+
+Consider:
+
+- Anatomical location.
+- Organ and structure.
+- Spatial coordinates.
+- Image registration.
+- Morphology.
+- Shape and size.
+- Anatomical relationships.
+- Imaging modality.
+- Acquisition differences.
+- Clinical report descriptions.
+
+Use a combination of:
+
+- Spatial registration.
+- Geometric comparison.
+- Feature extraction.
+- AI-assisted matching, where justified.
+- Rule-based consistency checks.
+
+The result should have explicit categories:
+
+- Likely same finding.
+- Potentially new finding.
+- Possible resolved finding.
+- Uncertain correspondence.
+- Requires clinician review.
+
+Never automatically merge findings when the match is uncertain.
+
+## Innovation 3 — Imaging and Clinical Discrepancy Intelligence
+
+Compare findings from different examinations and sources.
+
+Examples:
+
+- Ultrasound versus MRI measurement differences.
+- AI segmentation versus clinician annotation.
+- Current radiology report versus previous report.
+- Different measurement planes.
+- Changes in imaging resolution.
+- Differences in scan acquisition conditions.
+
+The system should distinguish:
+
+- Measurable differences.
+- Differences caused by imaging methods.
+- Segmentation disagreement.
+- Reporting inconsistencies.
+- Unresolved uncertainty.
+
+Do not automatically classify every size difference as disease progression.
+
+Only compare measurements when the anatomical context and measurement methodology make comparison defensible.
+
+## Innovation 4 — Anatomical Memory
+
+Build a versioned anatomical history for each finding.
+
+Each version should preserve:
+
+- Finding ID.
+- Version number.
+- Previous version.
+- Updated measurements.
+- Original and updated imaging references.
+- Segmentation version.
+- Clinical annotation.
+- Reviewer information.
+- Change reason.
+- Timestamp.
+- Verification status.
+
+Use immutable audit events or an append-only history design where practical.
+
+Never silently overwrite previous clinically relevant records.
+
+Support:
+
+- Viewing previous versions.
+- Comparing versions.
+- Viewing changes.
+- Tracking reviewer corrections.
+- Restoring an earlier display state without deleting the historical audit trail.
+
+## Innovation 5 — Symptom-to-Anatomy Context
+
+Build a patient-reported symptom system.
+
+Features:
+
+- Body-location selection.
+- Pain intensity.
+- Symptom description.
+- Duration.
+- Date and time.
+- Menstrual cycle context.
+- Associated reported symptoms.
+- Comparison across visits.
+
+Display symptom locations alongside anatomical visualizations.
+
+Do not claim that symptom location proves that a nearby lesion caused the symptom.
+
+Clearly distinguish patient-reported information from clinician-documented findings.
+
+---
+
+# PART 5 — MEDICAL IMAGING AND AI PIPELINE
+
+Implement a genuine medical imaging pipeline.
+
+## DICOM Processing
+
+Support:
+
+- DICOM series upload.
+- DICOM metadata extraction.
+- Patient and study organisation.
+- Pixel spacing.
+- Slice orientation.
+- Slice position.
+- Slice thickness.
+- Image dimensions.
+- Spatial reconstruction.
+- Missing or inconsistent slice detection.
+- Image orientation validation.
+
+Use established libraries rather than manually implementing the DICOM standard.
+
+## Preprocessing
+
+Investigate and implement suitable methods for:
+
+- Intensity normalization.
+- Image resampling.
+- Noise reduction.
+- Image-quality assessment.
+- Spatial alignment.
+- Cropping and region-of-interest selection.
+
+Any correction should preserve the original scan and maintain a record of preprocessing operations.
+
+## AI Segmentation
+
+Use pretrained medical segmentation models when suitable.
+
+Investigate:
+
+- MONAI.
+- nnU-Net.
+- PyTorch.
+- Relevant public pretrained models.
+
+Select models according to the actual modality, anatomy, annotations and permitted licence.
+
+Do not use a generic model that cannot identify the anatomical structures it claims to segment.
+
+Provide:
+
+- Segmentation masks.
+- Confidence or uncertainty indicators where validated.
+- Manual correction workflow.
+- Model information.
+- Processing history.
+
+## 3D Reconstruction
+
+Implement:
+
+- Image-volume reconstruction.
+- Anatomical segmentation surfaces.
+- Marching Cubes or another appropriate surface extraction method.
+- Surface refinement.
+- Spatially correct meshes.
+- Separate anatomical object viewing.
+- Physical measurements.
+- Mesh export.
+
+Use VTK, PyVista or another justified framework.
+
+## Reconstruction Validation
+
+Provide:
+
+- Dice Similarity Coefficient when reference masks exist.
+- HD95 where appropriate.
+- Surface distance.
+- Volume difference.
+- Connected-component analysis.
+- Mesh-quality checks.
+- Measurement reproducibility.
+
+Never invent segmentation scores or clinical accuracy percentages.
+
+---
+
+# PART 6 — LLM AND CLINICAL INTELLIGENCE
+
+Integrate an LLM for medical document interpretation and patient-friendly explanations.
+
+The LLM must not invent clinical findings.
+
+Use a source-grounded retrieval system.
+
+## Medical document processing
+
+Support:
+
+- PDF reports.
+- DICOM-associated metadata.
+- DOCX.
+- TXT.
+- Structured laboratory reports.
+
+Extract:
+
+- Relevant findings.
+- Anatomical references.
+- Measurements.
+- Clinical terminology.
+- Report dates.
+- Examination details.
+- Recommendations documented by clinicians.
+
+Preserve exact source references and extracted text where legally permitted.
+
+## Evidence-grounded explanations
+
+When a user selects a finding, generate a plain-language explanation based only on:
+
+- The clinician-reviewed report.
+- Verified examination information.
+- Structured clinical records.
+- Reputable medical references.
+
+Display the source of every important explanation.
+
+If the source information is insufficient, state that it is insufficient.
+
+Do not allow the LLM to:
+
+- Independently diagnose a reproductive condition.
+- Prescribe medication.
+- Recommend surgery.
+- Infer malignancy without clinical evidence.
+- Invent laboratory values.
+- Turn uncertain imaging findings into confirmed diagnoses.
+
+Include a clinician review workflow.
+
+---
+
+# PART 7 — TECHNICAL STACK
+
+Evaluate and use a consistent stack.
+
+Recommended starting architecture:
+
+## Frontend
+
+- React.
+- TypeScript.
+- Vite or Next.js.
+- Tailwind CSS.
+- Three.js.
+- Appropriate medical imaging viewer components.
+
+## Backend
+
+- Python.
+- FastAPI.
+- Pydantic.
+- SQLAlchemy.
+- REST APIs.
+
+## Database
+
+- PostgreSQL.
+- JSONB for flexible clinical metadata.
+- pgvector only if semantic retrieval is justified.
+- Proper relational links for evidence, anatomy and version history.
+
+## Medical Imaging
+
+- PyDICOM.
+- SimpleITK.
+- MONAI.
+- PyTorch.
+- VTK.
+- PyVista.
+- Open3D where appropriate.
+
+## File Storage
+
+Use local storage for development and an appropriate object-storage abstraction for deployment.
+
+## AI Services
+
+Keep AI inference modules separate from the main API application.
+
+The system must continue to support its non-AI clinical-record and evidence-management features when an inference model is unavailable.
+
+You may recommend alternatives after researching them, but justify every major technology decision.
+
+---
+
+# PART 8 — DATABASE AND INFORMATION ARCHITECTURE
+
+Create a proper database model.
+
+At minimum, evaluate these entities:
+
+1. Users.
+2. Patients.
+3. Clinicians.
+4. Patient Permissions.
+5. Medical Studies.
+6. Imaging Series.
+7. Imaging Instances.
+8. Anatomical Structures.
+9. Anatomical Findings.
+10. Finding Versions.
+11. Segmentations.
+12. Measurements.
+13. Clinical Reports.
+14. Evidence Links.
+15. Symptoms.
+16. Menstrual Records.
+17. Laboratory Observations.
+18. Clinical Events.
+19. Follow-up Examinations.
+20. Finding Correspondence.
+21. Discrepancy Records.
+22. Clinician Reviews.
+23. AI Model Versions.
+24. Processing History.
+25. Audit Logs.
+
+Provide:
+
+- ER diagram.
+- Table definitions.
+- Primary and foreign keys.
+- Relationships.
+- Constraints.
+- Indexing strategy.
+- Database migrations.
+- Example seed data.
+
+Do not store every DICOM image directly in ordinary relational database fields.
+
+Store imaging files using a suitable file-storage mechanism and keep their metadata and references in the database.
+
+Use synthetic demonstration records and label them clearly.
+
+---
+
+# PART 9 — USER ROLES AND INTERFACES
+
+Build separate, meaningful experiences for different users.
+
+## Patient interface
+
+1. Patient dashboard.
+2. Reproductive health profile.
+3. Symptom tracking.
+4. Menstrual history.
+5. Clinical records.
+6. Imaging history.
+7. Interactive 3D anatomy.
+8. Finding explanations.
+9. Follow-up timeline.
+10. Personal health summaries.
+
+## Clinician interface
+
+1. Clinician dashboard.
+2. Patient list.
+3. Patient record.
+4. Medical imaging viewer.
+5. Segmentation review.
+6. 3D anatomical viewer.
+7. Finding-to-evidence viewer.
+8. Finding correspondence review.
+9. Discrepancy review.
+10. Anatomical history.
+11. Clinical annotation.
+12. Follow-up comparison.
+13. Report generation.
+
+## Administrator interface
+
+1. User management.
+2. Role and permission management.
+3. Dataset management.
+4. AI model management.
+5. Audit logs.
+6. System monitoring.
+
+Build actual workflows, not just decorative screens.
+
+Use role-based access control.
+
+---
+
+# PART 10 — UI AND UX DESIGN REQUIREMENTS
+
+Create a polished, professional healthcare application.
+
+The interface must:
+
+- Look like a real medical technology product.
+- Be easy for patients and clinicians to understand.
+- Avoid unnecessary dashboard clutter.
+- Provide clear navigation.
+- Support responsive desktop and tablet interfaces.
+- Have informative empty states.
+- Have useful loading and error states.
+- Clearly display AI-generated versus clinician-verified information.
+- Give the 3D viewer sufficient screen space.
+- Make medical evidence accessible without overcrowding the interface.
+
+Use professional healthcare typography, clear hierarchy, restrained colours and accessible contrast.
+
+Do not make the interface look like a generic AI-generated template.
+
+The 3D model should be interactive and allow users to:
+
+- Rotate.
+- Zoom.
+- Pan.
+- Select structures.
+- Toggle anatomical layers.
+- Select individual findings.
+- Open linked medical evidence.
+- Compare previous examinations.
+- Inspect measurements.
+
+---
+
+# PART 11 — SECURITY, PRIVACY AND MEDICAL SAFETY
+
+Design the platform with privacy and medical safety from the beginning.
+
+Research applicable Indian requirements, including:
+
+- Digital Personal Data Protection framework.
+- Applicable DPDP Rules and implementation timelines.
+- CDSCO medical device software guidance.
+- Medical-device regulatory applicability based on intended use.
+- Relevant data protection and research ethics requirements.
+
+Use official sources and verify current information.
+
+Implement:
+
+- Password hashing.
+- Authentication.
+- Role-based authorization.
+- Secure API access.
+- Protected file access.
+- Audit logging.
+- Patient consent records.
+- Data minimisation.
+- De-identification workflows.
+- Encryption in transit and appropriate encryption at rest.
+- Safe handling of uploaded documents.
+
+Do not expose patient-identifying DICOM metadata to external LLM APIs.
+
+Do not use real patient information in demo mode.
+
+The project must be presented as a research and clinical communication-support prototype, not an independently validated diagnostic system.
+
+Do not claim regulatory approval.
+
+---
+
+# PART 12 — COMPLETE PROJECT GENERATION
+
+Now build the complete software project.
+
+Do not stop at architecture diagrams or pseudocode.
+
+I expect:
+
+## A. Complete codebase
+
+Generate all necessary files, including:
+
+- Frontend.
+- Backend.
+- Database configuration.
+- Database migrations.
+- Authentication.
+- Medical imaging processing.
+- AI integration.
+- 3D visualization.
+- Evidence management.
+- ReproTrace engine.
+- API routes.
+- Validation.
+- Tests.
+- Environment configuration.
+- Docker configuration where appropriate.
+
+Provide a clear folder structure.
+
+## B. Functional requirements
+
+The following must actually work:
+
+1. User registration and login.
+2. Patient and clinician roles.
+3. Patient health profiles.
+4. Imaging upload.
+5. DICOM parsing.
+6. Metadata extraction.
+7. Basic medical image visualization.
+8. Anatomical segmentation integration.
+9. 3D model generation.
+10. Interactive 3D viewing.
+11. Clinical report upload and extraction.
+12. Evidence-to-anatomy linking.
+13. Finding version management.
+14. Cross-examination matching prototype.
+15. Discrepancy flagging.
+16. Symptom recording.
+17. Longitudinal timelines.
+18. Clinical review.
+19. Audit history.
+20. Data export.
+
+Where a genuine AI model or dataset is unavailable, build a clearly identified integration interface or demonstration mode.
+
+Never represent a simulated AI result as a real model prediction.
+
+## C. API documentation
+
+Document each endpoint, including:
+
+- Method.
+- URL.
+- Required parameters.
+- Request structure.
+- Response structure.
+- Authentication requirements.
+- Error responses.
+
+Generate an OpenAPI-compatible API specification.
+
+## D. Testing
+
+Create:
+
+- Unit tests.
+- Backend API tests.
+- Database tests.
+- File-upload validation tests.
+- DICOM processing tests.
+- Evidence-linking tests.
+- Finding-version tests.
+- Security tests.
+- Frontend workflow tests where practical.
+
+Run the tests if your environment permits.
+
+Report failures honestly.
+
+## E. Project documentation
+
+Generate:
+
+1. README.
+2. Project abstract.
+3. Problem statement.
+4. Research gap.
+5. Objectives.
+6. Existing-system comparison.
+7. Novelty and contributions.
+8. Functional requirements.
+9. Non-functional requirements.
+10. System architecture.
+11. ER diagram.
+12. Data-flow diagram.
+13. AI/ML methodology.
+14. API documentation.
+15. Installation guide.
+16. User manual.
+17. Testing report.
+18. Limitations.
+19. Future scope.
+20. Hackathon demonstration script.
+
+---
+
+# PART 13 — DEVELOPMENT STRATEGY
+
+Follow this development order.
+
+### Phase 1: Research and architecture
+
+Finish the research, novelty comparison, feasibility assessment, dataset selection and software architecture.
+
+### Phase 2: Functional foundation
+
+Create the frontend, backend, database, authentication, roles and patient records.
+
+### Phase 3: Medical imaging
+
+Implement DICOM upload, metadata extraction, volume visualization and 3D reconstruction.
+
+### Phase 4: AI integration
+
+Integrate appropriate segmentation models and create model adapters for the four condition modules.
+
+### Phase 5: ReproTrace engine
+
+Implement evidence linking, anatomical finding correspondence, discrepancy detection and versioned anatomical memory.
+
+### Phase 6: Clinical context
+
+Implement symptoms, menstrual history, laboratory records and patient-friendly source-grounded explanations.
+
+### Phase 7: Testing and validation
+
+Test the workflows with suitable public and synthetic datasets. Clearly identify what has and has not been clinically validated.
+
+### Phase 8: Final delivery
+
+Produce the complete source code, installation guide, documentation and demonstration.
+
+---
+
+# PART 14 — STRICT DEVELOPMENT RULES
+
+Follow these rules throughout the project.
+
+1. Never fabricate research papers, datasets, model performance or clinical results.
+2. Never claim a model has been trained unless it has actually been trained.
+3. Never display fake AI predictions as real results.
+4. Never use placeholder buttons that do nothing.
+5. Never generate pseudocode when functional code is requested.
+6. Never silently replace existing project files or redesign an existing UI unnecessarily.
+7. Inspect the available workspace before making changes.
+8. If a project already exists, preserve its functioning components and build on them.
+9. Use environment variables for all secrets and API keys.
+10. Implement sensible error handling.
+11. Maintain clear separation between frontend, backend, AI services and medical imaging services.
+12. Keep source-image references and processing provenance for every generated finding.
+13. Distinguish AI suggestions, clinician-reviewed findings and confirmed clinical information.
+14. Never infer that two findings are identical when evidence is insufficient.
+15. Do not automatically interpret measurement differences as disease progression.
+16. Do not invent clinical recommendations.
+17. Do not use unlicensed medical datasets or models.
+18. Do not claim that a demo is clinically validated.
+19. Use realistic synthetic data when real data is unavailable and label it explicitly.
+20. Maintain a development checklist and update it as actual functionality is completed.
+
+If something is technically impossible or unsupported, explain the limitation and implement the best defensible alternative.
+
+Do not ask unnecessary questions. Make reasonable technical assumptions, document them and continue.
+
+---
+
+# PART 15 — FINAL ACCEPTANCE CRITERIA
+
+The project will only be considered successfully implemented when:
+
+- The frontend runs.
+- The backend runs.
+- Database migrations work.
+- Authentication works.
+- A patient can maintain a reproductive health profile.
+- An anonymized DICOM study can be uploaded.
+- DICOM metadata can be extracted.
+- At least one real, compatible segmentation workflow can be demonstrated.
+- An interactive 3D anatomical model can be generated and explored.
+- An anatomical finding can be linked to its source imaging evidence.
+- A finding can be versioned without overwriting its history.
+- A follow-up finding comparison can be demonstrated.
+- Discrepancies can be flagged.
+- Clinician verification can be recorded.
+- The application distinguishes real outputs from simulated data.
+- The documentation explains installation and usage.
+- The tests and their results are reported honestly.
+
+## FINAL INSTRUCTION
+
+Begin by completing the research and existing-system investigation.
+
+Then identify and refine the genuine technical contribution of AnatomyBridge and ReproTrace.
+
+Next, design the architecture and immediately start implementing the application.
+
+I do not want just a list of technologies or suggestions. I want the complete project developed in a structured, maintainable and testable form.
+
+Prioritise a working end-to-end uterine fibroid imaging and evidence-linking demonstration first, while building an architecture that can be extended to PCOS, endometriosis and ovarian cysts.
+
+At the end, provide:
+
+1. Final research gap.
+2. Final technical contribution.
+3. Complete project folder structure.
+4. Implemented features.
+5. Features requiring additional datasets or validation.
+6. Installation and execution instructions.
+7. Test results.
+8. Known limitations.
+9. Final hackathon demonstration workflow.
+
+Start now. Do not stop after the planning phase.

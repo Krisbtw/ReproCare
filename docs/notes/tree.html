@@ -1,0 +1,6 @@
+<!doctype html><html><body><script>
+fetch('repo-tree.json').then(r=>r.json()).then(j=>{
+  const p=j.tree.filter(t=>t.type==='blob'&&!t.path.startsWith('.grok')&&!t.path.includes('node_modules')).map(t=>t.path+' '+t.size);
+  let chunk='';for(const x of p){if((chunk+x).length>950){console.log(chunk);chunk='';}chunk+=x+'\n';}console.log(chunk);console.log('TOTAL '+p.length+' truncated='+j.truncated);
+}).catch(e=>console.log('ERR '+e));
+</script></body></html>

@@ -3,6 +3,7 @@ import { getSql, type Sql } from "@/lib/db";
 import { authMiddleware } from "@/lib/auth/middleware";
 import { ENGINE_VERSION } from "../reprotrace/engine";
 import { insertLabVersion } from "./lab-version";
+import { applyMenarcheYear } from "./menarche";
 import type { ExportPayload, VersionRow, Workspace } from "./types";
 import {
   CYCLES,
@@ -224,6 +225,25 @@ export const setActivePatient = createServerFn({ method: "POST" })
     if (!rows.length) throw new Error("That record is not in your workspace.");
     await sql`update profiles set active_patient_id = ${data} where user_id = ${context.userId}`;
     return { ok: true };
+  });
+
+export const setMenarcheYear = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { patientId: string; menarcheYear: number | null; reason: string }) => {
+    if (typeof input.patientId !== "string" || !input.patientId) throw new Error("Record not found.");
+    if (input.menarcheYear !== null && (!Number.isInteger(input.menarcheYear) || input.menarcheYear < 1900 || input.menarcheYear > 2200)) {
+      throw new Error("Enter the year of the first period as a whole year, or clear it.");
+    }
+    const reason = String(input.reason ?? "").trim().slice(0, 300);
+    if (reason.length < 4) throw new Error("Say where the year came from (for example: patient-reported at visit).");
+    return { ...input, reason };
+  })
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    const role = await roleOf(sql, context.userId);
+    // Ownership, lens, plausibility and the audit line (with the earlier value) live in menarche.ts.
+    const result = await applyMenarcheYear(sql, context.userId, role, data, new Date().getFullYear());
+    return { ok: true, changed: result.changed };
   });
 
 const REGIONS = [

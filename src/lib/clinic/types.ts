@@ -4,6 +4,8 @@ export type PatientRow = {
   code: string;
   display_name: string;
   year_of_birth: number | null;
+  /** Year of first period (migration 0004). Year only; null when not recorded. */
+  menarche_year: number | null;
   pathway: string;
   synopsis: string;
   is_self: boolean;

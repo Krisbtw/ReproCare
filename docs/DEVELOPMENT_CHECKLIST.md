@@ -126,3 +126,19 @@ Still not done: browser drive of any screen, real MRI, trained model, Python ima
 New `imaging-service/` (Python 3.12, FastAPI, pydicom, SimpleITK, scipy): `/series/inspect`, `/metrics/score`, `/models`, `/health`, `/segment/{model_id}`, `python -m app.score`, `openapi.json`, Dockerfile. `python -m pytest` 25 pass. Checked by hand: shifted balls give the shift in mm on anisotropic spacing (5.0 mm in-plane, 6.0 mm through-plane); the score CLI ran on a NIfTI pair. Patient tags (name, ID, birth date) are tested not to appear in any response.
 
 Honest limits: the nnU-Net adapter answers 503 and returns no mask without operator weights and a label map; its prediction code has never executed. Uncompressed DICOM only. No authentication on the service. The web app does not call it. No real MRI, no UMD data (figshare is not reachable from this sandbox), so there is still no real-data Dice.
+
+## Update 2026-10-31 (Menarche year, PCOS guideline cycle bands, Imaging service CORS & Client)
+
+Run in this workspace: `tsc --noEmit` clean; `vite build` ok; `npm run test:app` 159 pass, 0 fail.
+
+New:
+- `migrations/0004_menarche_year.sql`: stores year of first period on patient record with range constraint (1900-2200).
+- `src/lib/clinic/menarche.ts` + `menarche.test.ts`: `applyMenarcheYear` handles permission checks and records previous values to append-only audit events.
+- `src/lib/clinic/pcos-context.ts` + tests: upgraded according to the 2023 International PCOS Guideline (Teede et al.) to compute gynecological age (`GynAge`), enforce adolescent ultrasound caution, and evaluate cycle length bands (`cycleBand`, `outsideBand`).
+- `src/lib/clinic/server.ts` + `src/lib/clinic/types.ts`: added `setMenarcheYear` server function and updated `PatientRow`.
+- `imaging-service/app/main.py` + `imaging-service/tests/test_cors.py`: added `CORSMiddleware` configured via `ANATOMYBRIDGE_CORS_ORIGINS`.
+- `src/lib/imaging/service-client.ts` + `service-client.test.ts`: browser client for independent series geometry verification against the Python service (`inspectWithService`, `checkHealth`, `compareReports`).
+- `src/components/clinic-app.tsx`: added menarche year input form, audit logging, PCOS basis badge, and cycle-interval guideline indicators.
+- `src/components/volume-lab.tsx`: added "Second check · imaging service" cross-check card comparing browser (`dicom-parser`) vs service (`pydicom`) series analysis.
+- `tests/verify/run.html`: browser-based test verification runner.
+

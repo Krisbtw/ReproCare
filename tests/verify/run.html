@@ -1,0 +1,59 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>AnatomyBridge Verify</title>
+<script src="https://cdn.jsdelivr.net/npm/typescript@5.6.3/lib/typescript.js"></script>
+</head><body><pre id="out"></pre>
+<script type="module">
+const out = document.getElementById('out');
+const log = (m) => { console.log(m); out.textContent += m + '\n'; };
+
+const testShim = `
+const q = globalThis.__tests = globalThis.__tests || [];
+export function test(name, fn) { q.push({ name, fn, file: globalThis.__curFile }); }
+export default test;
+`;
+const assertShim = `
+function fail(m){ throw new Error(m); }
+const eq = (a,b)=> Object.is(a,b) || a===b;
+function deep(a,b){ return JSON.stringify(a)===JSON.stringify(b); }
+const assert = {
+  equal(a,b,m){ if(!eq(a,b)) fail((m?m+': ':'')+'expected '+JSON.stringify(b)+' got '+JSON.stringify(a)); },
+  deepEqual(a,b,m){ if(!deep(a,b)) fail((m?m+': ':'')+'deepEqual expected '+JSON.stringify(b)+' got '+JSON.stringify(a)); },
+  ok(v,m){ if(!v) fail(m||'not ok'); },
+  match(s,re,m){ if(!re.test(s)) fail((m||'')+' no match '+re+' in '+JSON.stringify(s)); },
+  async rejects(fn,re){ try{ await fn(); }catch(e){ if(re && !re.test(String(e && e.message))) fail('rejected with wrong message '+e.message); return; } fail('did not reject'); },
+};
+export default assert;
+export const { equal, deepEqual, ok, match, rejects } = assert;
+`;
+const blob = (code) => URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+const SHIMS = { 'node:test': blob(testShim), 'node:assert/strict': blob(assertShim) };
+
+async function load(path, mapping) {
+  const src = await (await fetch(path)).text();
+  let js = ts.transpileModule(src, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022, verbatimModuleSyntax: false } }).outputText;
+  for (const [spec, url] of Object.entries({ ...SHIMS, ...mapping })) {
+    js = js.split(`"${spec}"`).join(`"${url}"`);
+  }
+  return blob(js);
+}
+
+try {
+  const pcos = await load('../../src/lib/clinic/pcos-context.ts', {});
+  const client = await load('../../src/lib/imaging/service-client.ts', {});
+  const files = [
+    ['pcos-context.test.ts', '../../src/lib/clinic/pcos-context.test.ts', { './pcos-context.ts': pcos }],
+    ['service-client.test.ts', '../../src/lib/imaging/service-client.test.ts', { './service-client.ts': client }],
+  ];
+  for (const [name, path, map] of files) {
+    globalThis.__curFile = name;
+    await import(await load(path, map));
+  }
+  let pass = 0, failN = 0;
+  for (const t of globalThis.__tests) {
+    try { await t.fn(); pass++; log('PASS ' + t.file + ' :: ' + t.name); }
+    catch (e) { failN++; log('FAIL ' + t.file + ' :: ' + t.name + ' -> ' + (e && e.message)); }
+  }
+  log(`TOTAL pass=${pass} fail=${failN}`);
+} catch (e) { log('HARNESS ERROR ' + (e && e.stack || e)); }
+</script></body></html>
+
