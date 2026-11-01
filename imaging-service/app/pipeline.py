@@ -8,7 +8,26 @@ from __future__ import annotations
 import json
 import math
 import time
+import os
+from datetime import datetime
+try:
+    import requests
+    RequestException = requests.exceptions.RequestException
+except ImportError:
+    requests = None
+    RequestException = Exception
+try:
+    import nibabel
+except ImportError:
+    nibabel = None
 from typing import Any, Dict, List, Optional, Tuple, Union
+from collections import deque
+import scipy
+try:
+    from skimage import measure, morphology
+except ImportError:
+    measure = None
+    morphology = None
 
 import numpy as np
 from scipy import ndimage
@@ -275,16 +294,7 @@ class AIDICOMIntegration:
             )
 
             if response.status_code != 200:
-                raise ValueError(f
-
-Continue the last code form raise line
-11:03 AM
-Claude Opus 5.5
-11:03 AM
-
-Here's the continuation of the AI integration code with complete error handling, fallback mechanisms, and spatial coordinate validation:
-
-                f"AI service returned status {response.status_code}")
+                raise ValueError(f"AI service returned status {response.status_code}")
 
             ai_response = response.json()
 
@@ -564,15 +574,6 @@ Here's the continuation of the AI integration code with complete error handling,
             # Apply transformation to each coordinate
             transformed_coords = []
             for coord in coords:
-                homogeneous = np.append(coord, 
-
-continue the last code from for coord
-11:04 AM
-Claude Opus 5.5
-11:04 AM
-
-Here's the continuation of the coordinate transformation and complete workflow implementation:
-
                 homogeneous = np.append(coord, 1)  # Convert to homogeneous coordinates
                 transformed = transform_matrix @ homogeneous
                 transformed_coords.append(transformed[:3])
@@ -834,14 +835,6 @@ Here's the continuation of the coordinate transformation and complete workflow i
             # Convert to physical coordinates
             physical_coords = coords * spacing
 
-
-continue from physical_coords
-11:05 AM
-Claude Opus 5.5
-11:05 AM
-
-Here's the continuation of the bounding box calculation and completion of the AI integration workflow, including fallback mechanisms and coordinate validation:
-
             # Calculate bounding box
             min_coords = np.min(physical_coords, axis=0)
             max_coords = np.max(physical_coords, axis=0)
@@ -1075,15 +1068,6 @@ Here's the continuation of the bounding box calculation and completion of the AI
             elif metrics['volume_mm3'] < 1000:
                 return ['fibroid', 'leiomyoma']
             elif metrics['volume_mm3'] < 5000:
-                return ['large
-
-Continue from elif metrics['volume_mm3'] < 5000:
-11:05 AM
-Claude Opus 5.5
-11:05 AM
-
-Here's the continuation with anatomical labeling, mesh generation, and complete workflow completion:
-
                 return ['large_fibroid', 'subserosal_fibroid']
             elif metrics['volume_mm3'] < 20000:
                 return ['very_large_fibroid', 'pedunculated_fibroid']
@@ -1333,15 +1317,7 @@ Here's the continuation with anatomical labeling, mesh generation, and complete 
             # Check for degenerate faces
             for face in mesh['faces']:
                 if len(face) != 3:
-                   
-
-Continue from for face in mesh['faces']:
-11:06 AM
-Claude Opus 5.5
-11:06 AM
-
-Here's the continuation of the mesh validation and completion of the AI integration workflow with fallback mechanisms:
-
+                    return False
                 if len(set(face)) != 3:  # Duplicate vertices in face
                     return False
 
@@ -1581,15 +1557,7 @@ Here's the continuation of the mesh validation and completion of the AI integrat
                     'method': 'region_growing',
                     'parameters': segmentation.get('region_growing_params', {}),
                     'reason': segmentation.get('fallback_reason', 'ai_uncertainty'),
-                    'confidence': segmentation.get('region_growing_confidence', 0.
-
-Continue from  'reason': segmentation.get('fallback_reason', 'ai_uncertainty'),
-11:07 AM
-Claude Opus 5.5
-11:07 AM
-
-Here's the continuation with the completion of classical method tracking, error handling, and the final workflow integration:
-
+                    'confidence': segmentation.get('region_growing_confidence', 0.0),
                     'timestamp': segmentation.get('region_growing_timestamp', datetime.now().isoformat())
                 })
 
@@ -1663,14 +1631,14 @@ Here's the continuation with the completion of classical method tracking, error 
             self._log_error(f"Source image references failed: {str(e)}")
             return []
 
-    def _calculate_slice_thickness(self, instance):
+    def _calculate_slice_thickness(self, instance, volume=None):
         """Calculate slice thickness from DICOM instance"""
         try:
             if hasattr(instance, 'SliceThickness'):
                 return float(instance.SliceThickness)
 
             # Fallback calculation if SliceThickness not available
-            if len(volume.dicom_series) > 1:
+            if volume is not None and hasattr(volume, 'dicom_series') and len(volume.dicom_series) > 1:
                 prev_instance = volume.dicom_series[volume.dicom_series.index(instance) - 1]
                 current_pos = [float(p) for p in instance.ImagePositionPatient]
                 prev_pos = [float(p) for p in prev_instance.ImagePositionPatient]
@@ -1834,22 +1802,12 @@ Here's the continuation with the completion of classical method tracking, error 
             ]
 
         except Exception as e:
-            self._log_error(f"Reference points retrieval failed: {str(e
-
-Continue from except Exception as e:
-11:08 AM
-Claude Opus 5.5
-11:08 AM
-
-Here's the continuation with the completion of the reference points handling, error handling framework, and the final integration of the AI workflow with fallback mechanisms:
-
             self._log_error(f"Reference points retrieval failed: {str(e)}")
             return [{
                 'point_type': 'error',
                 'error': str(e),
                 'timestamp': datetime.now().isoformat()
             }]
-        }
 
     def _create_versioned_record(self, provenance_record):
         """Create versioned record of the finding"""
@@ -2082,15 +2040,6 @@ Here's the continuation with the completion of the reference points handling, er
         try:
             # This would be enhanced with actual error analysis from the AI service
             # For now, we'll make some educated guesses based on the request
-
-            # Check
-
-Continue from # For now, we'll make some educated guesses based on the request
-11:08 AM
-Claude Opus 5.5
-11:08 AM
-
-Here's the continuation with comprehensive AI failure analysis, fallback strategies, and complete error handling:
 
             # Check request complexity that might cause timeouts
             volume_size = np.prod(ai_request['input']['volume_data'].shape)
@@ -2338,15 +2287,6 @@ Here's the continuation with comprehensive AI failure analysis, fallback strateg
                 errors.append('empty_volume')
 
             # Check for inconsistent spacing
-            coords = ai_request['
-
-Continue from   # Check for inconsistent spacing
-11:09 AM
-Claude Opus 5.5
-11:09 AM
-
-Here's the continuation with comprehensive input validation analysis, correction mechanisms, and the complete region growing fallback implementation:
-
             coords = ai_request['input'].get('coordinates', {})
             if 'spacing' in coords:
                 spacing = coords['spacing']
@@ -2573,15 +2513,6 @@ Here's the continuation with comprehensive input validation analysis, correction
 
                 if region is not None:
                     # Merge with existing segmentation
-                   
-
-Continue from   if region is not None:
-11:10 AM
-Claude Opus 5.5
-11:10 AM
-
-Here's the continuation with the complete region growing implementation and classical method integration:
-
                     # Merge with existing segmentation
                     segmentation_mask = np.maximum(segmentation_mask, region)
 
@@ -2798,15 +2729,6 @@ Here's the continuation with the complete region growing implementation and clas
             # Calculate surface area
             surface_area = self._calculate_surface_area(mask, params.get('spacing', [1.0, 1.0, 1.0]))
 
-            #
-
-Continue from # Calculate surface area
-11:11 AM
-Claude Opus 5.5
-11:11 AM
-
-Here's the continuation with comprehensive metrics calculation and classical method validation:
-
             # Calculate surface area (using gradient method)
             surface_area_mm2 = self._calculate_surface_area(mask, params.get('spacing', [1.0, 1.0, 1.0]))
 
@@ -2820,6 +2742,7 @@ Here's the continuation with comprehensive metrics calculation and classical met
             bounding_box = self._calculate_bounding_box(mask, params.get('spacing', [1.0, 1.0, 1.0]))
 
             # Calculate intensity statistics
+            total_voxels = int(np.sum(mask > 0))
             region_intensity = volume_data[mask > 0]
             mean_intensity = np.mean(region_intensity)
             std_intensity = np.std(region_intensity)
@@ -2880,6 +2803,7 @@ Here's the continuation with comprehensive metrics calculation and classical met
         try:
             # Calculate intensity consistency
             seed_intensity = volume_data[tuple(params['seed_points'][0])]
+            total_voxels = int(np.sum(mask > 0))
             region_intensity = volume_data[mask > 0]
             intensity_consistency = 1.0 - np.mean(abs(region_intensity - seed_intensity) / (params['threshold'] + 1e-6))
 
@@ -3011,6 +2935,7 @@ Here's the continuation with comprehensive metrics calculation and classical met
 
             # Check 3: Intensity consistency
             seed_intensity = volume_data[tuple(params['seed_points'][0])]
+            total_voxels = int(np.sum(mask > 0))
             region_intensity = volume_data[mask > 0]
             intensity_diff = np.mean(abs(region_intensity - seed_intensity))
 
@@ -3025,15 +2950,6 @@ Here's the continuation with comprehensive metrics calculation and classical met
                 validation['issues'].append('multiple_components')
 
             # Check 5: Reasonable shape
-            compactness = self._calculate_compactness(mask, params.get('spacing', [1.0,
-
-Continue from # Check 5: Reasonable shape
-11:12 AM
-Claude Opus 5.5
-11:12 AM
-
-Here's the continuation with comprehensive validation checks and the complete classical method integration:
-
             compactness = self._calculate_compactness(mask, params.get('spacing', [1.0, 1.0, 1.0]))
             if compactness < 0.1 or compactness > 1.0:  # Unrealistic compactness values
                 validation['valid'] = False
@@ -3049,6 +2965,7 @@ Here's the continuation with comprehensive validation checks and the complete cl
                 validation['issues'].append('anatomically_unlikely')
 
             # Check 8: Intensity range plausibility
+            total_voxels = int(np.sum(mask > 0))
             region_intensity = volume_data[mask > 0]
             if len(region_intensity) > 0:
                 mean_int = np.mean(region_intensity)
@@ -3111,6 +3028,7 @@ Here's the continuation with comprehensive validation checks and the complete cl
                 return True
 
             # Check intensity characteristics
+            total_voxels = int(np.sum(mask > 0))
             region_intensity = volume_data[mask > 0]
             if len(region_intensity) > 0:
                 mean_int = np.mean(region_intensity)
@@ -3200,6 +3118,7 @@ Here's the continuation with comprehensive validation checks and the complete cl
                 labels.append('spherical_structure')
 
             # Intensity-based classification
+            total_voxels = int(np.sum(mask > 0))
             region_intensity = volume_data[mask > 0]
             if len(region_intensity) > 0:
                 mean_int = np.mean(region_intensity)
@@ -3252,15 +3171,6 @@ Here's the continuation with comprehensive validation checks and the complete cl
             }, volume)
 
             mesh = self._generate_mesh({
-                'mask': processed['
-
-Continue from    mesh = self._generate_mesh({
-11:12 AM
-Claude Opus 5.5
-11:12 AM
-
-Here's the completion of the manual segmentation fallback and the final integration of all fallback mechanisms:
-
                 'mask': processed['mask'],
                 'metrics': processed['metrics']
             }, volume)
@@ -3484,15 +3394,6 @@ Here's the completion of the manual segmentation fallback and the final integrat
             self._log_error(f"Mask format conversion failed: {str(e)}")
             return np.zeros_like(mask, dtype=np.uint8)
 
-    def _calculate_segmentation_metrics(self, mask, coordinates
-
-Continue from   return np.zeros_like(mask, dtype=np.uint8)
-11:13 AM
-Claude Opus 5.5
-11:13 AM
-
-Here's the completion of the segmentation metrics calculation with comprehensive spatial analysis and the final integration of all processing components:
-
     def _calculate_segmentation_metrics(self, mask, coordinates):
         """Calculate comprehensive segmentation metrics"""
         try:
@@ -3587,7 +3488,7 @@ Here's the completion of the segmentation metrics calculation with comprehensive
 
             # Compactness is inversely related to surface area for given volume
             # Using modified formula to avoid division by zero
-            compactness = 1.0 / (1.0 + (surface_area / (6.0 * np.pi * (volume/4.0/np.pi)**(2/3)))))
+            compactness = 1.0 / (1.0 + (surface_area / (6.0 * np.pi * (volume/4.0/np.pi)**(2/3))))
 
             # Normalize to 0-1 range
             return max(0.0, min(1.0, compactness))
@@ -3718,15 +3619,6 @@ Here's the completion of the segmentation metrics calculation with comprehensive
                 'back_right_lower': 0,
                 'back_right_upper': 0
             }
-
-            for
-
-Continue from 'back_right_upper': 0
-11:14 AM
-Claude Opus 5.5
-11:14 AM
-
-Here's the continuation with the octant distribution calculation and completion of the spatial analysis:
 
             for coord in physical_coords:
                 # Determine octant based on centroid
@@ -3957,16 +3849,7 @@ Here's the continuation with the octant distribution calculation and completion 
 
             # Calculate skewness
             skewness = (np.sum((np.arange(len(probs)) - mean)**3 * probs) /
-                       (std_dev**
-
-Continue from  # Calculate skewness
-11:14 AM
-Claude Opus 5.5
-11:14 AM
-
-Here's the completion of the skewness calculation and the final volume characteristics analysis:
-
-                       (std_dev**3)))
+                       (std_dev**3))
 
             return float(skewness)
 
@@ -4192,15 +4075,6 @@ Here's the completion of the skewness calculation and the final volume character
             self._log_error(f"Perimeter calculation failed: {str(e)}")
             return 0.0
 
-    def _calculate_sphericity(self,
-
-Continue from return 0.0
-11:15 AM
-Claude Opus 5.5
-11:15 AM
-
-Here's the continuation with the sphericity calculation and the final confidence estimation methods:
-
     def _calculate_sphericity(self, mask, spacing):
         """Calculate sphericity (π^(1/3) * (6V)^(2/3) / A)"""
         try:
@@ -4420,15 +4294,6 @@ Here's the continuation with the sphericity calculation and the final confidence
                 'irregular': 0.6,
                 'unknown': 0.5
             }.get(shape_chars['shape_type'], 0.5)
-
-            # Get aspect ratio
-
-Continue from }.get(shape_chars['shape_type'], 0.5)
-11:15 AM
-Claude Opus 5.5
-11:15 AM
-
-Here's the continuation with the complete confidence calculation and anatomical position classification:
 
             # Get aspect ratio confidence
             aspect_ratio_confidence = 1.0 - abs(shape_chars['aspect_ratios'][0] - 1.0) * 0.5 - \
@@ -4655,15 +4520,6 @@ Here's the continuation with the complete confidence calculation and anatomical 
             # Combine factors
             confidence = (
                 0.2 * size_confidence +
-                0.
-
-Continue  from  # Combine factors
-11:16 AM
-Claude Opus 5.5
-11:16 AM
-
-Here's the completion of the position confidence calculation and the spatial relationships analysis:
-
                 0.15 * position_factors['left_right'] +
                 0.15 * position_factors['anterior_posterior'] +
                 0.15 * position_factors['inferior_superior'] +
@@ -4867,15 +4723,6 @@ Here's the completion of the position confidence calculation and the spatial rel
             # 4. Boundary validation
             surface_area = metrics.get('surface_area_mm2', 0)
             if volume_mm3 > 0 and surface_area > 0:
-                expected_surface_area = 6 * np.pi * (volume_mm3/
-
-continue from if volume_mm3 > 0 and surface_area > 0:
-11:17 AM
-Claude Opus 5.5
-11:17 AM
-
-Here's the continuation of the comprehensive validation with boundary analysis and additional quality checks:
-
                 expected_surface_area = 6 * np.pi * (volume_mm3/4/np.pi)**(2/3)
                 surface_ratio = surface_area / expected_surface_area
 
@@ -5063,15 +4910,6 @@ Here's the continuation of the comprehensive validation with boundary analysis a
                     'boundary_quality': 0.0,
                     'position_appropriateness': 0.0,
                     'processing_consistency': 0.0,
-                   
-
-Continue from 'processing_consistency': 0.0,
-11:18 AM
-Claude Opus 5.5
-11:18 AM
-
-Here's the completion of the quality assessment with detailed metrics and recommendation generation:
-
                     'anatomical_plausibility': 0.0
                 },
                 'detailed_metrics': {},
@@ -5290,15 +5128,6 @@ Here's the completion of the quality assessment with detailed metrics and recomm
                 summary['processing_steps'].append('Intensity thresholding')
                 summary['processing_steps'].append('Connectivity analysis')
 
-            elif processing_method
-
-Continue from summary['processing_steps'].append('Connectivity analysis')
-11:19 AM
-Claude Opus 5.5
-11:19 AM
-
-Here's the continuation with the processing summary completion and final confidence calculation:
-
             elif processing_method == 'manual_segmentation':
                 summary['method_parameters'] = {
                     'reviewer': metrics.get('manual_reviewer', 'unknown'),
@@ -5486,6 +5315,7 @@ Here's the continuation with the processing summary completion and final confide
 
             # Intensity-based classification (if volume data available)
             if volume_data is not None and len(volume_data) > 0:
+                total_voxels = int(np.sum(mask > 0))
                 region_intensity = volume_data[mask > 0]
                 if len(region_intensity) > 0:
                     mean_intensity = np.mean(region_intensity)
@@ -5505,15 +5335,6 @@ Here's the continuation with the processing summary completion and final confide
 
             # Remove duplicates and return
             return list(set(labels))
-
-       
-
-Continue from # Remove duplicates and return
-11:19 AM
-Claude Opus 5.5
-11:19 AM
-
-Here's the completion of the anatomical label generation with final classification and confidence weighting:
 
             # Apply confidence-based filtering
             filtered_labels = []
@@ -5651,7 +5472,7 @@ Here's the completion of the anatomical label generation with final classificati
             if volume_mm3 > 5000:
                 labels.append(("potentially_clinically_significant_fibroid", 0.8))
             elif volume_mm3 > 2000:
-                labels.append(("potentially_symptomatic_fibroid", 0.7)
+                labels.append(("potentially_symptomatic_fibroid", 0.7))
 
             # Filter low-confidence labels
             return [label for label, confidence in labels if confidence > 0.6]
@@ -5734,15 +5555,7 @@ Here's the completion of the anatomical label generation with final classificati
             if compactness < 0.1 or compactness > 1.0:
                 return {
                     'consistent': False,
-                    'issue
-
-Continue from if compactness < 0.1 or compactness > 1.0:
-11:20 AM
-Claude Opus 5.5
-11:20 AM
-
-Here's the continuation of the segmentation consistency validation with additional checks and comprehensive analysis:
-
+                    'issue': 'unrealistic_compactness',
                     'severity': 'medium',
                     'details': {
                         'compactness': compactness,
@@ -5958,15 +5771,7 @@ Here's the continuation of the segmentation consistency validation with addition
                 expected_surface_area = 6 * np.pi * (volume_mm3/4/np.pi)**(2/3)
                 surface_ratio = surface_area / expected_surface_area
                 components['volume_surface_consistency'] = max(
-
-Continue from   if volume_mm3 > 0:
-11:21 AM
-Claude Opus 5.5
-11:21 AM
-
-Here's the continuation of the comprehensive consistency score calculation with all component evaluations:
-
-                0.0, min(1.0, 1.0 - abs(np.log10(surface_ratio)) * 0.2))
+                    0.0, min(1.0, 1.0 - abs(np.log10(surface_ratio)) * 0.2))
 
             # Compactness consistency
             components['compactness_consistency'] = max(0.0, min(1.0,
@@ -6137,15 +5942,6 @@ Here's the continuation of the comprehensive consistency score calculation with 
 
             # Volume-surface relationship
             if volume_mm3 > 0:
-                expected_surface_area = 6 * np.pi * (volume_mm3/4/np.pi)**(2
-
-Continue from   if volume_mm3 > 0:
-11:22 AM
-Claude Opus 5.5
-11:22 AM
-
-Here's the continuation of the consistency details generation:
-
                 expected_surface_area = 6 * np.pi * (volume_mm3/4/np.pi)**(2/3)
                 surface_ratio = surface_area / expected_surface_area
                 details['volume_surface_relationship']['expected_surface_area'] = expected_surface_area
@@ -6354,15 +6150,6 @@ Here's the continuation of the consistency details generation:
             volume_params = {
                 'volume_rendering': {
                     'opacity': 0.7,
-                    'color': [255, 100
-
-Continue from  volume_params = {
-11:23 AM
-Claude Opus 5.5
-11:23 AM
-
-Here's the continuation of the volume visualization parameters with comprehensive 3D rendering specifications:
-
                     'color': [255, 100, 100],  # Default red color for fibroids
                     'edge_color': [200, 0, 0],
                     'edge_width': 1.0,
@@ -6566,16 +6353,6 @@ Here's the continuation of the volume visualization parameters with comprehensiv
                 'boundary_metrics': {
                     'surface_area_mm2': metrics.get('surface_area_mm2', 0),
                     'surface_roughness': metrics.get('volume_characteristics', {}).get('surface_roughness', 0.5),
-                    'fractal_dimension': self._calculate_fractal_dimension(mask),
-                   
-
-Continue from  'surface_roughness': metrics.get('volume_characteristics', {}).get('surface_roughness', 0.5),
-11:24 AM
-Claude Opus 5.5
-11:24 AM
-
-Here's the continuation of the boundary visualization parameters with detailed boundary analysis and visualization features:
-
                     'fractal_dimension': self._calculate_fractal_dimension(mask),
                     'mean_curvature': metrics.get('volume_characteristics', {}).get('mean_curvature', 0.0),
                     'gaussian_curvature': metrics.get('volume_characteristics', {}).get('gaussian_curvature', 0.0),
@@ -6790,16 +6567,6 @@ Here's the continuation of the boundary visualization parameters with detailed b
 
             edge_lengths = np.linalg.norm(edges, axis=2)
 
-            # Calculate face areas
-            face_areas = np.zeros
-
-Continue from # Calculate face areas
-11:24 AM
-Claude Opus 5.5
-11:24 AM
-
-Here's the continuation of the boundary complexity calculation with complete implementation:
-
             # Calculate face areas using Heron's formula approximation
             a, b, c = edge_lengths.T
             s = (a + b + c) / 2
@@ -6977,15 +6744,6 @@ Here's the continuation of the boundary complexity calculation with complete imp
 
             # Calculate quality components
             components = {
-                'smoothness': max(0.0, 1
-
-Continue from  components = {
-11:25 AM
-Claude Opus 5.5
-11:25 AM
-
-Here's the continuation of the boundary quality score calculation with complete implementation:
-
                 'smoothness': max(0.0, 1.0 - surface_roughness * 1.2),
 
                 'curvature_appropriateness': max(0.0, min(1.0,
@@ -7182,15 +6940,6 @@ Here's the continuation of the boundary quality score calculation with complete 
             if surface_roughness > 0.7:
                 recommendations.append({
                     'severity': 'high',
-                    'message': 'High surface roughness detected. Boundary appears irregular
-
-Continue from 'severity': 'high',
-11:26 AM
-Claude Opus 5.5
-11:26 AM
-
-Here's the continuation of the boundary quality recommendations with comprehensive analysis and actionable suggestions:
-
                     'message': 'High surface roughness detected. Boundary appears irregular and may contain artifacts or over-segmentation.',
                     'recommended_actions': [
                         'Apply Gaussian smoothing filter (σ=1-2 voxels)',
