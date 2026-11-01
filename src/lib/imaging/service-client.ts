@@ -52,10 +52,17 @@ export function serviceUrl(raw: string | null | undefined): string | null {
   }
 }
 
-/** Configured bearer token or API key for authenticating with the imaging service. */
+/** Configured bearer token or API key for authenticating with the imaging service.
+ *
+ * @deprecated Direct browser-to-service calls with a token are superseded by the server-side
+ * proxy at /api/imaging-proxy/*. This function is kept so that existing callers that pass an
+ * explicit `token` argument (e.g. tests or the /health check from an operator admin page) still
+ * work, but it NO LONGER reads VITE_IMAGING_SERVICE_TOKEN from the environment — that variable
+ * should be removed from deployments. The proxy reads ANATOMYBRIDGE_SERVICE_API_KEY from
+ * server-side process.env, which is never inlined into the browser bundle.
+ */
 export function serviceToken(raw?: string | null | undefined): string | null {
-  const envVal = (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_IMAGING_SERVICE_TOKEN;
-  const t = typeof raw === "string" ? raw.trim() : typeof envVal === "string" ? envVal.trim() : "";
+  const t = typeof raw === "string" ? raw.trim() : "";
   return t.length > 0 ? t : null;
 }
 

@@ -225,8 +225,24 @@ export function matchStudies(
 
 export type StudyGroup = { studyId: string; date: string; snaps: Snap[] };
 
-/** Spatial match uses only observations that actually have a centroid. */
-export function matchChronology(groups: StudyGroup[]): Proposal[] {
+/**
+ * Spatial match uses only observations that actually have a centroid.
+ *
+ * @param groups       Chronologically ordered groups of finding snapshots, one per study.
+ * @param registrations Optional map from `"${fromStudyId}:${toStudyId}"` to a registration
+ *   result. When provided, consecutive study pairs that have a matching registration entry use
+ *   the registration transform to correct centroid positions before matching — reducing the
+ *   number of `provisional: true` proposals.
+ *
+ *   NOTE: As of ReproTrace rules engine v1, registration results are only consumed here.
+ *   The Volume Lab registration workflow (registration.ts) runs independently and its results
+ *   must be threaded in by the caller. See DEVELOPMENT_CHECKLIST.md §T08 for the current
+ *   gap: there is no UI path that automatically feeds Volume Lab registration output here.
+ */
+export function matchChronology(
+  groups: StudyGroup[],
+  registrations?: Map<string, { supported: boolean; transform?: RegistrationTransform }> | null,
+): Proposal[] {
   const spatial = groups
     .map((g) => ({
       ...g,
@@ -236,7 +252,10 @@ export function matchChronology(groups: StudyGroup[]): Proposal[] {
     .sort((a, b) => a.date.localeCompare(b.date));
   const out: Proposal[] = [];
   for (let i = 1; i < spatial.length; i += 1) {
-    out.push(...matchStudies(spatial[i - 1].snaps, spatial[i].snaps));
+    const fromStudyId = spatial[i - 1].studyId;
+    const toStudyId = spatial[i].studyId;
+    const reg = registrations?.get(`${fromStudyId}:${toStudyId}`) ?? null;
+    out.push(...matchStudies(spatial[i - 1].snaps, spatial[i].snaps, reg));
   }
   return out;
 }

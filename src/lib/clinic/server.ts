@@ -36,7 +36,7 @@ async function audit(sql: Sql, userId: string, action: string, entityType: strin
 
 async function roleOf(sql: Sql, userId: string): Promise<string> {
   const rows = await sql<{ role: string }>`select role from profiles where user_id = ${userId}`;
-  return rows[0]?.role ?? "clinician";
+  return rows[0]?.role ?? "patient";
 }
 
 async function seed(sql: Sql, userId: string) {
@@ -115,7 +115,7 @@ async function seed(sql: Sql, userId: string) {
 }
 
 async function ensure(sql: Sql, userId: string) {
-  await sql`insert into profiles (user_id, display_name, role) values (${userId}, ${""}, ${"clinician"}) on conflict (user_id) do nothing`;
+  await sql`insert into profiles (user_id, display_name, role) values (${userId}, ${""}, ${"patient"}) on conflict (user_id) do nothing`;
   const n = await sql<{ n: number }>`select count(*)::int as n from patients where user_id = ${userId}`;
   if (asNumber(n[0]?.n) === 0) {
     try {

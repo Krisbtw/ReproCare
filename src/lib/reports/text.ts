@@ -276,7 +276,7 @@ export async function decodePdf(bytes: Uint8Array): Promise<{ text: string; warn
     texts.push(textFromContentStream(content));
   }
   const extractedText = texts.join("\n");
-  const isScanned = images > 0 && extractedText.trim().length < 80;
+  const isScanned = images > 0 && extractedText.trim().length < 200;
   if (isScanned) {
     warnings.push("SCANNED PDF LIMITATION: This document contains image-only or scanned pages. In-browser OCR is not supported; text could not be extracted automatically. Please upload a digital text-based PDF or paste text directly.");
   }

@@ -78,3 +78,4 @@ test("registerVolumes flags unsupported when volumes have poor overlap or extrem
   // Because overlap is minimal and shift is large, supported is false or notes indicate poor overlap
   assert.ok(reg.notes.length > 0);
 });
+

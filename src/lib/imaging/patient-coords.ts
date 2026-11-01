@@ -184,3 +184,4 @@ export function meshBounds(mesh: Mesh): { min: Vec3; max: Vec3; center: Vec3; sp
   const span: Vec3 = [maxX - minX, maxY - minY, maxZ - minZ];
   return { min, max, center, span };
 }
+

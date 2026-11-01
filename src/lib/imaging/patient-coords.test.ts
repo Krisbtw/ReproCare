@@ -98,3 +98,4 @@ test("transformMeshToPatient transforms all vertices and preserves topology", ()
   assert.deepEqual(b.max, [110, 210, 300]);
   assert.deepEqual(b.center, [105, 205, 300]);
 });
+

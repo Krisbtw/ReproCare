@@ -31,7 +31,7 @@ if torch is not None:
             return self.conv(x)
 
     class SimpleUnet3D(nn.Module):
-        """Standard 3D U-Net for 4-class segmentation (background + 4 UMD anatomical structures)."""
+        """Standard 3D U-Net for 5-class segmentation (0=background, 1=uterine_wall, 2=cavity, 3=myoma, 4=nabothian)."""
 
         def __init__(self, in_channels: int = 1, num_classes: int = 5, base_filters: int = 16):
             super().__init__()
@@ -87,3 +87,4 @@ else:
     class SimpleUnet3D:  # type: ignore[no-redef]
         def __init__(self, *args, **kwargs):
             raise RuntimeError("PyTorch is required to instantiate SimpleUnet3D.")
+

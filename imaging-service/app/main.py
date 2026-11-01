@@ -6,11 +6,12 @@ Nothing here stores uploads. Files are read in memory and dropped after the resp
 """
 from __future__ import annotations
 
-import io
+import base64
 import os
+import zlib
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -54,7 +55,7 @@ if _ORIGINS:
         CORSMiddleware,
         allow_origins=_ORIGINS,
         allow_methods=["GET", "POST"],
-        allow_headers=["content-type"],
+        allow_headers=["authorization", "content-type", "x-api-key"],
         allow_credentials=False,
     )
 
@@ -161,9 +162,15 @@ async def segment(
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     out = adapter.run(vol, spacing)
-    seg = out.pop("label_volume_zyx")
-    out["shape_zyx"] = list(seg.shape)
+    seg: np.ndarray = out.pop("label_volume_zyx")
+    # Serialize the mask as base64-encoded zlib-compressed bytes so the browser
+    # can reconstruct the voxel array without a separate binary endpoint.
+    seg_u8 = seg.astype(np.uint8)
+    compressed = zlib.compress(seg_u8.tobytes(), level=6)
+    out["mask_b64_zlib"] = base64.b64encode(compressed).decode("ascii")
+    out["mask_dtype"] = "uint8"
+    out["shape_zyx"] = list(seg_u8.shape)
     out["spacing_zyx_mm"] = list(spacing)
-    out["label_counts"] = {str(int(v)): int(c) for v, c in zip(*np.unique(seg, return_counts=True))}
+    out["label_counts"] = {str(int(v)): int(c) for v, c in zip(*np.unique(seg_u8, return_counts=True))}
     out["series_report"] = rep.to_dict()
     return out

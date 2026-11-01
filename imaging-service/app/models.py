@@ -132,6 +132,7 @@ class UmdMonaiAdapter:
     intended = ["uterine_wall", "cavity", "myoma", "nabothian"]
     licence_note = "Trained on UMD dataset (CC BY 4.0). Not validated for standalone clinical diagnosis."
     labels = {
+        "0": "background",
         "1": "uterine_wall",
         "2": "cavity",
         "3": "myoma",

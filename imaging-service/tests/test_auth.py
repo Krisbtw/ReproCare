@@ -36,3 +36,4 @@ def test_auth_enforced_when_env_key_is_set(monkeypatch):
     # Protected endpoint with correct X-API-Key header succeeds
     r5 = client.get("/models", headers={"X-API-Key": "secret-token-1234"})
     assert r5.status_code == 200
+
