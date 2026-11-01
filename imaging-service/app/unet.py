@@ -4,9 +4,9 @@ Can be instantiated with PyTorch and trained via train_umd.py or used with MONAI
 from __future__ import annotations
 
 try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
+    import torch  # type: ignore
+    import torch.nn as nn  # type: ignore
+    import torch.nn.functional as F  # type: ignore
 except ImportError:
     torch = None
     nn = object
