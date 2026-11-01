@@ -43,3 +43,4 @@ def test_discrepancy_detection_new_unmatched():
     disc = detect_discrepancies(current, historical)
     assert len(disc) == 1
     assert disc[0]["type"] == "unmatched_new_finding"
+

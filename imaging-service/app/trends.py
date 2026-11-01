@@ -78,3 +78,4 @@ def detect_discrepancies(current_findings: list[dict], historical_findings: list
             })
 
     return discrepancies
+

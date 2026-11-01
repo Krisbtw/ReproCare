@@ -82,3 +82,4 @@ export function evaluateLongitudinalAlert(points: ObservationPoint[]): Longitudi
     growthRateMm3PerMonth: growthRate,
   };
 }
+
