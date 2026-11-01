@@ -37,3 +37,11 @@ def test_auth_enforced_when_env_key_is_set(monkeypatch):
     r5 = client.get("/models", headers={"X-API-Key": "secret-token-1234"})
     assert r5.status_code == 200
 
+
+def test_security_headers_present():
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.headers.get("x-content-type-options") == "nosniff"
+    assert r.headers.get("x-frame-options") == "DENY"
+    assert "max-age=" in r.headers.get("strict-transport-security", "")
+
