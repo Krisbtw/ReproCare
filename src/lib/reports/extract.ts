@@ -7,7 +7,8 @@
  *   - a FIGO type is only recorded when the text literally writes "FIGO <n>" / "FIGO type <n>";
  *   - a "recommendation" is only a sentence the report author wrote (recommend / advised / suggest / follow-up);
  *     AnatomyBridge never generates one;
- *   - negations ("no", "without", "not seen") are flagged on the finding sentence, not silently dropped.
+ *   - negations ("no", "without", "no evidence of", "ruled out") are flagged on the finding sentence;
+ *   - clinical uncertainty cues ("cannot rule out", "possible", "suspicious for") are explicitly tagged.
  *
  * This is not an NLP model and is not validated on real reports.
  */
@@ -25,7 +26,7 @@ export type ExtractedMeasurement = Span & {
   /** Sentence the measurement sits in, for context. */
   sentence: Span;
   structure: string | null;
-  laterality: "left" | "right" | null;
+  laterality: "left" | "right" | "bilateral" | null;
 };
 
 export type ExtractedFinding = {
@@ -34,7 +35,8 @@ export type ExtractedFinding = {
   pathway: "fibroids" | "endometriosis" | "pcos" | "ovarian_cyst" | "general";
   sentence: Span;
   negated: boolean;
-  laterality: "left" | "right" | null;
+  uncertain?: boolean;
+  laterality: "left" | "right" | "bilateral" | null;
   figo: string | null;
   measurementIndexes: number[];
 };
@@ -152,7 +154,8 @@ function sentenceAt(all: Span[], index: number): Span {
   return all.find((s) => index >= s.start && index < s.end) ?? { start: index, end: index, text: "" };
 }
 
-function laterality(text: string): "left" | "right" | null {
+function laterality(text: string): "left" | "right" | "bilateral" | null {
+  if (/\b(bilateral|both ovaries|both adnexa)\b/i.test(text)) return "bilateral";
   const l = /\bleft\b/i.test(text);
   const r = /\bright\b/i.test(text);
   if (l && !r) return "left";
@@ -160,7 +163,8 @@ function laterality(text: string): "left" | "right" | null {
   return null;
 }
 
-const NEGATION = /\b(no|not|without|absent|negative for|free of|nil)\b[^.;\n]{0,40}$/i;
+const NEGATION = /\b(no|not|without|absent|negative for|free of|nil|no evidence of|ruled out|unlikely|cannot identify|unremarkable for)\b[^.;\n]{0,50}$/i;
+const UNCERTAINTY = /\b(cannot (?:rule out|exclude)|possible|equivocal|suggestive of|suspicious for|indeterminate|questionable|differential includes)\b/i;
 
 export function extractReport(text: string): Extraction {
   const notes: string[] = [];
@@ -201,6 +205,7 @@ export function extractReport(text: string): Extraction {
     const hit = term.re.exec(s.text);
     const prefix = hit ? s.text.slice(0, hit.index) : "";
     const negated = NEGATION.test(prefix);
+    const uncertain = UNCERTAINTY.test(s.text);
     const figoHere = figo.find((f) => f.start >= s.start && f.end <= s.end);
     findings.push({
       structure: term.structure,
@@ -208,12 +213,14 @@ export function extractReport(text: string): Extraction {
       pathway: term.pathway,
       sentence: s,
       negated,
+      uncertain,
       laterality: laterality(s.text),
       figo: figoHere ? figoHere.text.replace(/\D+/g, " ").trim().replace(/\s+/g, "-") : null,
       measurementIndexes: measurements.map((mm, i) => (mm.start >= s.start && mm.end <= s.end ? i : -1)).filter((i) => i >= 0),
     });
   }
   if (findings.some((f) => f.negated)) notes.push("Some finding sentences are negated (for example 'no fibroid'). They are kept and marked, not treated as findings.");
+  if (findings.some((f) => f.uncertain)) notes.push("Some finding statements express clinical uncertainty (e.g. 'cannot rule out'). They are explicitly marked for clinician review.");
 
   const recommendations = sents.filter((s) => /\b(recommend|advised?|suggest(?:ed)?|follow[\s-]?up|correlat(?:e|ion)|repeat)\b/i.test(s.text));
   if (recommendations.length) notes.push("Recommendation sentences are quoted from the report author. AnatomyBridge does not create recommendations.");

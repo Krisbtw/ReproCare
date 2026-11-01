@@ -69,6 +69,11 @@ export type RecordFindingInput = {
   seriesId?: string | null;
   centroidMm?: [number, number, number] | null;
   frame?: string | null;
+  modelId?: string | null;
+  segmentationSource?: string | null;
+  segmentationRunId?: string | null;
+  volumeMm3?: number | null;
+  uncertaintyMm3?: number | null;
   newStudy?: {
     patientId: string;
     modality?: string;
@@ -258,6 +263,7 @@ export function VolumeLab({
   const [recFinding, setRecFinding] = useState("");
   const [recReason, setRecReason] = useState("");
   const [recDone, setRecDone] = useState<string | null>(null);
+  const [recClinicianConfirmed, setRecClinicianConfirmed] = useState(false);
   // Files of the series currently shown, kept only in memory so they can be sent for the optional second check.
   const [seriesFiles, setSeriesFiles] = useState<{ name: string; bytes: Uint8Array }[]>([]);
   const [cross, setCross] = useState<CrossState>({ phase: "idle" });
@@ -560,6 +566,14 @@ export function VolumeLab({
 
   function handleAiSegmentSuccess(ai: AiSegmentSuccess) {
     if (!volume) return;
+    if (
+      ai.mask.dims[0] !== volume.dims[0] ||
+      ai.mask.dims[1] !== volume.dims[1] ||
+      ai.mask.dims[2] !== volume.dims[2]
+    ) {
+      setError(`AI mask dimensions [${ai.mask.dims.join(", ")}] do not match volume dimensions [${volume.dims.join(", ")}].`);
+      return;
+    }
     const measurement = measureMask(ai.mask);
     let mesh: Seg["mesh"] = null;
     if (measurement.voxelCount > 0) {
@@ -677,7 +691,9 @@ export function VolumeLab({
 
     const linked = versionFromLab({
       accepted: seg.result.accepted,
-      isLearnedModel: seg.result.isLearnedModel,
+      isLearnedModel: Boolean(seg.result.isLearnedModel),
+      clinicianConfirmed: recClinicianConfirmed,
+      modelId: seg.result.isLearnedModel ? "umd_monai_fibroid" : null,
       measurement: seg.measurement,
       seed: seg.seed,
       recordHash: fnv1a(JSON.stringify(record)),
@@ -730,11 +746,16 @@ export function VolumeLab({
         frame,
         studyId: opened.series.studyUid,
         seriesId: opened.series.seriesUid,
+        modelId: f.modelId,
+        segmentationSource: f.segmentationSource,
+        segmentationRunId: f.segmentationRunId,
+        volumeMm3: Math.round(f.volumeMl * 1000),
         newStudy: newStudyPayload,
         newSeries: newSeriesPayload,
       });
       setRecDone("Saved as a new version. The newly uploaded study and series are genuinely linked to the version with patient LPS coordinates.");
       setRecReason("");
+      setRecClinicianConfirmed(false);
     });
   }
 
@@ -1401,7 +1422,25 @@ export function VolumeLab({
                             Why record this (kept in the audit trail)
                             <input className="mt-1 block min-h-11 w-full rounded-md border border-line bg-card px-2 text-ink" value={recReason} onChange={(e) => setRecReason(e.target.value)} maxLength={400} data-testid="record-reason" />
                           </label>
-                          <Btn testId="record-version-btn" disabled={busy || !recFinding || recReason.trim().length < 8 || !canExport} onClick={recordAsVersion}>
+                          {seg.result.isLearnedModel && (
+                            <label className="flex items-start gap-2 rounded-md border border-pine/30 bg-pine-soft/20 p-2 text-xs text-ink" data-testid="clinician-confirm-wrapper">
+                              <input
+                                type="checkbox"
+                                data-testid="record-clinician-confirm"
+                                className="mt-0.5"
+                                checked={recClinicianConfirmed}
+                                onChange={(e) => setRecClinicianConfirmed(e.target.checked)}
+                              />
+                              <span>
+                                <strong>Clinician verification:</strong> I have reviewed this learned AI model segmentation against the native DICOM images and confirm its anatomical boundaries for clinical record keeping.
+                              </span>
+                            </label>
+                          )}
+                          <Btn
+                            testId="record-version-btn"
+                            disabled={busy || !recFinding || recReason.trim().length < 8 || !canExport || (Boolean(seg.result.isLearnedModel) && !recClinicianConfirmed)}
+                            onClick={recordAsVersion}
+                          >
                             Add as new version
                           </Btn>
                           <p className="text-xs text-muted">

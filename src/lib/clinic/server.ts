@@ -1,11 +1,20 @@
 import { createServerFn } from "@tanstack/react-start";
 import { getSql, type Sql } from "@/lib/db";
 import { authMiddleware } from "@/lib/auth/middleware";
-import { ENGINE_VERSION } from "../reprotrace/engine";
+import { ENGINE_VERSION, matchChronology, sameMethodChange, type Snap, type Measure } from "../reprotrace/engine";
 import { insertLabVersion } from "./lab-version";
 import { applyMenarcheYear } from "./menarche";
 import { ingestReport, linkReportQuote, type IngestInput, type QuoteLinkInput } from "../reports/store";
-import type { ExportPayload, VersionRow, Workspace } from "./types";
+import type {
+  ExportPayload,
+  VersionRow,
+  Workspace,
+  ClinicianVerificationRow,
+  RegistrationRow,
+  EndometriosisRecordItem,
+  OvarianCystRecordItem,
+  PcosAssessmentItem,
+} from "./types";
 import {
   CYCLES,
   FINDINGS,
@@ -116,6 +125,22 @@ async function seed(sql: Sql, userId: string) {
 
 async function ensure(sql: Sql, userId: string) {
   await sql`insert into profiles (user_id, display_name, role) values (${userId}, ${""}, ${"patient"}) on conflict (user_id) do nothing`;
+
+  // Bootstrap admin role if configured via BOOTSTRAP_ADMIN_EMAILS
+  const rawAdminEmails = process.env["BOOTSTRAP_ADMIN_EMAILS"];
+  if (rawAdminEmails) {
+    const adminEmails = rawAdminEmails.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+    const userRows = await sql<{ email: string }>`select email from "user" where id = ${userId}`.catch(() => []);
+    const email = userRows[0]?.email?.toLowerCase();
+    if (email && adminEmails.includes(email)) {
+      const current = await roleOf(sql, userId);
+      if (current !== "admin") {
+        await sql`update profiles set role = 'admin' where user_id = ${userId}`;
+        await audit(sql, userId, "bootstrap_admin", "profile", userId, `Bootstrapped admin role for ${email}`);
+      }
+    }
+  }
+
   const n = await sql<{ n: number }>`select count(*)::int as n from patients where user_id = ${userId}`;
   if (asNumber(n[0]?.n) === 0) {
     try {
@@ -140,9 +165,16 @@ export const getWorkspace = createServerFn({ method: "GET" })
     const sql = await getSql();
     await ensure(sql, context.userId);
     const userId = context.userId;
-    const [profiles, patients, studies, series, reports, findings, versions, evidence, symptoms, cycles, labs, correspondences, decisions, discrepancies, reviews, consents, uploads, auditRows, extractions] =
+    const userProfiles = await sql<{ user_id: string; display_name: string; role: string; active_patient_id: string | null }>`select user_id, display_name, role, active_patient_id from profiles where user_id = ${userId}`;
+    const profile = userProfiles[0] ?? {
+      user_id: userId,
+      display_name: "",
+      role: "patient",
+      active_patient_id: null,
+    };
+    const userRole = profile.role ?? "patient";
+    const [patients, studies, series, reports, findings, versions, evidence, symptoms, cycles, labs, correspondences, decisions, discrepancies, reviews, consents, uploads, auditRows, extractions, verifications, registrations, endometriosisRecords, ovarianCystRecords, pcosAssessments] =
       await Promise.all([
-        sql<{ user_id: string; display_name: string; role: string; active_patient_id: string | null }>`select user_id, display_name, role, active_patient_id from profiles where user_id = ${userId}`,
         sql`select * from patients where user_id = ${userId} order by code`,
         sql`select * from studies where user_id = ${userId} order by study_date`,
         sql`select * from series where user_id = ${userId} order by series_number`,
@@ -161,6 +193,20 @@ export const getWorkspace = createServerFn({ method: "GET" })
         sql`select id, patient_id, received_at, file_name, transfer_syntax, metadata, warnings, identifiers_withheld from dicom_uploads where user_id = ${userId} order by received_at desc limit 12`,
         sql`select * from audit_events where user_id = ${userId} order by at desc limit 40`,
         sql`select id, report_id, file_name, file_kind, content_sha256, deid_method, redaction_count, redaction_kinds, extractor, extraction, warnings, created_at from report_extractions where user_id = ${userId} order by created_at desc`,
+        userRole === "admin"
+          ? sql<ClinicianVerificationRow>`
+              select cv.*, p.display_name, p.role as current_role
+              from clinician_verifications cv
+              left join profiles p on cv.user_id = p.user_id
+              order by cv.requested_at desc
+            `.catch(() => [])
+          : sql<ClinicianVerificationRow>`
+              select * from clinician_verifications where user_id = ${userId} order by requested_at desc
+            `.catch(() => []),
+        sql<RegistrationRow>`select * from registrations where user_id = ${userId} order by created_at desc`.catch(() => []),
+        sql<EndometriosisRecordItem>`select * from pathway_endometriosis_records where user_id = ${userId} order by created_at desc`.catch(() => []),
+        sql<OvarianCystRecordItem>`select * from pathway_ovarian_cyst_records where user_id = ${userId} order by created_at desc`.catch(() => []),
+        sql<PcosAssessmentItem>`select * from pathway_pcos_assessments where user_id = ${userId} order by created_at desc`.catch(() => []),
       ]);
     const versionsOut: VersionRow[] = (versions as Record<string, unknown>[]).map((v) => ({
       ...(v as object),
@@ -170,12 +216,7 @@ export const getWorkspace = createServerFn({ method: "GET" })
       report_longest_mm: v.report_longest_mm == null ? null : Number(v.report_longest_mm),
     })) as VersionRow[];
     const workspace: Workspace = {
-      profile: profiles[0] ?? {
-        user_id: userId,
-        display_name: "",
-        role: "patient",
-        active_patient_id: null,
-      },
+      profile,
       patients: patients as Workspace["patients"],
       studies: studies as Workspace["studies"],
       series: series as Workspace["series"],
@@ -194,6 +235,11 @@ export const getWorkspace = createServerFn({ method: "GET" })
       uploads: uploads as Workspace["uploads"],
       audit: auditRows as Workspace["audit"],
       extractions: extractions as Workspace["extractions"],
+      verifications: (verifications ?? []) as Workspace["verifications"],
+      registrations: (registrations ?? []) as Workspace["registrations"],
+      endometriosisRecords: (endometriosisRecords ?? []) as Workspace["endometriosisRecords"],
+      ovarianCystRecords: (ovarianCystRecords ?? []) as Workspace["ovarianCystRecords"],
+      pcosAssessments: (pcosAssessments ?? []) as Workspace["pcosAssessments"],
       models: MODELS.map((model) => ({
         id: model.id,
         name: model.name,
@@ -202,6 +248,7 @@ export const getWorkspace = createServerFn({ method: "GET" })
       })),
       engineVersion: ENGINE_VERSION,
     };
+    return workspace;
     return workspace;
   });
 
@@ -435,6 +482,11 @@ export const saveLabMeasurement = createServerFn({ method: "POST" })
       seriesId?: string | null;
       centroidMm?: [number, number, number] | null;
       frame?: string | null;
+      modelId?: string | null;
+      segmentationSource?: string | null;
+      segmentationRunId?: string | null;
+      volumeMm3?: number | null;
+      uncertaintyMm3?: number | null;
       newStudy?: {
         patientId: string;
         modality?: string;
@@ -471,6 +523,11 @@ export const saveLabMeasurement = createServerFn({ method: "POST" })
     if (role !== "clinician" && role !== "admin") throw new Error("Recording a measurement is a clinician action.");
     const id = await insertLabVersion(sql, context.userId, data);
     await audit(sql, context.userId, "new_version", "finding_version", id, "Volume lab measurement recorded as a new version. Prior versions were not overwritten.");
+    // Recompute ReproTrace correspondences & discrepancies live for this patient
+    const patientRow = await sql<{ patient_id: string }>`select patient_id from findings where id = ${data.findingId} and user_id = ${context.userId}`;
+    if (patientRow[0]?.patient_id) {
+      await recomputeReproTrace(sql, context.userId, patientRow[0].patient_id).catch(() => null);
+    }
     return { ok: true, id };
   });
 
@@ -605,4 +662,430 @@ export const linkReportEvidence = createServerFn({ method: "POST" })
     const id = await linkReportQuote(sql, context.userId, data);
     await audit(sql, context.userId, "link_evidence", "finding_version", data.findingVersionId, `Report quote [${data.start}, ${data.end}) linked. The version itself was not changed.`);
     return { ok: true, id };
+  });
+
+
+/** Recomputes longitudinal ReproTrace correspondences and discrepancies from live database records. */
+export async function recomputeReproTrace(
+  sql: Sql,
+  userId: string,
+  patientId: string,
+): Promise<{ proposalsCount: number; discrepanciesCount: number }> {
+  const studies = await sql<{ id: string; study_date: string }>`
+    select id, study_date::text from studies where patient_id = ${patientId} and user_id = ${userId} order by study_date
+  `;
+  if (studies.length === 0) return { proposalsCount: 0, discrepanciesCount: 0 };
+
+  const findings = await sql<{ id: string; code: string; organ: string; structure: string; pathway: string }>`
+    select id, code, organ, structure, pathway from findings where patient_id = ${patientId} and user_id = ${userId}
+  `;
+  const versions = await sql<{
+    id: string; finding_id: string; study_id: string; observed_on: string; location_label: string;
+    centroid_mm: string | null; axes_mm: string | null; longest_mm: number | null;
+    frame: string; quality: string; modality: string; basis: string; report_longest_mm: number | null;
+  }>`
+    select id, finding_id, study_id, observed_on::text, location_label,
+           centroid_mm, axes_mm, longest_mm, frame, quality, modality, measurement_basis as basis,
+           report_longest_mm
+    from finding_versions
+    where user_id = ${userId} and finding_id in (select id from findings where patient_id = ${patientId} and user_id = ${userId})
+    order by observed_on, version_no
+  `;
+
+  const regRows = await sql<{
+    fixed_series_id: string; moving_series_id: string; ncc_score: number;
+    residual_mm: number; transform_matrix_json: string; status: string;
+  }>`
+    select fixed_series_id, moving_series_id, ncc_score, residual_mm, transform_matrix_json, status
+    from registrations
+    where patient_id = ${patientId} and user_id = ${userId}
+  `.catch(() => []);
+
+  const regMap = new Map<string, { supported: boolean; transform?: any }>();
+  for (const r of regRows) {
+    try {
+      const matrix = JSON.parse(r.transform_matrix_json);
+      regMap.set(`${r.fixed_series_id}:${r.moving_series_id}`, {
+        supported: r.status === "verified" || r.ncc_score > 0.5,
+        transform: matrix,
+      });
+    } catch {
+      // ignore JSON parse error
+    }
+  }
+
+  const studyGroups = studies.map((s) => {
+    const studyVersions = versions.filter((v) => v.study_id === s.id);
+    const snaps: Snap[] = studyVersions.map((v) => {
+      const f = findings.find((x) => x.id === v.finding_id);
+      return {
+        id: v.id,
+        findingId: v.finding_id,
+        studyId: v.study_id,
+        date: v.observed_on,
+        organ: f?.organ ?? "uterus",
+        structure: f?.structure ?? "fibroid",
+        locationLabel: v.location_label,
+        modality: v.modality,
+        frame: (v.frame as any) ?? "unavailable",
+        centroidMm: parseTriple(v.centroid_mm),
+        axesMm: parseTriple(v.axes_mm),
+        longestMm: v.longest_mm == null ? null : Number(v.longest_mm),
+        quality: (v.quality as any) ?? "adequate",
+      };
+    });
+    return { studyId: s.id, date: s.study_date, snaps };
+  });
+
+  const proposals = matchChronology(studyGroups, regMap);
+
+  await sql`update correspondences set active = false where patient_id = ${patientId} and user_id = ${userId} and provisional = true`;
+  await sql`update discrepancies set active = false where patient_id = ${patientId} and user_id = ${userId}`;
+
+  for (const p of proposals) {
+    await sql`
+      insert into correspondences (
+        id, user_id, patient_id, from_version_id, to_version_id, from_study_id, to_study_id,
+        category, score, rationale, provisional, engine_version, active
+      ) values (
+        ${crypto.randomUUID()}, ${userId}, ${patientId},
+        ${p.fromId}, ${p.toId}, ${p.fromStudyId}, ${p.toStudyId},
+        ${p.category}, ${p.score}, ${p.rationale}, ${p.provisional}, ${ENGINE_VERSION}, true
+      )
+    `;
+  }
+
+  let discrepanciesCount = 0;
+  for (const p of proposals) {
+    if (!p.fromId || !p.toId) continue;
+    if (p.category !== "likely_same" && p.category !== "uncertain") continue;
+    const v1 = versions.find((v) => v.id === p.fromId);
+    const v2 = versions.find((v) => v.id === p.toId);
+    if (!v1 || !v2) continue;
+    const m1: Measure = {
+      id: v1.id,
+      findingId: v1.finding_id,
+      date: v1.observed_on,
+      modality: v1.modality,
+      basis: v1.basis,
+      locationLabel: v1.location_label,
+      longestMm: v1.longest_mm,
+      axesMm: parseTriple(v1.axes_mm),
+      source: "record",
+      reportLongestMm: v1.report_longest_mm,
+      quality: v1.quality,
+    };
+    const m2: Measure = {
+      id: v2.id,
+      findingId: v2.finding_id,
+      date: v2.observed_on,
+      modality: v2.modality,
+      basis: v2.basis,
+      locationLabel: v2.location_label,
+      longestMm: v2.longest_mm,
+      axesMm: parseTriple(v2.axes_mm),
+      source: "record",
+      reportLongestMm: v2.report_longest_mm,
+      quality: v2.quality,
+    };
+    const disc = sameMethodChange(m1, m2);
+    if (disc) {
+      await sql`
+        insert into discrepancies (
+          id, user_id, patient_id, category, summary, detail, left_ref, right_ref, engine_version, active
+        ) values (
+          ${crypto.randomUUID()}, ${userId}, ${patientId},
+          ${disc.category}, ${disc.summary}, ${disc.detail},
+          ${v1.id}, ${v2.id}, ${ENGINE_VERSION}, true
+        )
+      `;
+      discrepanciesCount++;
+    }
+  }
+
+  await audit(sql, userId, "recompute_reprotrace", "patient", patientId, `ReproTrace updated: ${proposals.length} proposal(s), ${discrepanciesCount} discrepancy(ies).`);
+  return { proposalsCount: proposals.length, discrepanciesCount };
+}
+
+/** Request clinician verification for an authenticated patient. */
+export const requestClinicianVerification = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { licenceNo: string; registry: string; evidenceNote: string }) => {
+    if (!input || typeof input !== "object") throw new Error("Expected an input object.");
+    const licenceNo = String(input.licenceNo ?? "").trim().slice(0, 100);
+    const registry = String(input.registry ?? "").trim().slice(0, 100);
+    const evidenceNote = String(input.evidenceNote ?? "").trim().slice(0, 1000);
+    if (!licenceNo || !registry) throw new Error("Licence number and medical registry are required.");
+    return { licenceNo, registry, evidenceNote };
+  })
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    await ensure(sql, context.userId);
+    const id = crypto.randomUUID();
+    await sql`
+      insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status)
+      values (${id}, ${context.userId}, ${data.licenceNo}, ${data.registry}, ${data.evidenceNote}, 'pending')
+    `;
+    await audit(sql, context.userId, "request_clinician_verification", "clinician_verification", id, `Submitted licence ${data.licenceNo} (${data.registry}) for verification.`);
+    return { ok: true, id, status: "pending" };
+  });
+
+/** Approve or revoke clinician verification. Admin only. */
+export const verifyClinician = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { verificationId: string; decision: "verified" | "revoked"; reason: string }) => {
+    if (input.decision !== "verified" && input.decision !== "revoked") {
+      throw new Error("Decision must be verified or revoked.");
+    }
+    const reason = String(input.reason ?? "").trim().slice(0, 500);
+    if (!reason) throw new Error("A reason for the decision is required for auditing.");
+    return { verificationId: input.verificationId, decision: input.decision, reason };
+  })
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    const callerRole = await roleOf(sql, context.userId);
+    if (callerRole !== "admin") {
+      throw new Error("Unauthorized: Only administrators can approve or revoke clinician verifications.");
+    }
+    const vRows = await sql<{ id: string; user_id: string }>`
+      select id, user_id from clinician_verifications where id = ${data.verificationId}
+    `;
+    if (!vRows.length) throw new Error("Verification request not found.");
+    const targetUserId = vRows[0].user_id;
+
+    if (data.decision === "revoked") {
+      const targetRole = await roleOf(sql, targetUserId);
+      if (targetRole === "admin") {
+        const adminCount = await sql<{ count: number }>`select count(*)::int as count from profiles where role = 'admin'`;
+        if (asNumber(adminCount[0]?.count) <= 1) {
+          throw new Error("Action rejected: Cannot revoke or demote the last remaining administrator.");
+        }
+      }
+    }
+
+    const newRole = data.decision === "verified" ? "clinician" : "patient";
+    await sql`
+      update clinician_verifications
+      set status = ${data.decision}, decided_by = ${context.userId}, decided_at = now(), reason = ${data.reason}
+      where id = ${data.verificationId}
+    `;
+    await sql`update profiles set role = ${newRole} where user_id = ${targetUserId}`;
+    await audit(
+      sql,
+      context.userId,
+      data.decision === "verified" ? "verify_clinician" : "revoke_clinician",
+      "clinician_verification",
+      data.verificationId,
+      `User ${targetUserId} ${data.decision} (role -> ${newRole}): ${data.reason}`,
+    );
+    return { ok: true, status: data.decision, targetUserId, newRole };
+  });
+
+
+export type VerificationViewItem = {
+  id: string;
+  user_id: string;
+  licence_no: string;
+  registry: string;
+  evidence_note: string;
+  status: string;
+  decided_by: string | null;
+  decided_at: string | null;
+  reason: string;
+  requested_at: string;
+  display_name: string | null;
+  current_role: string | null;
+};
+
+export type VerificationStatusItem = {
+  id: string;
+  licence_no: string;
+  registry: string;
+  evidence_note: string;
+  status: string;
+  decided_at: string | null;
+  reason: string;
+  requested_at: string;
+};
+
+/** List all pending and historical clinician verifications. Admin only. */
+export const listPendingClinicians = createServerFn({ method: "GET" })
+  .middleware([authMiddleware])
+  .handler(async ({ context }) => {
+    const sql = await getSql();
+    const callerRole = await roleOf(sql, context.userId);
+    if (callerRole !== "admin") {
+      throw new Error("Unauthorized: Only administrators can view clinician verifications.");
+    }
+    return sql<VerificationViewItem>`
+      select
+        v.id, v.user_id, v.licence_no, v.registry, v.evidence_note, v.status,
+        v.decided_by, v.decided_at, v.reason, v.requested_at,
+        p.display_name, p.role as current_role
+      from clinician_verifications v
+      left join profiles p on p.user_id = v.user_id
+      order by v.requested_at desc
+    `;
+  });
+
+/** Get verification status for the current user. */
+export const getVerificationStatus = createServerFn({ method: "GET" })
+  .middleware([authMiddleware])
+  .handler(async ({ context }) => {
+    const sql = await getSql();
+    const rows = await sql<VerificationStatusItem>`
+      select id, licence_no, registry, evidence_note, status, decided_at, reason, requested_at
+      from clinician_verifications
+      where user_id = ${context.userId}
+      order by requested_at desc limit 1
+    `;
+    return rows[0] ?? null;
+  });
+
+/** Save a 3D volume registration result across studies. Clinician only. */
+export const saveVolumeRegistration = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: {
+    patientId: string;
+    fixedSeriesId: string;
+    movingSeriesId: string;
+    nccScore: number;
+    residualMm: number;
+    transformMatrix: number[];
+    status?: "verified" | "unverified" | "failed";
+  }) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    const role = await roleOf(sql, context.userId);
+    if (role !== "clinician" && role !== "admin") throw new Error("Saving registration is a clinician action.");
+    const id = crypto.randomUUID();
+    await sql`
+      insert into registrations (
+        id, user_id, patient_id, fixed_series_id, moving_series_id, ncc_score, residual_mm, transform_matrix_json, status
+      ) values (
+        ${id}, ${context.userId}, ${data.patientId}, ${data.fixedSeriesId}, ${data.movingSeriesId},
+        ${data.nccScore}, ${data.residualMm}, ${JSON.stringify(data.transformMatrix)}, ${data.status ?? "unverified"}
+      )
+    `;
+    await audit(sql, context.userId, "save_registration", "registration", id, `Rigid volume registration stored. NCC: ${data.nccScore.toFixed(3)}, Residual: ${data.residualMm.toFixed(2)} mm`);
+    await recomputeReproTrace(sql, context.userId, data.patientId).catch(() => null);
+    return { ok: true, id };
+  });
+
+/** Save structured Endometriosis clinical record. */
+export const saveEndometriosisRecord = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { patientId: string; lesionSites: string[]; surgicalHistory: string; stagingRASRM?: string; imagingNote: string }) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    const role = await roleOf(sql, context.userId);
+    if (role !== "clinician" && role !== "admin") throw new Error("Entering endometriosis clinical records is a clinician action.");
+    const id = crypto.randomUUID();
+    await sql`
+      insert into pathway_endometriosis_records (
+        id, user_id, patient_id, lesion_sites_json, surgical_history, staging_rASRM, imaging_note
+      ) values (
+        ${id}, ${context.userId}, ${data.patientId}, ${JSON.stringify(data.lesionSites)},
+        ${data.surgicalHistory}, ${data.stagingRASRM ?? null}, ${data.imagingNote}
+      )
+    `;
+    await audit(sql, context.userId, "save_endometriosis_record", "endometriosis_record", id, `Sites: ${data.lesionSites.join(", ")}; Staging: ${data.stagingRASRM ?? "N/A"}`);
+    return { ok: true, id };
+  });
+
+/** Get structured Endometriosis clinical records for a patient. */
+export const getEndometriosisRecords = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((patientId: string) => patientId)
+  .handler(async ({ context, data: patientId }) => {
+    const sql = await getSql();
+    return sql<EndometriosisRecordItem>`
+      select id, lesion_sites_json, surgical_history, staging_rASRM, imaging_note, created_at
+      from pathway_endometriosis_records
+      where patient_id = ${patientId} and user_id = ${context.userId}
+      order by created_at desc
+    `;
+  });
+
+/** Save structured Ovarian Cyst clinical record. */
+export const saveOvarianCystRecord = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { patientId: string; laterality: "left" | "right" | "bilateral"; maxDiameterMm: number; featuresText: string; followUpMonths?: number; clinicalNote: string }) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    const role = await roleOf(sql, context.userId);
+    if (role !== "clinician" && role !== "admin") throw new Error("Entering ovarian cyst clinical records is a clinician action.");
+    const id = crypto.randomUUID();
+    await sql`
+      insert into pathway_ovarian_cyst_records (
+        id, user_id, patient_id, laterality, max_diameter_mm, features_text, follow_up_months, clinical_note
+      ) values (
+        ${id}, ${context.userId}, ${data.patientId}, ${data.laterality},
+        ${data.maxDiameterMm}, ${data.featuresText}, ${data.followUpMonths ?? null}, ${data.clinicalNote}
+      )
+    `;
+    await audit(sql, context.userId, "save_ovarian_cyst_record", "ovarian_cyst_record", id, `${data.laterality} cyst, diameter: ${data.maxDiameterMm}mm`);
+    return { ok: true, id };
+  });
+
+/** Get structured Ovarian Cyst clinical records for a patient. */
+export const getOvarianCystRecords = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((patientId: string) => patientId)
+  .handler(async ({ context, data: patientId }) => {
+    const sql = await getSql();
+    return sql<OvarianCystRecordItem>`
+      select id, laterality, max_diameter_mm, features_text, follow_up_months, clinical_note, created_at
+      from pathway_ovarian_cyst_records
+      where patient_id = ${patientId} and user_id = ${context.userId}
+      order by created_at desc
+    `;
+  });
+
+/** Save structured PCOS clinical assessment (Rotterdam Criteria). */
+export const savePcosAssessment = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: {
+    patientId: string;
+    cycleIrregularity: boolean;
+    hyperandrogenismClinical: boolean;
+    hyperandrogenismBiochemical: boolean;
+    ultrasoundOrAmhFeatures: boolean;
+    notes: string;
+  }) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    const role = await roleOf(sql, context.userId);
+    if (role !== "clinician" && role !== "admin") throw new Error("Entering PCOS assessments is a clinician action.");
+    const hyperandrogenism = data.hyperandrogenismClinical || data.hyperandrogenismBiochemical;
+    const criteriaCount = [data.cycleIrregularity, hyperandrogenism, data.ultrasoundOrAmhFeatures].filter(Boolean).length;
+    const rotterdamMet = criteriaCount >= 2;
+
+    const id = crypto.randomUUID();
+    await sql`
+      insert into pathway_pcos_assessments (
+        id, user_id, patient_id, cycle_irregularity, hyperandrogenism_clinical, hyperandrogenism_biochemical,
+        ultrasound_or_amh_features, rotterdam_criteria_met, notes
+      ) values (
+        ${id}, ${context.userId}, ${data.patientId}, ${data.cycleIrregularity}, ${data.hyperandrogenismClinical},
+        ${data.hyperandrogenismBiochemical}, ${data.ultrasoundOrAmhFeatures}, ${rotterdamMet}, ${data.notes}
+      )
+    `;
+    await audit(sql, context.userId, "save_pcos_assessment", "pcos_assessment", id, `Rotterdam criteria met: ${rotterdamMet} (${criteriaCount}/3 features)`);
+    return { ok: true, id, rotterdamCriteriaMet: rotterdamMet };
+  });
+
+/** Get structured PCOS clinical assessments for a patient. */
+export const getPcosAssessments = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((patientId: string) => patientId)
+  .handler(async ({ context, data: patientId }) => {
+    const sql = await getSql();
+    return sql<PcosAssessmentItem>`
+      select id, cycle_irregularity, hyperandrogenism_clinical, hyperandrogenism_biochemical,
+             ultrasound_or_amh_features, rotterdam_criteria_met, notes, created_at
+      from pathway_pcos_assessments
+      where patient_id = ${patientId} and user_id = ${context.userId}
+      order by created_at desc
+    `;
   });

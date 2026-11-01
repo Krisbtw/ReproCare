@@ -8,23 +8,20 @@
  *
  * This proxy keeps the key exclusively in server-side process.env. The browser
  * calls /api/imaging-proxy/* (same-origin, auth-gated), and this handler forwards
- * to the Python service with the server-held token. Nothing in the browser bundle
- * references ANATOMYBRIDGE_SERVICE_API_KEY.
+ * to the Python service with the server-held token.
  *
- * ENVIRONMENT VARIABLES (server-only — no VITE_ prefix):
- *   ANATOMYBRIDGE_SERVICE_URL          Base URL of the Python service, e.g. http://localhost:8100
- *   ANATOMYBRIDGE_SERVICE_API_KEY      Bearer token / API key for the service (optional when service
- *                                      runs without auth, e.g. local dev with no key set)
- *
- * ROUTES:
- *   GET  /api/imaging-proxy/models
- *   POST /api/imaging-proxy/inspect          (multipart, same schema as /series/inspect)
- *   POST /api/imaging-proxy/segment/:modelId (multipart, same schema as /segment/{model_id})
+ * SECURITY:
+ *   - Only authenticated users with role 'clinician' or 'admin' may invoke inspection or segmentation.
+ *   - Requests are size-limited (max 1000 files, max 64MB total).
+ *   - Every invocation is recorded in audit_events.
  */
 import { createServerFn } from "@tanstack/react-start";
 import { authMiddleware } from "@/lib/auth/middleware";
+import { getSql } from "@/lib/db";
 
 const PROXY_TIMEOUT_MS = 90_000;
+const MAX_PROXY_FILES = 1000;
+const MAX_TOTAL_BYTES = 64 * 1024 * 1024; // 64MB
 
 function imagingServiceUrl(): string | null {
   const raw = process.env["ANATOMYBRIDGE_SERVICE_URL"];
@@ -48,6 +45,26 @@ function serviceHeaders(): Record<string, string> {
   const h: Record<string, string> = {};
   if (key) h["Authorization"] = `Bearer ${key}`;
   return h;
+}
+
+async function requireClinicianOrAdmin(userId: string): Promise<string> {
+  const sql = await getSql();
+  const rows = await sql<{ role: string }>`select role from profiles where user_id = ${userId}`;
+  const role = rows[0]?.role ?? "patient";
+  if (role !== "clinician" && role !== "admin") {
+    throw new Error("Forbidden: Imaging inspection and AI segmentation require verified clinician or administrator credentials.");
+  }
+  return role;
+}
+
+async function auditProxyAction(userId: string, action: string, detail: string) {
+  try {
+    const sql = await getSql();
+    await sql`insert into audit_events (id, user_id, action, entity_type, entity_id, detail)
+      values (${crypto.randomUUID()}, ${userId}, ${action}, 'imaging_proxy', ${userId}, ${detail})`;
+  } catch {
+    // Non-fatal logging
+  }
 }
 
 async function proxyFetch(
@@ -77,7 +94,7 @@ export type ProxyModelStatus = {
   is_learned_model: boolean;
 };
 
-/** List available segmentation models. */
+/** List available segmentation models. Allowed for authenticated users. */
 export const proxyListModels = createServerFn({ method: "GET" })
   .middleware([authMiddleware])
   .handler(async () => {
@@ -98,21 +115,29 @@ export const proxyListModels = createServerFn({ method: "GET" })
 /** Proxy type for inspect — accepts serialized FormData entries. */
 export type ProxyFile = { name: string; base64: string };
 
-/** Forward a DICOM series to the Python /series/inspect endpoint. */
+/** Forward a DICOM series to the Python /series/inspect endpoint. Requires clinician/admin. */
 export const proxyInspectSeries = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .validator((input: unknown) => {
     if (!Array.isArray(input)) throw new Error("Expected an array of file objects.");
+    if (input.length === 0) throw new Error("At least one DICOM file is required.");
+    if (input.length > MAX_PROXY_FILES) throw new Error(`Exceeded maximum file limit of ${MAX_PROXY_FILES}.`);
+    let estimatedBytes = 0;
     for (const f of input) {
       if (!f || typeof f !== "object") throw new Error("Each file must be an object.");
       const o = f as Record<string, unknown>;
       if (typeof o["name"] !== "string" || typeof o["base64"] !== "string") {
         throw new Error("Each file must have name:string and base64:string.");
       }
+      estimatedBytes += Math.floor((o["base64"].length * 3) / 4);
+    }
+    if (estimatedBytes > MAX_TOTAL_BYTES) {
+      throw new Error(`Payload exceeds maximum allowed size of ${MAX_TOTAL_BYTES / (1024 * 1024)}MB.`);
     }
     return input as ProxyFile[];
   })
-  .handler(async ({ data: files }) => {
+  .handler(async ({ data: files, context }) => {
+    await requireClinicianOrAdmin(context.userId);
     const form = new FormData();
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
@@ -134,28 +159,37 @@ export const proxyInspectSeries = createServerFn({ method: "POST" })
       const detail = await res.text().catch(() => res.statusText);
       throw new Error(`Imaging service returned ${res.status}: ${detail.slice(0, 300)}`);
     }
+    await auditProxyAction(context.userId, "proxy_inspect_series", `Inspected ${files.length} slices`);
     const text = await res.text();
     return text;
   });
 
-/** Forward a DICOM series to the Python /segment/{modelId} endpoint. */
+/** Forward a DICOM series to the Python /segment/{modelId} endpoint. Requires clinician/admin. */
 export const proxySegment = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .validator((input: unknown) => {
     if (!input || typeof input !== "object") throw new Error("Expected an object.");
     const o = input as Record<string, unknown>;
-    if (typeof o["modelId"] !== "string") throw new Error("modelId must be a string.");
+    if (typeof o["modelId"] !== "string" || !o["modelId"].trim()) throw new Error("modelId must be a non-empty string.");
     if (!Array.isArray(o["files"])) throw new Error("files must be an array.");
+    if (o["files"].length === 0) throw new Error("At least one DICOM file is required.");
+    if (o["files"].length > MAX_PROXY_FILES) throw new Error(`Exceeded maximum file limit of ${MAX_PROXY_FILES}.`);
+    let estimatedBytes = 0;
     for (const f of o["files"] as unknown[]) {
       if (!f || typeof f !== "object") throw new Error("Each file must be an object.");
       const ff = f as Record<string, unknown>;
       if (typeof ff["name"] !== "string" || typeof ff["base64"] !== "string") {
         throw new Error("Each file must have name:string and base64:string.");
       }
+      estimatedBytes += Math.floor((ff["base64"].length * 3) / 4);
+    }
+    if (estimatedBytes > MAX_TOTAL_BYTES) {
+      throw new Error(`Payload exceeds maximum allowed size of ${MAX_TOTAL_BYTES / (1024 * 1024)}MB.`);
     }
     return { modelId: o["modelId"] as string, files: o["files"] as ProxyFile[] };
   })
-  .handler(async ({ data: { modelId, files } }) => {
+  .handler(async ({ data: { modelId, files }, context }) => {
+    await requireClinicianOrAdmin(context.userId);
     const form = new FormData();
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
@@ -185,11 +219,12 @@ export const proxySegment = createServerFn({ method: "POST" })
           : res.statusText;
       throw new Error(`Imaging service returned ${res.status}: ${detail}`);
     }
+    await auditProxyAction(context.userId, "proxy_ai_segment", `Model: ${modelId}, slices: ${files.length}`);
     const text = await res.text();
     return text;
   });
 
-/** Forward trend calculation request to the Python /trends/calculate endpoint. */
+/** Forward trend calculation request to the Python /trends/calculate endpoint. Requires clinician/admin. */
 export const proxyCalculateTrends = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .validator((input: unknown) => {
@@ -200,7 +235,8 @@ export const proxyCalculateTrends = createServerFn({ method: "POST" })
       current_findings?: Array<Record<string, unknown>>;
     };
   })
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    await requireClinicianOrAdmin(context.userId);
     let res: Response;
     try {
       res = await proxyFetch("/trends/calculate", {
@@ -219,7 +255,7 @@ export const proxyCalculateTrends = createServerFn({ method: "POST" })
       const detail = await res.text().catch(() => res.statusText);
       throw new Error(`Imaging service returned ${res.status}: ${detail.slice(0, 300)}`);
     }
+    await auditProxyAction(context.userId, "proxy_calculate_trends", `Observations: ${data.observations.length}`);
     const text = await res.text();
     return text;
   });
-

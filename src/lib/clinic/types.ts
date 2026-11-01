@@ -230,6 +230,67 @@ export type ExtractionRow = {
 
 export type ModelRow = { id: string; name: string; status: string; note: string };
 
+export type ClinicianVerificationRow = {
+  id: string;
+  user_id: string;
+  licence_no: string;
+  registry: string;
+  evidence_note: string;
+  status: "pending" | "verified" | "revoked";
+  decided_by: string | null;
+  decided_at: string | null;
+  reason: string;
+  requested_at: string;
+  display_name?: string;
+  current_role?: string;
+};
+
+export type RegistrationRow = {
+  id: string;
+  user_id: string;
+  patient_id: string;
+  fixed_series_id: string;
+  moving_series_id: string;
+  ncc_score: number;
+  residual_mm: number;
+  transform_matrix_json: string;
+  status: "verified" | "unverified" | "failed";
+  created_at: string;
+};
+
+export type EndometriosisRecordItem = {
+  id: string;
+  patient_id?: string;
+  lesion_sites_json: string;
+  surgical_history: string;
+  staging_rASRM: string | null;
+  imaging_note: string;
+  created_at: string;
+};
+
+export type OvarianCystRecordItem = {
+  id: string;
+  patient_id?: string;
+  laterality: "left" | "right" | "bilateral";
+  max_diameter_mm: number;
+  features_text: string;
+  follow_up_months: number | null;
+  clinical_note: string;
+  created_at: string;
+};
+
+export type PcosAssessmentItem = {
+  id: string;
+  patient_id?: string;
+  cycle_irregularity: boolean;
+  hyperandrogenism_clinical: boolean;
+  hyperandrogenism_biochemical: boolean;
+  ultrasound_or_amh_features: boolean;
+  rotterdam_criteria_met: boolean;
+  notes: string;
+  created_at: string;
+};
+
 export type Workspace = {
   profile: { user_id: string; display_name: string; role: string; active_patient_id: string | null };
   patients: PatientRow[];
@@ -251,6 +312,11 @@ export type Workspace = {
   audit: AuditRow[];
   extractions: ExtractionRow[];
   models: ModelRow[];
+  verifications?: ClinicianVerificationRow[];
+  registrations?: RegistrationRow[];
+  endometriosisRecords?: EndometriosisRecordItem[];
+  ovarianCystRecords?: OvarianCystRecordItem[];
+  pcosAssessments?: PcosAssessmentItem[];
   engineVersion: string;
 };
 

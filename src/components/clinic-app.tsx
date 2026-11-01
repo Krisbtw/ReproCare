@@ -22,6 +22,11 @@ import {
   setRole,
   uploadReport,
   linkReportEvidence,
+  requestClinicianVerification,
+  verifyClinician,
+  saveEndometriosisRecord,
+  saveOvarianCystRecord,
+  savePcosAssessment,
 } from "@/lib/clinic/server";
 import { explainPlain } from "@/lib/clinic/plain";
 import { checkMenarcheYear, cycleBand, outsideBand, pcosContext } from "@/lib/clinic/pcos-context";
@@ -306,7 +311,7 @@ export function ClinicApp() {
           )}
           {view === "course" && patient && <CourseView data={data} patient={patient} onStudio={() => setView("studio")} />}
           {view === "trace" && patient && <Trace data={data} patient={patient} clinician={role !== "patient"} busy={busy} run={run} />}
-          {view === "context" && patient && <Context data={data} patient={patient} busy={busy} run={run} />}
+          {view === "context" && patient && <Context data={data} patient={patient} clinician={role !== "patient"} busy={busy} run={run} />}
           {view === "methods" && <ResearchView />}
           {view === "admin" && <Admin data={data} role={role} busy={busy} run={run} patientId={s(patient, "id")} />}
         </div>
@@ -900,11 +905,13 @@ function Context({
   patient,
   busy,
   run,
+  clinician,
 }: {
   data: Workspace;
   patient: Bag;
   busy: boolean;
   run: (task: () => Promise<unknown>) => Promise<void>;
+  clinician?: boolean;
 }) {
   const pid = s(patient, "id");
   const symptoms = (data.symptoms as Bag[]).filter((x) => s(x, "patient_id") === pid);
@@ -1051,6 +1058,11 @@ function Context({
           <Button type="submit" disabled={busy}>Add lab</Button>
         </form>
       </section>
+      <div className="grid gap-4 lg:grid-cols-3">
+        <EndometriosisSection pid={pid} data={data} clinician={clinician} busy={busy} run={run} />
+        <OvarianCystSection pid={pid} data={data} clinician={clinician} busy={busy} run={run} />
+        <PcosAssessmentSection pid={pid} data={data} clinician={clinician} busy={busy} run={run} />
+      </div>
     </div>
   );
 }
@@ -1072,16 +1084,105 @@ function Admin({
     <div className="space-y-4">
       <header>
         <p className="text-sm font-medium text-pine">Administration</p>
-        <h1 className="text-3xl">Models, consent, audit, export</h1>
+        <h1 className="text-3xl">Models, verification, audit, export</h1>
       </header>
       <div className="grid gap-3 md:grid-cols-2">
         {(data.models as { id: string; name: string; status: string; note: string }[]).map((model) => (
           <article key={model.id} className="rounded-lg border border-line bg-card p-4">
-            <div className="flex flex-wrap gap-2"><h2 className="text-lg">{model.name}</h2><Chip tone={model.status === "not_connected" ? "clay" : "pine"}>{model.status.replaceAll("_", " ")}</Chip></div>
+            <div className="flex flex-wrap gap-2">
+              <h2 className="text-lg">{model.name}</h2>
+              <Chip tone={model.status === "not_connected" ? "clay" : "pine"}>{model.status.replaceAll("_", " ")}</Chip>
+            </div>
             <p className="mt-2 text-sm text-ink-soft">{model.note}</p>
           </article>
         ))}
       </div>
+
+      {role === "admin" && (
+        <section className="space-y-3 rounded-lg border border-line bg-card p-4" data-testid="admin-verifications">
+          <div className="flex items-center justify-between">
+            <h2 className="text-xl">Clinician Verification Requests</h2>
+            <Chip tone="pine">{`${(data.verifications ?? []).filter((v) => v.status === "pending").length} pending`}</Chip>
+          </div>
+          <p className="text-sm text-ink-soft">
+            Review submitted medical licenses and practice credentials. Approving promotes the account to verified clinician status; revoking removes clinical capabilities.
+          </p>
+          {(!data.verifications || data.verifications.length === 0) ? (
+            <p className="text-sm text-muted">No verification requests submitted.</p>
+          ) : (
+            <div className="space-y-3">
+              {data.verifications.map((v) => (
+                <div key={v.id} className="rounded-md border border-line bg-paper p-3 text-sm space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="font-semibold text-ink">
+                      {v.display_name || v.user_id} · <span className="font-normal text-ink-soft">Licence: {v.licence_no} ({v.registry})</span>
+                    </span>
+                    <Chip tone={v.status === "verified" ? "pine" : v.status === "pending" ? "clay" : "ink"}>
+                      {v.status}
+                    </Chip>
+                  </div>
+                  {v.evidence_note && <p className="text-xs text-ink-soft">Note: {v.evidence_note}</p>}
+                  {v.reason && <p className="text-xs text-muted">Decision note: {v.reason}</p>}
+                  <p className="text-xs text-muted">Requested: {new Date(v.requested_at).toLocaleString()}</p>
+                  {v.status === "pending" && (
+                    <div className="flex gap-2 pt-1">
+                      <Button
+                        tone="pine"
+                        disabled={busy}
+                        onClick={() => {
+                          const reason = window.prompt("Reason for verification approval:", "Medical license and registration verified");
+                          if (reason) {
+                            void run(() => verifyClinician({ data: { verificationId: v.id, decision: "verified", reason } }));
+                          }
+                        }}
+                      >
+                        Approve verification
+                      </Button>
+                      <Button
+                        tone="clay"
+                        disabled={busy}
+                        onClick={() => {
+                          const reason = window.prompt("Reason for rejecting/revoking:", "Credential requirements not met");
+                          if (reason) {
+                            void run(() => verifyClinician({ data: { verificationId: v.id, decision: "revoked", reason } }));
+                          }
+                        }}
+                      >
+                        Reject / Revoke
+                      </Button>
+                    </div>
+                  )}
+                  {v.status === "verified" && (
+                    <div className="pt-1">
+                      <Button
+                        tone="clay"
+                        disabled={busy}
+                        onClick={() => {
+                          const reason = window.prompt("Reason for revoking clinician verification:", "Annual audit / credential expiration");
+                          if (reason) {
+                            void run(() => verifyClinician({ data: { verificationId: v.id, decision: "revoked", reason } }));
+                          }
+                        }}
+                      >
+                        Revoke credentials
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
+      <section className="space-y-3 rounded-lg border border-line bg-card p-4" data-testid="clinician-verification-panel">
+        <h2 className="text-xl">Clinician Credentialing</h2>
+        <p className="text-sm text-ink-soft">
+          Medical professionals must submit valid regulatory registration before clinical measurement tools (e.g. Volume Lab, AI confirmation, finding recording) can be used.
+        </p>
+        <ClinicianVerificationForm busy={busy} run={run} verifications={data.verifications ?? []} currentUserId={data.profile.user_id} />
+      </section>
+
       <section className="space-y-2 rounded-lg border border-line bg-card p-4">
         <h2 className="text-xl">Recent audit</h2>
         <ul className="space-y-1 text-sm text-ink-soft">
@@ -1105,5 +1206,370 @@ function Admin({
       </div>
       <p className="text-xs text-muted">Uploaded DICOM headers stored: {(data.uploads as Bag[]).length}. Identifiers are withheld. Pixel data is not in the database.</p>
     </div>
+  );
+}
+
+function ClinicianVerificationForm({
+  busy,
+  run,
+  verifications,
+  currentUserId,
+}: {
+  busy: boolean;
+  run: (task: () => Promise<unknown>) => Promise<void>;
+  verifications: Bag[];
+  currentUserId: string;
+}) {
+  const [licenceNo, setLicenceNo] = useState("");
+  const [registry, setRegistry] = useState("");
+  const [evidenceNote, setEvidenceNote] = useState("");
+  const [done, setDone] = useState<string | null>(null);
+
+  const myVerifications = verifications.filter((v) => s(v, "user_id") === currentUserId);
+  const latest = myVerifications[0];
+
+  return (
+    <div className="space-y-3">
+      {latest && (
+        <div className="rounded-md bg-paper p-3 text-sm">
+          <div className="flex items-center justify-between">
+            <span className="font-medium text-ink">Credential status: {s(latest, "status").toUpperCase()}</span>
+            <Chip tone={s(latest, "status") === "verified" ? "pine" : s(latest, "status") === "pending" ? "clay" : "ink"}>
+              {s(latest, "status")}
+            </Chip>
+          </div>
+          <p className="mt-1 text-xs text-muted">
+            Licence: {s(latest, "licence_no")} ({s(latest, "registry")}) · Submitted: {new Date(s(latest, "requested_at")).toLocaleDateString()}
+          </p>
+          {s(latest, "reason") && <p className="text-xs text-ink-soft mt-1">Review note: {s(latest, "reason")}</p>}
+        </div>
+      )}
+      {(!latest || s(latest, "status") === "revoked") && (
+        <form
+          className="grid gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!licenceNo.trim() || !registry.trim()) return;
+            void run(async () => {
+              await requestClinicianVerification({ data: { licenceNo: licenceNo.trim(), registry: registry.trim(), evidenceNote: evidenceNote.trim() } });
+              setDone("Verification request submitted for administrator review.");
+              setLicenceNo("");
+              setRegistry("");
+              setEvidenceNote("");
+            });
+          }}
+        >
+          <div className="grid gap-2 sm:grid-cols-2">
+            <input
+              data-testid="clinician-licence-input"
+              className="min-h-11 rounded-md border border-line bg-paper px-2 text-sm text-ink"
+              placeholder="Medical licence number (e.g. GMC 1234567)"
+              value={licenceNo}
+              onChange={(e) => setLicenceNo(e.target.value)}
+              required
+            />
+            <input
+              data-testid="clinician-registry-input"
+              className="min-h-11 rounded-md border border-line bg-paper px-2 text-sm text-ink"
+              placeholder="Medical registry / licensing body"
+              value={registry}
+              onChange={(e) => setRegistry(e.target.value)}
+              required
+            />
+          </div>
+          <textarea
+            data-testid="clinician-note-input"
+            className="min-h-20 rounded-md border border-line bg-paper p-2 text-sm text-ink"
+            placeholder="Clinical specialty, hospital affiliation, or verification context"
+            value={evidenceNote}
+            onChange={(e) => setEvidenceNote(e.target.value)}
+          />
+          <div className="flex items-center gap-2">
+            <Button type="submit" disabled={busy || !licenceNo.trim() || !registry.trim()}>
+              Submit for Verification
+            </Button>
+            {done && <span className="text-xs text-pine">{done}</span>}
+          </div>
+        </form>
+      )}
+    </div>
+  );
+}
+
+function EndometriosisSection({
+  pid,
+  data,
+  clinician,
+  busy,
+  run,
+}: {
+  pid: string;
+  data: Workspace;
+  clinician?: boolean;
+  busy: boolean;
+  run: (task: () => Promise<unknown>) => Promise<void>;
+}) {
+  const records = (data.endometriosisRecords ?? []).filter((r) => !r.patient_id || r.patient_id === pid);
+  const [staging, setStaging] = useState("Stage II (Mild)");
+  const [surgicalHistory, setSurgicalHistory] = useState("");
+  const [imagingNote, setImagingNote] = useState("");
+  const [siteText, setSiteText] = useState("Uterosacral ligaments, Pouch of Douglas");
+
+  return (
+    <section className="space-y-3 rounded-lg border border-line bg-card p-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl">Endometriosis Records</h2>
+        <Chip tone="clay">Clinical Decision Aid</Chip>
+      </div>
+      <p className="text-xs text-muted">
+        rASRM / Enzian classification aid. Not an autonomous diagnostic device. Surgical and multidisciplinary correlation required.
+      </p>
+      <ul className="space-y-2 text-sm">
+        {records.map((rec) => (
+          <li key={rec.id} className="rounded-md border border-line bg-paper p-2 space-y-1">
+            <div className="flex justify-between text-xs">
+              <span className="font-medium text-ink">{rec.staging_rASRM || "Unstaged"}</span>
+              <span className="text-muted">{new Date(rec.created_at).toLocaleDateString()}</span>
+            </div>
+            <p className="text-xs text-ink-soft">Sites: {rec.lesion_sites_json}</p>
+            {rec.imaging_note && <p className="text-xs text-muted">Imaging: {rec.imaging_note}</p>}
+            {rec.surgical_history && <p className="text-xs text-muted">Surgery: {rec.surgical_history}</p>}
+          </li>
+        ))}
+        {records.length === 0 && <li className="text-xs text-muted">No structured endometriosis records stored for this patient.</li>}
+      </ul>
+      {clinician && (
+        <form
+          className="space-y-2 pt-2 border-t border-line"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const sites = siteText.split(",").map((s) => s.trim()).filter(Boolean);
+            void run(() => saveEndometriosisRecord({
+              data: {
+                patientId: pid,
+                lesionSites: sites,
+                surgicalHistory: surgicalHistory.trim(),
+                stagingRASRM: staging,
+                imagingNote: imagingNote.trim(),
+              },
+            }));
+            setImagingNote("");
+            setSurgicalHistory("");
+          }}
+        >
+          <label className="block text-xs text-muted">
+            rASRM Staging
+            <select className="mt-1 min-h-11 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink" value={staging} onChange={(e) => setStaging(e.target.value)}>
+              <option>Stage I (Minimal)</option>
+              <option>Stage II (Mild)</option>
+              <option>Stage III (Moderate)</option>
+              <option>Stage IV (Severe)</option>
+              <option>Extragenital / Deep Infiltrating (Enzian)</option>
+            </select>
+          </label>
+          <label className="block text-xs text-muted">
+            Suspected / confirmed lesion sites (comma-separated)
+            <input className="mt-1 min-h-11 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink" value={siteText} onChange={(e) => setSiteText(e.target.value)} />
+          </label>
+          <input className="min-h-11 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink" placeholder="Surgical / laparoscopy history" value={surgicalHistory} onChange={(e) => setSurgicalHistory(e.target.value)} />
+          <input className="min-h-11 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink" placeholder="Imaging findings note (US / MRI)" value={imagingNote} onChange={(e) => setImagingNote(e.target.value)} />
+          <Button type="submit" disabled={busy}>Save Endometriosis Record</Button>
+        </form>
+      )}
+    </section>
+  );
+}
+
+function OvarianCystSection({
+  pid,
+  data,
+  clinician,
+  busy,
+  run,
+}: {
+  pid: string;
+  data: Workspace;
+  clinician?: boolean;
+  busy: boolean;
+  run: (task: () => Promise<unknown>) => Promise<void>;
+}) {
+  const records = (data.ovarianCystRecords ?? []).filter((r) => !r.patient_id || r.patient_id === pid);
+  const [laterality, setLaterality] = useState<"left" | "right" | "bilateral">("left");
+  const [maxDiameterMm, setMaxDiameterMm] = useState(38);
+  const [featuresText, setFeaturesText] = useState("Simple anechoic, thin smooth walls, no internal vascularity (O-RADS 2)");
+  const [followUpMonths, setFollowUpMonths] = useState(6);
+  const [clinicalNote, setClinicalNote] = useState("");
+
+  return (
+    <section className="space-y-3 rounded-lg border border-line bg-card p-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl">Ovarian Cyst Records</h2>
+        <Chip tone="clay">O-RADS Framework</Chip>
+      </div>
+      <p className="text-xs text-muted">
+        Ovarian risk stratification. Not an autonomous device. Sonographic follow-up guided by ACR O-RADS criteria.
+      </p>
+      <ul className="space-y-2 text-sm">
+        {records.map((rec) => (
+          <li key={rec.id} className="rounded-md border border-line bg-paper p-2 space-y-1">
+            <div className="flex justify-between text-xs">
+              <span className="font-medium text-ink">{rec.laterality.toUpperCase()} · {rec.max_diameter_mm} mm</span>
+              <span className="text-muted">{new Date(rec.created_at).toLocaleDateString()}</span>
+            </div>
+            <p className="text-xs text-ink-soft">Features: {rec.features_text}</p>
+            {rec.follow_up_months && <p className="text-xs text-pine">Follow-up: {rec.follow_up_months} months</p>}
+            {rec.clinical_note && <p className="text-xs text-muted">{rec.clinical_note}</p>}
+          </li>
+        ))}
+        {records.length === 0 && <li className="text-xs text-muted">No ovarian cyst records stored for this patient.</li>}
+      </ul>
+      {clinician && (
+        <form
+          className="space-y-2 pt-2 border-t border-line"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void run(() => saveOvarianCystRecord({
+              data: {
+                patientId: pid,
+                laterality,
+                maxDiameterMm,
+                featuresText: featuresText.trim(),
+                followUpMonths,
+                clinicalNote: clinicalNote.trim(),
+              },
+            }));
+            setClinicalNote("");
+          }}
+        >
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block text-xs text-muted">
+              Laterality
+              <select className="mt-1 min-h-11 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink" value={laterality} onChange={(e) => setLaterality(e.target.value as "left" | "right" | "bilateral")}>
+                <option value="left">Left ovary</option>
+                <option value="right">Right ovary</option>
+                <option value="bilateral">Bilateral</option>
+              </select>
+            </label>
+            <label className="block text-xs text-muted">
+              Max diameter (mm)
+              <input type="number" min={1} max={300} className="mt-1 min-h-11 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink" value={maxDiameterMm} onChange={(e) => setMaxDiameterMm(Number(e.target.value))} />
+            </label>
+          </div>
+          <input className="min-h-11 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink" placeholder="Acoustic features / O-RADS score" value={featuresText} onChange={(e) => setFeaturesText(e.target.value)} />
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block text-xs text-muted">
+              Follow-up (months)
+              <input type="number" min={0} max={36} className="mt-1 min-h-11 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink" value={followUpMonths} onChange={(e) => setFollowUpMonths(Number(e.target.value))} />
+            </label>
+            <label className="block text-xs text-muted">
+              Clinical note
+              <input className="mt-1 min-h-11 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink" placeholder="e.g. Asymptomatic, premenopausal" value={clinicalNote} onChange={(e) => setClinicalNote(e.target.value)} />
+            </label>
+          </div>
+          <Button type="submit" disabled={busy}>Save Ovarian Cyst Record</Button>
+        </form>
+      )}
+    </section>
+  );
+}
+
+function PcosAssessmentSection({
+  pid,
+  data,
+  clinician,
+  busy,
+  run,
+}: {
+  pid: string;
+  data: Workspace;
+  clinician?: boolean;
+  busy: boolean;
+  run: (task: () => Promise<unknown>) => Promise<void>;
+}) {
+  const records = (data.pcosAssessments ?? []).filter((r) => !r.patient_id || r.patient_id === pid);
+  const [cycleIrreg, setCycleIrreg] = useState(true);
+  const [hyperClin, setHyperClin] = useState(true);
+  const [hyperBio, setHyperBio] = useState(false);
+  const [pcom, setPcom] = useState(true);
+  const [notes, setNotes] = useState("");
+
+  const hyperPresent = hyperClin || hyperBio;
+  const count = [cycleIrreg, hyperPresent, pcom].filter(Boolean).length;
+  const criteriaMet = count >= 2;
+
+  return (
+    <section className="space-y-3 rounded-lg border border-line bg-card p-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl">PCOS Evaluation</h2>
+        <Chip tone={criteriaMet ? "pine" : "clay"}>{`Rotterdam: ${count}/3`}</Chip>
+      </div>
+      <p className="text-xs text-muted">
+        2023 International Guideline / Rotterdam 2003 criteria. Diagnosis requires &gt;= 2 features and exclusion of mimickers.
+      </p>
+      <ul className="space-y-2 text-sm">
+        {records.map((rec) => (
+          <li key={rec.id} className="rounded-md border border-line bg-paper p-2 space-y-1">
+            <div className="flex justify-between text-xs">
+              <span className="font-semibold text-ink">
+                Rotterdam Criteria: {rec.rotterdam_criteria_met ? "MET (2 or more features)" : "NOT MET"}
+              </span>
+              <span className="text-muted">{new Date(rec.created_at).toLocaleDateString()}</span>
+            </div>
+            <p className="text-xs text-ink-soft">
+              Cycle: {rec.cycle_irregularity ? "Yes" : "No"} · Hyperandrogenism: {rec.hyperandrogenism_clinical || rec.hyperandrogenism_biochemical ? "Yes" : "No"} · Morphology: {rec.ultrasound_or_amh_features ? "Yes" : "No"}
+            </p>
+            {rec.notes && <p className="text-xs text-muted">{rec.notes}</p>}
+          </li>
+        ))}
+        {records.length === 0 && <li className="text-xs text-muted">No structured PCOS evaluations stored for this patient.</li>}
+      </ul>
+      {clinician && (
+        <form
+          className="space-y-2 pt-2 border-t border-line text-xs"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void run(() => savePcosAssessment({
+              data: {
+                patientId: pid,
+                cycleIrregularity: cycleIrreg,
+                hyperandrogenismClinical: hyperClin,
+                hyperandrogenismBiochemical: hyperBio,
+                ultrasoundOrAmhFeatures: pcom,
+                notes: notes.trim(),
+              },
+            }));
+            setNotes("");
+          }}
+        >
+          <div className="space-y-1 rounded-md bg-paper p-2">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={cycleIrreg} onChange={(e) => setCycleIrreg(e.target.checked)} />
+              <span>1. Ovulatory dysfunction (Oligo/amenorrhea)</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={hyperClin} onChange={(e) => setHyperClin(e.target.checked)} />
+              <span>2a. Clinical hyperandrogenism (Hirsutism/acne)</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={hyperBio} onChange={(e) => setHyperBio(e.target.checked)} />
+              <span>2b. Biochemical hyperandrogenism (Elevated testosterone/FAI)</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={pcom} onChange={(e) => setPcom(e.target.checked)} />
+              <span>3. Polycystic ovarian morphology (20+ follicles or vol 10+ mL, or high AMH)</span>
+            </label>
+          </div>
+          <div className="rounded-md bg-paper p-2 font-medium">
+            Status: {criteriaMet ? (
+              <span className="text-pine">Criteria Met ({count}/3 features present)</span>
+            ) : (
+              <span className="text-clay">Criteria Not Met ({count}/3 features present)</span>
+            )}
+          </div>
+          <input className="min-h-11 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink" placeholder="Exclusion notes (TSH, prolactin, 17-OHP)" value={notes} onChange={(e) => setNotes(e.target.value)} />
+          <Button type="submit" disabled={busy}>Save PCOS Assessment</Button>
+        </form>
+      )}
+    </section>
   );
 }

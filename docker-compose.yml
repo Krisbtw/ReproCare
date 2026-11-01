@@ -6,10 +6,11 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - NODE_ENV=production
-      - DATABASE_URL=postgresql://reprocare:password@db:5432/reprocare_db
+      - NODE_ENV=development
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-reprocare}:${POSTGRES_PASSWORD:-password}@db:5432/${POSTGRES_DB:-reprocare_db}
       - ANATOMYBRIDGE_SERVICE_URL=http://imaging:8100
-      - ANATOMYBRIDGE_SERVICE_API_KEY=reprocare-service-secret-key
+      - ANATOMYBRIDGE_SERVICE_API_KEY=${ANATOMYBRIDGE_SERVICE_API_KEY:-dev-service-key-change-in-prod}
+      - BOOTSTRAP_ADMIN_EMAILS=${BOOTSTRAP_ADMIN_EMAILS:-}
     depends_on:
       - db
       - imaging
@@ -19,22 +20,21 @@ services:
       context: ./imaging-service
       dockerfile: Dockerfile
     ports:
-      - "8100:8100"
+      - "127.0.0.1:8100:8100"
     environment:
-      - ANATOMYBRIDGE_SERVICE_API_KEY=reprocare-service-secret-key
+      - ANATOMYBRIDGE_SERVICE_API_KEY=${ANATOMYBRIDGE_SERVICE_API_KEY:-dev-service-key-change-in-prod}
       - ANATOMYBRIDGE_CORS_ORIGINS=http://localhost:8080,http://127.0.0.1:8080
 
   db:
     image: postgres:15-alpine
     environment:
-      - POSTGRES_USER=reprocare
-      - POSTGRES_PASSWORD=password
-      - POSTGRES_DB=reprocare_db
+      - POSTGRES_USER=${POSTGRES_USER:-reprocare}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+      - POSTGRES_DB=${POSTGRES_DB:-reprocare_db}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
 volumes:
   postgres_data:
-

@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: web
-          image: reprocare/web:latest
+          image: reprocare/web:0.1.0
           ports:
             - containerPort: 8080
           envFrom:
@@ -60,7 +60,7 @@ spec:
     spec:
       containers:
         - name: imaging
-          image: reprocare/imaging:latest
+          image: reprocare/imaging:0.1.0
           ports:
             - containerPort: 8100
           envFrom:

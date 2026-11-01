@@ -167,3 +167,15 @@ test("detects scanned PDF limitations and handles FIGO class / nabothian cyst ex
   assert.equal(ext.findings.some((f) => f.structure === "fibroid"), true);
   assert.equal(ext.anatomy.some((a) => a.text === "cervix"), true);
 });
+
+test("extract: recognizes expanded negation phrases and clinical uncertainty cues", () => {
+  const sample = "No evidence of deep infiltrating endometriosis in the pouch of Douglas. Cannot rule out small ovarian cyst in the left adnexa measuring 2.4 cm.";
+  const ext = extractReport(sample);
+  const endo = ext.findings.find((f) => f.structure === "endometriosis lesion");
+  assert.equal(endo?.negated, true, "no evidence of -> negated");
+
+  const cyst = ext.findings.find((f) => f.structure === "ovarian cyst");
+  assert.equal(cyst?.uncertain, true, "cannot rule out -> uncertain");
+  assert.equal(cyst?.laterality, "left");
+  assert.equal(ext.notes.some((n) => n.includes("uncertainty")), true);
+});

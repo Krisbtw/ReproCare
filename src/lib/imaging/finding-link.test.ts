@@ -24,13 +24,29 @@ test("accepted classical run becomes version fields with no centroid and unavail
   assert.match(r.fields.evidenceNote, /not been shown to be the study/);
 });
 
-test("refuses rejected segmentation, learned flag, empty mask, fragmented mask, short reason, absurd size", () => {
+test("refuses rejected segmentation, unconfirmed learned flag, empty mask, fragmented mask, short reason, absurd size", () => {
   assert.equal(versionFromLab({ ...base, accepted: false }).ok, false);
-  assert.equal(versionFromLab({ ...base, isLearnedModel: true }).ok, false);
+  assert.equal(versionFromLab({ ...base, isLearnedModel: true, clinicianConfirmed: false }).ok, false);
   assert.equal(versionFromLab({ ...base, measurement: { ...good, voxelCount: 0, axesMm: null, longestMm: null } }).ok, false);
   assert.equal(versionFromLab({ ...base, measurement: { ...good, componentCount: 3, largestComponentFraction: 0.6 } }).ok, false);
   assert.equal(versionFromLab({ ...base, reason: "short" }).ok, false);
   assert.equal(versionFromLab({ ...base, measurement: { ...good, axesMm: [400, 10, 10], longestMm: 400 } }).ok, false);
+});
+
+test("accepts learned model result when clinician explicitly confirms", () => {
+  const r = versionFromLab({
+    ...base,
+    isLearnedModel: true,
+    clinicianConfirmed: true,
+    modelId: "umd_monai_fibroid",
+    segmentationRunId: "run-123",
+  });
+  assert.ok(r.ok);
+  if (!r.ok) return;
+  assert.equal(r.fields.modelId, "umd_monai_fibroid");
+  assert.equal(r.fields.segmentationSource, "umd_monai_fibroid");
+  assert.equal(r.fields.segmentationRunId, "run-123");
+  assert.match(r.fields.evidenceNote, /Clinician reviewed and confirmed/);
 });
 
 test("fnv1a is stable and sensitive", () => {

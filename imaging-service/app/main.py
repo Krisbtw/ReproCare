@@ -6,7 +6,9 @@ Nothing here stores uploads. Files are read in memory and dropped after the resp
 """
 from __future__ import annotations
 
+import asyncio
 import base64
+import hmac
 import os
 import zlib
 from datetime import datetime
@@ -16,11 +18,10 @@ import numpy as np
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from . import metrics, models, series, trends
-from .routes import trends as trends_routes
 
 MAX_FILES = 1000
 MAX_BYTES_EACH = 64 * 1024 * 1024
@@ -192,7 +193,7 @@ def verify_service_auth(
     elif api_key_header:
         provided = api_key_header.strip()
 
-    if not provided or provided != expected:
+    if not provided or not hmac.compare_digest(provided, expected):
         raise HTTPException(401, "Unauthorized: valid service API key or Bearer token is required.")
     return True
 
@@ -206,6 +207,16 @@ class MaskScoreRequest(BaseModel):
 @app.get("/health", response_model=Health)
 def health() -> Health:
     return Health(status="ok", service="anatomybridge-imaging", any_model_connected=any(m.connected for m in models.statuses()))
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def prometheus_metrics() -> str:
+    """Prometheus scrape endpoint for service monitoring."""
+    return (
+        "# HELP anatomybridge_imaging_up Service operational status\n"
+        "# TYPE anatomybridge_imaging_up gauge\n"
+        "anatomybridge_imaging_up 1\n"
+    )
 
 
 @app.get("/models")
@@ -266,7 +277,10 @@ async def segment(
         vol, spacing, rep = series.stack_volume(await _read_files(files))
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    out = adapter.run(vol, spacing)
+    try:
+        out = await asyncio.to_thread(adapter.run, vol, spacing)
+    except Exception as e:
+        raise HTTPException(422, f"Inference failed: {str(e)}") from e
     seg: np.ndarray = out.pop("label_volume_zyx")
     # Serialize the mask as base64-encoded zlib-compressed bytes so the browser
     # can reconstruct the voxel array without a separate binary endpoint.
@@ -325,5 +339,4 @@ def calculate_trends_endpoint(
     }
 
 
-# Mount patient longitudinal trends and ReproTrace router
-app.include_router(trends_routes.router)
+# Fake patient trends router removed — system of record is the TypeScript clinic backend

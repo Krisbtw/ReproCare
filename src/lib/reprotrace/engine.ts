@@ -41,9 +41,11 @@ export type Proposal = {
   provisional: boolean;
 };
 
-const DIST_SAME = 18;
-const DIST_FAR = 40;
-const PAIR_FLOOR = 0.62;
+import { REPROTRACE_PARAMS } from "./params.ts";
+
+const DIST_SAME = REPROTRACE_PARAMS.DIST_SAME_MM;
+const DIST_FAR = REPROTRACE_PARAMS.DIST_FAR_MM;
+const PAIR_FLOOR = REPROTRACE_PARAMS.PAIR_FLOOR_SCORE;
 
 export function longestOf(
   axes: [number, number, number] | null,

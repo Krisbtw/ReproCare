@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   web:
     build:
@@ -9,9 +7,10 @@ services:
       - "80:8080"
     environment:
       - NODE_ENV=production
-      - DATABASE_URL=postgresql://reprocare:password@db:5432/reprocare_db
+      - DATABASE_URL=postgresql://${DB_USER:-reprocare}:${DB_PASSWORD:?DB_PASSWORD must be set in production}@db:5432/${DB_NAME:-reprocare_db}
       - ANATOMYBRIDGE_SERVICE_URL=http://imaging:8100
-      - ANATOMYBRIDGE_SERVICE_API_KEY=${ANATOMYBRIDGE_SERVICE_API_KEY:-reprocare-prod-secret}
+      - ANATOMYBRIDGE_SERVICE_API_KEY=${ANATOMYBRIDGE_SERVICE_API_KEY:?ANATOMYBRIDGE_SERVICE_API_KEY must be set in production}
+      - BOOTSTRAP_ADMIN_EMAILS=${BOOTSTRAP_ADMIN_EMAILS:-}
     depends_on:
       db:
         condition: service_healthy
@@ -28,43 +27,45 @@ services:
     build:
       context: ./imaging-service
       dockerfile: Dockerfile
-    ports:
-      - "8100:8100"
+    # Port 8100 is internal to docker network; not exposed publicly
+    expose:
+      - "8100"
     environment:
-      - ANATOMYBRIDGE_SERVICE_API_KEY=${ANATOMYBRIDGE_SERVICE_API_KEY:-reprocare-prod-secret}
-      - ANATOMYBRIDGE_CORS_ORIGINS=http://localhost,https://reprocare.app
+      - ANATOMYBRIDGE_SERVICE_API_KEY=${ANATOMYBRIDGE_SERVICE_API_KEY:?ANATOMYBRIDGE_SERVICE_API_KEY must be set in production}
+      - ANATOMYBRIDGE_CORS_ORIGINS=https://reprocare.app
     restart: unless-stopped
 
   db:
-    image: postgres:15-alpine
+    image: postgres:15.8-alpine
     environment:
-      - POSTGRES_USER=reprocare
-      - POSTGRES_PASSWORD=${DB_PASSWORD:-password}
-      - POSTGRES_DB=reprocare_db
+      - POSTGRES_USER=${DB_USER:-reprocare}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set in production}
+      - POSTGRES_DB=${DB_NAME:-reprocare_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U reprocare -d reprocare_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-reprocare} -d ${DB_NAME:-reprocare_db}"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.54.1
+    # Bind prometheus to loopback only so it is not public
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
       - ./monitoring/alert.rules:/etc/prometheus/alert.rules
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.1.0
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:?GRAFANA_PASSWORD must be set in production}
     volumes:
       - grafana_data:/var/lib/grafana
     restart: unless-stopped
@@ -72,4 +73,3 @@ services:
 volumes:
   postgres_data:
   grafana_data:
-

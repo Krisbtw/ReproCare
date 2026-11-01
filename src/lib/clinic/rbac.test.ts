@@ -129,6 +129,18 @@ async function makeDb(): Promise<{ pg: PGlite; sql: Sql }> {
       note text not null,
       created_at timestamptz not null default now()
     );
+    create table if not exists clinician_verifications (
+      id text primary key,
+      user_id text not null references profiles (user_id) on delete cascade,
+      licence_no text not null default '',
+      registry text not null default '',
+      evidence_note text not null default '',
+      status text not null default 'pending' check (status in ('pending', 'verified', 'revoked')),
+      decided_by text references profiles (user_id) on delete set null,
+      decided_at timestamptz,
+      reason text not null default '',
+      requested_at timestamptz not null default now()
+    );
 
     insert into profiles (user_id, display_name, role) values ('patient_user', 'Patient Self', 'patient');
     insert into profiles (user_id, display_name, role) values ('clinician_user', 'Dr Clinician', 'clinician');
@@ -302,4 +314,68 @@ test("RBAC: Administrator-controlled clinician verification (promoteUser)", asyn
   assert.equal(await testPromoteUser("admin_user", "patient_user", "patient"), true);
   const reverted = await sql<{ role: string }>`select role from profiles where user_id = 'patient_user'`;
   assert.equal(reverted[0].role, "patient");
+});
+
+test("RBAC: Clinician verification workflow (request, approve, revoke, last admin guard)", async () => {
+  const { sql } = await makeDb();
+
+  // 1. Patient requests verification
+  const vId = "verif_1";
+  await sql`
+    insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status)
+    values (${vId}, 'patient_user', 'MED-12345', 'GMC', 'Certified OB/GYN', 'pending')
+  `;
+  const vRows = await sql<{ status: string }>`select status from clinician_verifications where id = ${vId}`;
+  assert.equal(vRows[0].status, "pending");
+
+  // 2. Non-admin cannot approve
+  async function testVerifyClinician(callerId: string, verificationId: string, decision: "verified" | "revoked", reason: string) {
+    const callerRows = await sql<{ role: string }>`select role from profiles where user_id = ${callerId}`;
+    if (callerRows[0]?.role !== "admin") {
+      throw new Error("Unauthorized: Only administrators can approve or revoke clinician verifications.");
+    }
+    const verif = await sql<{ user_id: string }>`select user_id from clinician_verifications where id = ${verificationId}`;
+    const targetUserId = verif[0].user_id;
+
+    if (decision === "revoked") {
+      const targetRole = (await sql<{ role: string }>`select role from profiles where user_id = ${targetUserId}`)[0]?.role;
+      if (targetRole === "admin") {
+        const adminCount = (await sql<{ count: number }>`select count(*)::int as count from profiles where role = 'admin'`)[0]?.count;
+        if (Number(adminCount) <= 1) {
+          throw new Error("Action rejected: Cannot revoke or demote the last remaining administrator.");
+        }
+      }
+    }
+
+    const newRole = decision === "verified" ? "clinician" : "patient";
+    await sql`update clinician_verifications set status = ${decision}, decided_by = ${callerId}, decided_at = now(), reason = ${reason} where id = ${verificationId}`;
+    await sql`update profiles set role = ${newRole} where user_id = ${targetUserId}`;
+    return true;
+  }
+
+  // Patient cannot verify
+  await assert.rejects(
+    () => testVerifyClinician("patient_user", vId, "verified", "self verify"),
+    /Unauthorized: Only administrators can approve or revoke clinician verifications/
+  );
+
+  // Admin approves verification -> role becomes clinician
+  assert.equal(await testVerifyClinician("admin_user", vId, "verified", "Credentials confirmed with registry"), true);
+  const pRows = await sql<{ role: string }>`select role from profiles where user_id = 'patient_user'`;
+  assert.equal(pRows[0].role, "clinician");
+
+  // Admin revokes verification -> role drops back to patient immediately
+  assert.equal(await testVerifyClinician("admin_user", vId, "revoked", "Licence expired"), true);
+  const revRows = await sql<{ role: string }>`select role from profiles where user_id = 'patient_user'`;
+  assert.equal(revRows[0].role, "patient");
+
+  // Guard: Cannot revoke the last administrator
+  await sql`
+    insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status)
+    values ('verif_admin', 'admin_user', 'ADMIN-01', 'REG', 'Admin credentials', 'verified')
+  `;
+  await assert.rejects(
+    () => testVerifyClinician("admin_user", "verif_admin", "revoked", "Demote sole admin"),
+    /Cannot revoke or demote the last remaining administrator/
+  );
 });

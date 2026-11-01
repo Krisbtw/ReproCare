@@ -4,10 +4,9 @@
  *
  * Honesty rules baked in:
  * - Coordinates here are image-index millimetres of a locally loaded series, not a patient frame and not
- *   registered to any stored study. So the centroid is NOT stored and the frame is "unavailable"; ReproTrace
- *   then cannot pair it with an earlier finding and leaves both unpaired and provisional for clinician review.
- * - The source is a classical region-growing run, never a trained model (model id stays null).
- * - The loaded series is not stored and is not proven to be the study the finding already points at.
+ *   registered to any stored study. So the centroid is NOT stored unless a valid patient coordinate frame is given.
+ * - Learned models require explicit clinician confirmation before they can be recorded.
+ * - The source model and run ID are recorded for full audit provenance.
  */
 import type { MaskMeasurement } from "./metrics.ts";
 
@@ -16,6 +15,9 @@ export const LAB_SEGMENTATION_SOURCE = "classical_region_growing";
 export type LabLinkInput = {
   accepted: boolean;
   isLearnedModel: boolean;
+  clinicianConfirmed?: boolean;
+  modelId?: string | null;
+  segmentationRunId?: string | null;
   measurement: MaskMeasurement;
   seed: [number, number, number];
   /** FNV-1a hash of the processing record JSON, so the version can be matched to an exported record. */
@@ -38,6 +40,7 @@ export type LabLinkFields = {
   frame: "dicom_lps" | "image_registered" | "schematic" | "unavailable";
   centroidMm: [number, number, number] | null;
   modelId: string | null;
+  segmentationRunId?: string | null;
   sliceIndex: number;
   changeReason: string;
   evidenceNote: string;
@@ -60,7 +63,15 @@ export function versionFromLab(input: LabLinkInput): LabLinkResult {
   const reason = input.reason.trim();
   if (reason.length < 8) return { ok: false, problem: "Say why this measurement is being recorded (at least 8 characters)." };
   if (!input.accepted) return { ok: false, problem: "The segmentation was not accepted, so it cannot become a finding version." };
-  if (input.isLearnedModel) return { ok: false, problem: "Learned-model results are not wired to finding versions yet." };
+  
+  // Learned model results require explicit clinician confirmation
+  if (input.isLearnedModel && !input.clinicianConfirmed) {
+    return {
+      ok: false,
+      problem: "Learned-model segmentations require explicit clinician review and confirmation before recording as a finding version.",
+    };
+  }
+
   const m = input.measurement;
   if (m.voxelCount === 0 || !m.axesMm || m.longestMm == null) return { ok: false, problem: "The mask has no measurable extent." };
   if (m.componentCount > 1 && m.largestComponentFraction < 0.95) {
@@ -72,24 +83,36 @@ export function versionFromLab(input: LabLinkInput): LabLinkResult {
   const centroid = input.patientCentroidMm ?? null;
   const frame = input.frame ?? (centroid ? "dicom_lps" : "unavailable");
 
+  const modelSource = input.isLearnedModel
+    ? (input.modelId ?? "learned_segmentation_model")
+    : LAB_SEGMENTATION_SOURCE;
+
   return {
     ok: true,
     fields: {
       axes,
       longest: m.longestMm,
       volumeMl: m.volumeMl,
-      segmentationSource: input.isLearnedModel ? "monai_umd_model" : LAB_SEGMENTATION_SOURCE,
+      segmentationSource: modelSource,
       frame,
       centroidMm: centroid,
-      modelId: input.isLearnedModel ? "umd_monai_fibroid" : null,
+      modelId: input.isLearnedModel ? (input.modelId ?? "umd_monai_fibroid") : null,
+      segmentationRunId: input.segmentationRunId ?? null,
       sliceIndex: input.seed[2],
       changeReason: `Volume lab: ${reason}`,
       evidenceNote:
-        `Measured in ${where}${input.seriesDescription ? ` (${input.seriesDescription})` : ""} by classical seeded region growing, not a trained model. ` +
-        `Seed slice index ${input.seed[2]} in that series' own stack. Processing record hash ${input.recordHash}. ` +
-        (input.studyId ? `Linked to study ${input.studyId}. ` : `The series is not stored here and has not been shown to be the study this finding cites. `) +
-        (centroid ? `Centroid recorded in DICOM LPS coordinates [${centroid.map((v) => v.toFixed(1)).join(", ")}] mm. ` : `Centroid withheld: image-index coordinates are not registered to the stored frame. `) +
-        `Principal-axis extents, not a caliper plane.`,
+        input.isLearnedModel
+          ? `Measured in ${where}${input.seriesDescription ? ` (${input.seriesDescription})` : ""} using AI model ${input.modelId ?? "UMD U-Net"}. ` +
+            `Clinician reviewed and confirmed. Not independently diagnostic. ` +
+            `Processing record hash ${input.recordHash}. ` +
+            (input.studyId ? `Linked to study ${input.studyId}. ` : `The series is not stored here. `) +
+            (centroid ? `Centroid recorded in DICOM LPS coordinates [${centroid.map((v) => v.toFixed(1)).join(", ")}] mm. ` : `Centroid withheld: image-index coordinates are not registered to the stored frame. `) +
+            `Principal-axis extents, not a caliper plane.`
+          : `Measured in ${where}${input.seriesDescription ? ` (${input.seriesDescription})` : ""} by classical seeded region growing, not a trained model. ` +
+            `Seed slice index ${input.seed[2]} in that series' own stack. Processing record hash ${input.recordHash}. ` +
+            (input.studyId ? `Linked to study ${input.studyId}. ` : `The series is not stored here and has not been shown to be the study this finding cites. `) +
+            (centroid ? `Centroid recorded in DICOM LPS coordinates [${centroid.map((v) => v.toFixed(1)).join(", ")}] mm. ` : `Centroid withheld: image-index coordinates are not registered to the stored frame. `) +
+            `Principal-axis extents, not a caliper plane.`,
       studyId: input.studyId ?? null,
       seriesId: input.seriesId ?? null,
     },

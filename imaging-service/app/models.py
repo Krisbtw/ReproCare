@@ -205,12 +205,14 @@ class UmdMonaiAdapter:
                 except Exception:
                     loaded = False
 
-            # 2. Try PyTorch module or state_dict checkpoint
+            # 2. Try PyTorch module or state_dict checkpoint (strictly weights_only=True)
             if not loaded:
                 try:
                     checkpoint = torch.load(str(weights_path), map_location=device, weights_only=True)
-                except Exception:
-                    checkpoint = torch.load(str(weights_path), map_location=device)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Unsafe or corrupted weights: failed to load checkpoint with weights_only=True: {e}"
+                    ) from e
 
                 if isinstance(checkpoint, torch.nn.Module):
                     model = checkpoint

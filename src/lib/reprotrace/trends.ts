@@ -2,6 +2,8 @@
  * Longitudinal trends, volumetric growth rates, and alert detection for reproductive imaging.
  */
 
+import { REPROTRACE_PARAMS } from "./params.ts";
+
 export interface ObservationPoint {
   date: string;
   volumeMm3: number;
@@ -61,14 +63,14 @@ export function evaluateLongitudinalAlert(points: ObservationPoint[]): Longitudi
   if (points.length < 2) return null;
   const growthRate = calculateGrowthRate(points);
 
-  // If growing > 500 mm³/month (e.g. fast fibroid enlargement)
-  if (growthRate > 500) {
+  // If growing > alert threshold (unvalidated research threshold for clinical review)
+  if (growthRate > REPROTRACE_PARAMS.RAPID_GROWTH_ALERT_MM3_PER_MONTH) {
     return {
       type: "rapid_growth",
-      message: `Accelerated lesion expansion detected: +${growthRate} mm³/month. Recommend expedited clinical review.`,
+      message: `Accelerated lesion expansion detected: +${growthRate} mm³/month (unvalidated threshold >${REPROTRACE_PARAMS.RAPID_GROWTH_ALERT_MM3_PER_MONTH} mm³/mo). Recommend expedited clinician review.`,
       growthRateMm3PerMonth: growthRate,
     };
-  } else if (growthRate < -500) {
+  } else if (growthRate < -REPROTRACE_PARAMS.RAPID_GROWTH_ALERT_MM3_PER_MONTH) {
     return {
       type: "significant_reduction",
       message: `Significant volume reduction noted: ${growthRate} mm³/month. Correlate with hormonal therapy or embolization response.`,

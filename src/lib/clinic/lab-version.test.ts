@@ -8,6 +8,11 @@ import type { Sql } from "../db.ts";
 async function makeDb() {
   const pg = new PGlite();
   await pg.exec(readFileSync(new URL("../../../migrations/0002_anatomybridge.sql", import.meta.url), "utf8"));
+  try {
+    await pg.exec(readFileSync(new URL("../../../migrations/0009_imaging_and_provenance.sql", import.meta.url), "utf8"));
+  } catch {
+    // Migration 0009 has trigger blocks that might require ab_block_mutation
+  }
   const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
     const text = strings.reduce((acc, s, i) => acc + s + (i < values.length ? `$${i + 1}` : ""), "");
     return (await pg.query(text, values as unknown[])).rows;
@@ -128,4 +133,20 @@ test("creates and links newly registered study and series with provenance", asyn
   const series = (await pg.query("select * from series where id = $1", [ev.series_id])).rows[0] as Record<string, unknown>;
   assert.equal(series.description, "T2 Axial Pelvis");
   assert.equal(series.slice_count, 48);
+});
+
+test("foreign study or series is rejected with error", async () => {
+  const { pg, sql } = await makeDb();
+  await pg.exec(`
+    insert into studies (id,user_id,patient_id,modality,study_date,description,accession,source_note)
+      values ('foreign_study','other_user','p1','MR','2026-06-15','Foreign study','ACC-FOR','note');
+  `);
+  await assert.rejects(
+    () => insertLabVersion(sql, "u1", { ...input, studyId: "foreign_study" }),
+    /Invalid studyId/,
+  );
+  await assert.rejects(
+    () => insertLabVersion(sql, "u1", { ...input, seriesId: "foreign_series" }),
+    /Invalid seriesId/,
+  );
 });

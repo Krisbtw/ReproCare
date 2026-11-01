@@ -13,6 +13,11 @@ export type LabVersionInput = {
   frame?: string | null;
   observedOn?: string | null;
   provenanceHash?: string | null;
+  segmentationSource?: string | null;
+  modelId?: string | null;
+  segmentationRunId?: string | null;
+  volumeMm3?: number | null;
+  uncertaintyMm3?: number | null;
   newStudy?: {
     patientId: string;
     modality?: string;
@@ -78,9 +83,17 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
     }
   } else if (data.studyId) {
     const studyCheck = await sql<{ id: string; study_date: string }>`select id, study_date from studies where id = ${data.studyId} and user_id = ${userId}`;
-    if (studyCheck.length > 0) {
-      targetStudyId = studyCheck[0].id;
-      targetObservedOn = data.observedOn ?? studyCheck[0].study_date;
+    if (!studyCheck.length) {
+      throw new Error(`Invalid studyId: Study ${data.studyId} does not exist or does not belong to user.`);
+    }
+    targetStudyId = studyCheck[0].id;
+    targetObservedOn = data.observedOn ?? studyCheck[0].study_date;
+  }
+
+  if (targetSeriesId) {
+    const seriesCheck = await sql<{ id: string }>`select id from series where id = ${targetSeriesId} and user_id = ${userId}`;
+    if (!seriesCheck.length) {
+      throw new Error(`Invalid seriesId: Series ${targetSeriesId} does not exist or does not belong to user.`);
     }
   }
 
@@ -91,14 +104,16 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
   await sql`insert into finding_versions (
     id, user_id, finding_id, version_no, previous_version_id, study_id, observed_on, location_label, figo,
     centroid_mm, axes_mm, longest_mm, measurement_basis, frame, segmentation_source, model_id, quality, modality,
-    report_longest_mm, change_reason
+    report_longest_mm, change_reason, series_id, volume_mm3, volume_method, segmentation_run_id, uncertainty_mm3
   ) values (
     ${id}, ${userId}, ${data.findingId}, ${num(current.version_no) + 1}, ${current.id as string},
     ${targetStudyId}, ${targetObservedOn}, ${current.location_label as string}, ${current.figo as string | null},
     ${centroidJson}, ${JSON.stringify(data.axes)}, ${data.longest}, ${"principal-axis extents of a seeded mask (not a caliper plane)"},
-    ${frameVal}, ${"classical_region_growing"}, ${null}, ${"adequate"}, ${current.modality as string},
-    ${null}, ${"Volume lab: " + data.reason}
+    ${frameVal}, ${data.segmentationSource ?? "classical_region_growing"}, ${data.modelId ?? null}, ${"adequate"}, ${current.modality as string},
+    ${null}, ${"Volume lab: " + data.reason}, ${targetSeriesId}, ${data.volumeMm3 ?? null},
+    ${data.segmentationSource ? "voxel_counting" : "ellipsoid_formula"}, ${data.segmentationRunId ?? null}, ${data.uncertaintyMm3 ?? null}
   )`;
+
   await sql`insert into evidence_links (id, user_id, finding_version_id, kind, study_id, series_id, report_id, quote, slice_index, note)
     values (${crypto.randomUUID()}, ${userId}, ${id}, ${"lab_segmentation"}, ${targetStudyId}, ${targetSeriesId}, ${null}, ${null}, ${data.sliceIndex}, ${data.evidenceNote})`;
   return id;
