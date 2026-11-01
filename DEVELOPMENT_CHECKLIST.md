@@ -10,7 +10,7 @@ Legend: ✅ done and tested · 🟡 exists, not browser-verified or partial · �
 |---|---|---|
 | Frontend runs | ✅ | Verified with dev server and browser smoke test on desktop (1280x800) and mobile (390x844), plus end-to-end browser interaction script. |
 | Backend runs | ✅ | TanStack Start Nitro server functions + Python FastAPI imaging service (`imaging-service/`) with authentication, CORS, and inspection endpoints. |
-| Database migrations work | ✅ | Migrations 0001 through 0005 tested against embedded PostgreSQL (PGlite) in automated test suites. |
+| Database migrations work | ✅ | Migrations 0001 through 0007 tested against embedded PostgreSQL (PGlite) in automated test suites. |
 | Authentication works | ✅ | Better Auth with session management and server-side RBAC; self-service privilege escalation disallowed; verified by browser tests. |
 | Patient maintains a reproductive health profile | ✅ | Symptoms, cycles, labs, and menarche year recorded in app with append-only audit trail and 2023 International PCOS Guideline evaluation. |
 | Anonymised DICOM study uploaded | ✅ | DICOM series loader parses single-file or multi-file series in-browser via `dicom-parser` with geometric validation and LPS coordinate frame construction. |
@@ -24,7 +24,7 @@ Legend: ✅ done and tested · 🟡 exists, not browser-verified or partial · �
 | Clinician verification recorded | ✅ | `addReview`, `saveLabMeasurement`, and `resolveDiscrepancy` protected by server-side RBAC refusing patient-role mutations. |
 | Real vs simulated outputs distinguished | ✅ | Synthetic scans and seeds clearly designated; model adapters declare readiness without mocking clinical inference; classical segmenter marks `isLearnedModel: false`. |
 | Documentation explains install and usage | ✅ | `README.md`, `INSTALL.md`, `USER_MANUAL.md`, `DEMO_SCRIPT.md`, `PROJECT_DOCUMENT.md`, `API.md`, `IMAGING_PIPELINE.md`. |
-| Tests reported honestly | ✅ | 203 passing tests across 18 suites in `npm run test:app`; 0 failures. 25 pytest tests in imaging service. Browser interaction test verified. |
+| Tests reported honestly | ✅ | 210 passing tests across 18 suites in `npm run test:app`; 0 failures. 109 pytest tests in imaging service. Browser interaction test verified. |
 
 ## Imaging (Part 5)
 
@@ -74,12 +74,12 @@ Command: `npm run test:app`
 
 | Test Suite | Tests | Result |
 |---|---|---|
-| `src/lib/clinic/rbac.test.ts` | 3 | pass |
+| `src/lib/clinic/rbac.test.ts` | 6 | pass |
 | `src/lib/clinic/pcos-context.test.ts` | 8 | pass |
 | `src/lib/clinic/menarche.test.ts` | 6 | pass |
 | `src/lib/clinic/lab-version.test.ts` | 4 | pass |
 | `src/lib/imaging/finding-link.test.ts` | 4 | pass |
-| `src/lib/imaging/patient-coords.test.ts` | 3 | pass |
+| `src/lib/imaging/patient-coords.test.ts` | 7 | pass |
 | `src/lib/imaging/registration.test.ts` | 3 | pass |
 | `src/lib/imaging/preprocess.test.ts` | 13 | pass |
 | `src/lib/imaging/surface.test.ts` | 1 | pass |
@@ -93,7 +93,7 @@ Command: `npm run test:app`
 | `src/lib/reprotrace/engine.test.ts` | 5 | pass |
 | `src/lib/reprotrace/spans.test.ts` | 2 | pass |
 
-**Total application tests:** 203 run, 203 pass, 0 fail.
+**Total application tests:** 210 run, 210 pass, 0 fail.
 **TypeScript compilation:** `npm run typecheck` passes with 0 errors.
 
 ## Browser QA & Interaction Testing (2026-10-31)
