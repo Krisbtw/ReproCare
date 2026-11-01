@@ -39,3 +39,4 @@ jobs:
         run: |
           cd imaging-service
           python -m pytest tests/ -v --tb=short
+

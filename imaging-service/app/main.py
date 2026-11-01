@@ -9,13 +9,17 @@ from __future__ import annotations
 import base64
 import os
 import zlib
+from datetime import datetime
 
 import numpy as np
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import metrics, models, series, trends
+from .routes import trends as trends_routes
 
 MAX_FILES = 1000
 MAX_BYTES_EACH = 64 * 1024 * 1024
@@ -23,6 +27,9 @@ MAX_BYTES_EACH = 64 * 1024 * 1024
 app = FastAPI(
     title="AnatomyBridge imaging service",
     version="0.1.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
     description=(
         "Research prototype. Checks DICOM series geometry, scores masks against references, and "
         "fronts optional segmentation models. It does not diagnose. No model weights are bundled."
@@ -54,9 +61,10 @@ if _ORIGINS:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_ORIGINS,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
         allow_headers=["authorization", "content-type", "x-api-key"],
-        allow_credentials=False,
+        allow_credentials=True,
+        max_age=86400,
     )
 
 
@@ -65,8 +73,86 @@ async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Content-Security-Policy"] = "default-src 'self'"
     return response
+
+
+def redact_sensitive_data(data: Any) -> Any:
+    """Removes or masks sensitive information from API error payloads or log responses."""
+    if isinstance(data, dict):
+        redacted = {}
+        for key, value in data.items():
+            if key in ["patient_ssn", "patient_dob", "emergency_contact", "medical_history", "referring_physician", "clinician_notes"]:
+                continue
+            elif key in ["email", "phone"]:
+                redacted[key] = "REDACTED"
+            elif isinstance(value, (dict, list)):
+                redacted[key] = redact_sensitive_data(value)
+            else:
+                redacted[key] = value
+        return redacted
+    elif isinstance(data, list):
+        return [redact_sensitive_data(item) for item in data]
+    return data
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handles request validation errors with structured responses."""
+    errors = []
+    for error in exc.errors():
+        loc = error.get("loc", [])
+        field = str(loc[-1]) if loc else "body"
+        errors.append({
+            "field": field,
+            "message": error.get("msg", "Validation error"),
+            "type": error.get("type", "value_error"),
+        })
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "error": "Validation Error",
+            "details": errors,
+            "timestamp": datetime.utcnow().isoformat(),
+            "request": request.url.path,
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Standardizes HTTP error responses and prevents data leakage."""
+    detail = exc.detail
+    if isinstance(detail, dict):
+        detail = redact_sensitive_data(detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "error": detail if isinstance(detail, str) else str(detail),
+            "detail": detail if isinstance(detail, str) else str(detail),
+            "timestamp": datetime.utcnow().isoformat(),
+            "request": request.url.path,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """Catch-all for unhandled exceptions that avoids leaking internal stack traces."""
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": "Internal Server Error",
+            "message": "An unexpected error occurred. Please try again later.",
+            "timestamp": datetime.utcnow().isoformat(),
+            "request": request.url.path,
+        },
+    )
 
 
 class Health(BaseModel):
@@ -228,3 +314,6 @@ def calculate_trends_endpoint(
         "discrepancies": discrepancies,
     }
 
+
+# Mount patient longitudinal trends and ReproTrace router
+app.include_router(trends_routes.router)

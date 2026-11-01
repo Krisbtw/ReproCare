@@ -31,6 +31,7 @@ import { ResearchView } from "./research-view";
 import { SliceBoard } from "./slice-board";
 import { VolumeLab } from "./volume-lab";
 import { ReportsView } from "./reports-view";
+import { LongitudinalTrends, type FindingHistoryPoint, type DiscrepancyItem } from "./longitudinal-trends";
 import type { SliceMark } from "@/lib/imaging/phantom";
 import type { Workspace } from "@/lib/clinic/types";
 
@@ -516,6 +517,23 @@ function Studio({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s(chosen, "id")]);
 
+  const trendHistory: FindingHistoryPoint[] = useMemo(() => {
+    return history.map((v) => {
+      const ax = triple(v, "axes_mm");
+      const vol = ax
+        ? Math.round((Math.PI / 6) * ax[0] * ax[1] * ax[2])
+        : (num(v, "longest_mm") ? Math.round((Math.PI / 6) * Math.pow(num(v, "longest_mm")!, 3)) : 1000);
+      return {
+        id: s(v, "id"),
+        date: s(v, "observed_on") || "2026-01-01",
+        label: s(v, "location_label") || `v${s(v, "version_no")}`,
+        volumeMm3: vol,
+        longestMm: num(v, "longest_mm"),
+        modality: s(v, "modality") || "MR",
+      };
+    });
+  }, [history]);
+
   function measureOf(v: Bag): Measure {
     return {
       id: s(v, "id"),
@@ -761,6 +779,20 @@ function Studio({
             </div>
             {dicom && <DicomCard read={dicom} onSave={() => run(() => saveDicomMeta({ data: { patientId: s(patient, "id"), fileName, transferSyntax: dicom.transferSyntax, metadata: dicom.metadata, warnings: dicom.warnings } }))} />}
           </article>
+        </div>
+      )}
+      {chosen && trendHistory.length > 0 && (
+        <div className="mt-6">
+          <LongitudinalTrends
+            patientName={s(patient, "name") || "Patient"}
+            history={trendHistory}
+            discrepancies={comparisons.map((c) => ({
+              id: c.id,
+              category: LABELS[c.gap.category] ?? c.gap.category,
+              summary: `${c.code}: ${c.gap.detail}`,
+              detail: c.gap.detail,
+            }))}
+          />
         </div>
       )}
     </div>
