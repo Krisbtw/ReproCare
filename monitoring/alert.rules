@@ -1,0 +1,38 @@
+groups:
+  - name: reprocare-alerts
+    rules:
+      - alert: HighSegmentationLatency
+        expr: histogram_quantile(0.95, rate(segmentation_latency_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High segmentation latency (instance {{ $labels.instance }})"
+          description: "95th percentile latency is {{ $value }}s"
+
+      - alert: DatabaseQueryErrors
+        expr: rate(postgresql_queries_failed_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database query errors (instance {{ $labels.instance }})"
+          description: "Failed queries detected"
+
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate (instance {{ $labels.instance }})"
+          description: "Error rate is {{ $value }}"
+
+      - alert: RateLimitExceeded
+        expr: rate(http_requests_rejected_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rate limit exceeded (instance {{ $labels.instance }})"
+          description: "Rate limit exceeded for {{ $labels.endpoint }}"

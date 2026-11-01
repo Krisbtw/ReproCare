@@ -1,0 +1,57 @@
+{
+  "dashboard": {
+    "title": "ReproCare Healthcare Platform Monitoring",
+    "timezone": "browser",
+    "schemaVersion": 16,
+    "panels": [
+      {
+        "id": 1,
+        "title": "API Request Rate",
+        "type": "graph",
+        "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total[5m])) by (method, route)",
+            "legendFormat": "{{method}} {{route}}"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "AI Segmentation Latency (P95)",
+        "type": "graph",
+        "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(segmentation_latency_seconds_bucket[5m])) by (le))",
+            "legendFormat": "p95 latency"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Database Active Connections & Query Rate",
+        "type": "graph",
+        "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+        "targets": [
+          {
+            "expr": "sum(rate(postgresql_queries_total[5m]))",
+            "legendFormat": "queries/sec"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "System Error Rate (5xx)",
+        "type": "graph",
+        "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m]))",
+            "legendFormat": "errors/sec"
+          }
+        ]
+      }
+    ]
+  }
+}

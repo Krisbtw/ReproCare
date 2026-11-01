@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "80:8080"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://reprocare:password@db:5432/reprocare_db
+      - ANATOMYBRIDGE_SERVICE_URL=http://imaging:8100
+      - ANATOMYBRIDGE_SERVICE_API_KEY=${ANATOMYBRIDGE_SERVICE_API_KEY:-reprocare-prod-secret}
+    depends_on:
+      db:
+        condition: service_healthy
+      imaging:
+        condition: service_started
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+
+  imaging:
+    build:
+      context: ./imaging-service
+      dockerfile: Dockerfile
+    ports:
+      - "8100:8100"
+    environment:
+      - ANATOMYBRIDGE_SERVICE_API_KEY=${ANATOMYBRIDGE_SERVICE_API_KEY:-reprocare-prod-secret}
+      - ANATOMYBRIDGE_CORS_ORIGINS=http://localhost,https://reprocare.app
+    restart: unless-stopped
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=reprocare
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-password}
+      - POSTGRES_DB=reprocare_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reprocare -d reprocare_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alert.rules:/etc/prometheus/alert.rules
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  grafana_data:

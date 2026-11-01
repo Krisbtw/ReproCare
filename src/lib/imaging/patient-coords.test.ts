@@ -99,3 +99,40 @@ test("transformMeshToPatient transforms all vertices and preserves topology", ()
   assert.deepEqual(b.center, [105, 205, 300]);
 });
 
+test("mesh vertices preserve DICOM patient coordinates within 1.0mm tolerance (Phase 4)", () => {
+  const origin: [number, number, number] = [-120.5, -95.0, 42.0];
+  const orientation: [number, number, number, number, number, number] = [1, 0, 0, 0, 1, 0];
+  const spacing: [number, number, number] = [0.9375, 0.9375, 3.0];
+  const frame = createPatientFrame(origin, orientation, spacing);
+
+  const landmarks: [number, number, number][] = [
+    [0, 0, 0], // Uterus landmark reference (image space mm)
+    [25.0, 30.0, 12.0],
+    [-15.0, 40.0, 6.0],
+  ];
+
+  const positions = new Float32Array(landmarks.flatMap((p) => p));
+  const indices = new Uint32Array([0, 1, 2]);
+  const mesh: Mesh = { positions, indices };
+
+  const transformed = transformMeshToPatient(mesh, frame);
+
+  // Check each vertex distance to theoretical patient coordinate is <= 1.0mm
+  for (let i = 0; i < landmarks.length; i++) {
+    const pt = landmarks[i];
+    const expected = imageMmToPatient(pt, frame);
+    const actual: [number, number, number] = [
+      transformed.positions[i * 3],
+      transformed.positions[i * 3 + 1],
+      transformed.positions[i * 3 + 2],
+    ];
+
+    const dist = Math.sqrt(
+      Math.pow(actual[0] - expected[0], 2) +
+      Math.pow(actual[1] - expected[1], 2) +
+      Math.pow(actual[2] - expected[2], 2)
+    );
+    assert.ok(dist < 1.0, `Vertex ${i} deviation ${dist}mm exceeds 1.0mm tolerance`);
+  }
+});
+
