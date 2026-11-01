@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Uplo
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import metrics, models, series
+from . import metrics, models, series, trends
 
 MAX_FILES = 1000
 MAX_BYTES_EACH = 64 * 1024 * 1024
@@ -183,3 +183,48 @@ async def segment(
     out["label_counts"] = {str(int(v)): int(c) for v, c in zip(*np.unique(seg_u8, return_counts=True))}
     out["series_report"] = rep.to_dict()
     return out
+
+
+class TrendPoint(BaseModel):
+    date: str = Field(description="ISO date string")
+    volume_mm3: float = Field(description="Lesion volume in mm3")
+
+
+class TrendCalculationRequest(BaseModel):
+    observations: list[TrendPoint]
+    historical_findings: list[dict] = []
+    current_findings: list[dict] = []
+
+
+@app.post("/trends/calculate")
+def calculate_trends_endpoint(
+    req: TrendCalculationRequest,
+    auth_ok: bool = Depends(verify_service_auth),
+) -> dict:
+    from datetime import datetime
+    dates = []
+    vols = []
+    for obs in req.observations:
+        try:
+            # Handle YYYY-MM-DD or full ISO
+            clean_date = obs.date.replace("Z", "+00:00")
+            if len(clean_date) == 10:
+                d = datetime.strptime(clean_date, "%Y-%m-%d")
+            else:
+                d = datetime.fromisoformat(clean_date)
+            dates.append(d)
+            vols.append(obs.volume_mm3)
+        except Exception:
+            pass
+
+    growth_rate = trends.calculate_growth_rate(dates, vols)
+    direction = trends.calculate_trend(vols)
+    discrepancies = trends.detect_discrepancies(req.current_findings, req.historical_findings)
+
+    return {
+        "growth_rate_mm3_per_month": growth_rate,
+        "trend_direction": direction,
+        "observations_count": len(dates),
+        "discrepancies": discrepancies,
+    }
+

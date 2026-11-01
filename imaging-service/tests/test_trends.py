@@ -44,3 +44,28 @@ def test_discrepancy_detection_new_unmatched():
     assert len(disc) == 1
     assert disc[0]["type"] == "unmatched_new_finding"
 
+
+def test_trends_endpoint():
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    payload = {
+        "observations": [
+            {"date": "2025-01-01", "volume_mm3": 1000.0},
+            {"date": "2025-03-01", "volume_mm3": 2000.0},
+            {"date": "2025-05-01", "volume_mm3": 3000.0},
+        ],
+        "historical_findings": [{"finding_id": "f1", "volume_mm3": 1000.0}],
+        "current_findings": [{"finding_id": "f1", "volume_mm3": 2500.0}],
+    }
+
+    res = client.post("/trends/calculate", json=payload)
+    assert res.status_code == 200
+    data = res.json()
+    assert 480 < data["growth_rate_mm3_per_month"] < 520
+    assert data["trend_direction"] == 1
+    assert data["observations_count"] == 3
+    assert len(data["discrepancies"]) == 1
+    assert data["discrepancies"][0]["type"] == "volume_discrepancy"
+

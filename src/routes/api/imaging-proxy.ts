@@ -178,3 +178,37 @@ export const proxySegment = createServerFn({ method: "POST" })
     return text;
   });
 
+/** Forward trend calculation request to the Python /trends/calculate endpoint. */
+export const proxyCalculateTrends = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: unknown) => {
+    if (!input || typeof input !== "object") throw new Error("Expected an object.");
+    return input as {
+      observations: Array<{ date: string; volume_mm3: number }>;
+      historical_findings?: Array<Record<string, unknown>>;
+      current_findings?: Array<Record<string, unknown>>;
+    };
+  })
+  .handler(async ({ data }) => {
+    let res: Response;
+    try {
+      res = await proxyFetch("/trends/calculate", {
+        method: "POST",
+        headers: {
+          ...serviceHeaders(),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(data),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Imaging service unreachable: ${msg}`);
+    }
+    if (!res.ok) {
+      const detail = await res.text().catch(() => res.statusText);
+      throw new Error(`Imaging service returned ${res.status}: ${detail.slice(0, 300)}`);
+    }
+    const text = await res.text();
+    return text;
+  });
+
