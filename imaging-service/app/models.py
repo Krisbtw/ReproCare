@@ -170,6 +170,13 @@ class UmdMonaiAdapter:
         if reason:
             raise ModelNotConnected(reason)
 
+        MAX_VOXELS = 512 * 512 * 200  # ~52 million voxels limit
+        if volume_zyx.size > MAX_VOXELS:
+            raise ModelNotConnected(
+                f"Input volume has {volume_zyx.size:,} voxels which exceeds the safe limit "
+                f"of {MAX_VOXELS:,}. Downsample or crop before inference."
+            )
+
         import torch
 
         device = torch.device(os.environ.get("ANATOMYBRIDGE_UMD_DEVICE", "cpu"))
@@ -187,12 +194,19 @@ class UmdMonaiAdapter:
         tensor_in = torch.from_numpy(vol).unsqueeze(0).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            if weights_path.suffix in (".ts", ".pt") and "torchscript" in str(weights_path).lower():
-                model = torch.jit.load(str(weights_path), map_location=device)
-                model.eval()
-                logits = model(tensor_in)
-            else:
-                # Load state dict into standard 3D U-Net or TorchScript
+            loaded = False
+            # 1. Try TorchScript format
+            if weights_path.suffix in (".ts", ".pt", ".pth"):
+                try:
+                    model = torch.jit.load(str(weights_path), map_location=device)
+                    model.eval()
+                    logits = model(tensor_in)
+                    loaded = True
+                except Exception:
+                    loaded = False
+
+            # 2. Try PyTorch module or state_dict checkpoint
+            if not loaded:
                 try:
                     checkpoint = torch.load(str(weights_path), map_location=device, weights_only=True)
                 except Exception:
@@ -206,6 +220,12 @@ class UmdMonaiAdapter:
                     from .unet import SimpleUnet3D
                     model = SimpleUnet3D(in_channels=1, num_classes=5).to(device)
                     model.load_state_dict(checkpoint["state_dict"])
+                    model.eval()
+                    logits = model(tensor_in)
+                elif isinstance(checkpoint, dict):
+                    from .unet import SimpleUnet3D
+                    model = SimpleUnet3D(in_channels=1, num_classes=5).to(device)
+                    model.load_state_dict(checkpoint)
                     model.eval()
                     logits = model(tensor_in)
                 else:

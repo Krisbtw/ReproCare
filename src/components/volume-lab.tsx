@@ -33,6 +33,7 @@ import {
 import { transformMeshToPatient, imageMmToPatient } from "@/lib/imaging/patient-coords";
 import { PlaneView } from "./plane-view";
 import { VolumeStage, type VolumeStageHandle } from "./volume-stage";
+import { ModelStatusPanel, type AiSegmentSuccess } from "./model-status-panel";
 
 const MAX_FILES = 1500;
 const MAX_TOTAL_BYTES = 1_000_000_000;
@@ -555,6 +556,44 @@ export function VolumeLab({
     } finally {
       setStatus(null);
     }
+  }
+
+  function handleAiSegmentSuccess(ai: AiSegmentSuccess) {
+    if (!volume) return;
+    const measurement = measureMask(ai.mask);
+    let mesh: Seg["mesh"] = null;
+    if (measurement.voxelCount > 0) {
+      mesh = meshFromMask(ai.mask, { blurIterations: 1, taubinIterations: params.smooth });
+    }
+    const result: SegmentResult = {
+      segmenter: `${ai.model.name} · ${ai.structureName}`,
+      isLearnedModel: true,
+      mask: ai.mask,
+      window: { lower: 0, upper: 1 },
+      voxelCount: measurement.voxelCount,
+      volumeMl: measurement.volumeMl,
+      steps: [
+        `Series slices: ${seriesFiles.length}`,
+        `Model: ${ai.model.name} (${ai.model.id})`,
+        `Target structure: ${ai.structureName}`,
+        `Voxels segmented: ${ai.voxelCount} (${measurement.volumeMl.toFixed(2)} mL)`,
+        ai.note || "Genuine learned model output. Not clinician-verified.",
+      ],
+      warnings: ai.voxelCount === 0 ? ["No voxels were predicted for this structure by the model."] : [],
+      accepted: ai.voxelCount > 0,
+      note: ai.note,
+    };
+    setSeg({
+      result,
+      measurement,
+      mesh,
+      seed: [Math.floor(volume.dims[0] / 2), Math.floor(volume.dims[1] / 2), Math.floor(volume.dims[2] / 2)],
+      seedValue: null,
+      smooth: params.smooth,
+      at: new Date(),
+    });
+    setRecDone(null);
+    setShowSteps(false);
   }
 
   async function changeSmoothing(iterations: number) {
@@ -1260,6 +1299,9 @@ export function VolumeLab({
               <p className="text-xs text-muted">
                 This is seeded region growing inside an intensity window, then cleanup. It has no anatomical knowledge: it cannot tell a fibroid from any other tissue of similar intensity. A person must judge the outline against the images.
               </p>
+              <div className="mt-4 border-t border-line/60 pt-4">
+                <ModelStatusPanel seriesFiles={seriesFiles} disabled={busy} onSegmentSuccess={handleAiSegmentSuccess} />
+              </div>
             </Card>
 
             <Card
@@ -1268,7 +1310,7 @@ export function VolumeLab({
                 seg ? (
                   <div className="flex flex-wrap gap-2">
                     <Tag tone={seg.result.accepted ? "pine" : "clay"}>{seg.result.accepted ? "Accepted by the leakage check" : "Not accepted"}</Tag>
-                    <Tag>{seg.result.segmenter}</Tag>
+                    <Tag tone={seg.result.isLearnedModel ? "pine" : undefined}>{seg.result.isLearnedModel ? "Learned AI Model" : seg.result.segmenter}</Tag>
                   </div>
                 ) : undefined
               }
@@ -1277,6 +1319,11 @@ export function VolumeLab({
                 <p className="rounded-md bg-paper px-3 py-6 text-center text-sm text-ink-soft">Measurements, mesh checks, and the processing history appear here after a segmentation.</p>
               ) : (
                 <div className="space-y-4" data-testid="result-panel">
+                  {seg.result.isLearnedModel && (
+                    <div className="rounded-md bg-paper p-3 text-xs text-ink" data-testid="ai-model-disclaimer">
+                      <strong className="text-ink">AI Model Output:</strong> {seg.result.note || "Genuine learned model output. Not clinician-verified."}
+                    </div>
+                  )}
                   {seg.result.warnings.length > 0 && (
                     <ul className="space-y-1" data-testid="result-warnings">
                       {seg.result.warnings.map((w) => (

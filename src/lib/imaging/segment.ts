@@ -25,7 +25,7 @@ export type SegmentOptions = {
 
 export type SegmentResult = {
   segmenter: string;
-  isLearnedModel: false;
+  isLearnedModel: boolean;
   mask: Mask;
   window: Window;
   voxelCount: number;
@@ -33,6 +33,7 @@ export type SegmentResult = {
   steps: string[];
   warnings: string[];
   accepted: boolean;
+  note?: string;
 };
 
 export function windowFromSeed(volume: Volume, seed: Vec3, radius = 2, kSigma = 2.5): Window & { mean: number; sd: number; n: number } {

@@ -21,8 +21,26 @@ def test_health_reports_no_model_connected(monkeypatch):
 
 def test_models_list_says_not_connected_with_a_reason(monkeypatch):
     monkeypatch.delenv("ANATOMYBRIDGE_NNUNET_RESULTS", raising=False)
-    m = client.get("/models").json()[0]
-    assert m["connected"] is False and m["reason"] and m["is_learned_model"] is True
+    monkeypatch.delenv("ANATOMYBRIDGE_UMD_WEIGHTS", raising=False)
+    models_list = client.get("/models").json()
+    assert len(models_list) >= 2
+    model_ids = [m["id"] for m in models_list]
+    assert "nnunet_umd" in model_ids
+    assert "umd_monai_fibroid" in model_ids
+
+    for m in models_list:
+        assert m["connected"] is False
+        assert m["reason"]
+        assert m["is_learned_model"] is True
+
+
+def test_umd_monai_segment_refuses_with_503(monkeypatch):
+    monkeypatch.delenv("ANATOMYBRIDGE_UMD_WEIGHTS", raising=False)
+    r = client.post("/segment/umd_monai_fibroid", files=files(make_series(n=4)))
+    assert r.status_code == 503
+    body = r.json()["detail"]
+    assert body["error"] == "model_not_connected"
+    assert "ANATOMYBRIDGE_UMD_WEIGHTS" in body["reason"]
 
 
 def test_segment_refuses_with_503_and_returns_no_mask(monkeypatch):

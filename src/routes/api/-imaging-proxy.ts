@@ -66,6 +66,17 @@ async function proxyFetch(
   }
 }
 
+export type ProxyModelStatus = {
+  id: string;
+  name: string;
+  connected: boolean;
+  reason: string;
+  modality: string;
+  intended_structures: string[];
+  licence_note: string;
+  is_learned_model: boolean;
+};
+
 /** List available segmentation models. */
 export const proxyListModels = createServerFn({ method: "GET" })
   .middleware([authMiddleware])
@@ -81,7 +92,7 @@ export const proxyListModels = createServerFn({ method: "GET" })
       const detail = await res.text().catch(() => res.statusText);
       throw new Error(`Imaging service returned ${res.status}: ${detail.slice(0, 300)}`);
     }
-    return (await res.json()) as string;
+    return (await res.json()) as ProxyModelStatus[];
   });
 
 /** Proxy type for inspect — accepts serialized FormData entries. */

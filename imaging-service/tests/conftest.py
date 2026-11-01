@@ -1,9 +1,17 @@
 import io
+import os
+import pytest
 
 import numpy as np
 import pydicom
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, MRImageStorage, generate_uid
+
+
+@pytest.fixture(autouse=True)
+def default_dev_mode(monkeypatch):
+    if "ANATOMYBRIDGE_DEV_NO_AUTH" not in os.environ and "ANATOMYBRIDGE_SERVICE_API_KEY" not in os.environ:
+        monkeypatch.setenv("ANATOMYBRIDGE_DEV_NO_AUTH", "1")
 
 
 def make_series(n=12, rows=32, cols=32, px=(1.0, 1.0), step=3.0, drop=(), dup=(), tilt_idx=None, series_uid=None, other_series_idx=None, ellipsoid=True):

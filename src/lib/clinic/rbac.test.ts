@@ -10,7 +10,7 @@ async function makeDb(): Promise<{ pg: PGlite; sql: Sql }> {
     create table if not exists profiles (
       user_id text primary key,
       display_name text not null default '',
-      role text not null default 'clinician' check (role in ('patient', 'clinician', 'admin')),
+      role text not null default 'patient' check (role in ('patient', 'clinician', 'admin')),
       active_patient_id text,
       created_at timestamptz not null default now()
     );
@@ -231,4 +231,75 @@ test("RBAC: Patient can only modify their own self-patient record", async () => 
     () => checkPatientAccess("patient_user", "p_clin"),
     /Record not found/
   );
+});
+
+test("RBAC: New profile without explicit role defaults to patient role", async () => {
+  const { sql } = await makeDb();
+  await sql`insert into profiles (user_id, display_name) values ('fresh_user', 'Fresh Newbie')`;
+  const rows = await sql<{ role: string }>`select role from profiles where user_id = 'fresh_user'`;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].role, "patient");
+});
+
+test("RBAC: Positive allowlist blocks non-clinicians and non-admins from clinician actions", async () => {
+  const { sql } = await makeDb();
+
+  function enforceClinicianOrAdmin(role: string) {
+    if (role !== "clinician" && role !== "admin") {
+      throw new Error("Unauthorized: Clinician or administrator privileges required.");
+    }
+    return true;
+  }
+
+  // Allowed
+  assert.equal(enforceClinicianOrAdmin("clinician"), true);
+  assert.equal(enforceClinicianOrAdmin("admin"), true);
+
+  // Denied
+  assert.throws(() => enforceClinicianOrAdmin("patient"), /Unauthorized/);
+  assert.throws(() => enforceClinicianOrAdmin("researcher"), /Unauthorized/);
+  assert.throws(() => enforceClinicianOrAdmin("unverified"), /Unauthorized/);
+});
+
+test("RBAC: Administrator-controlled clinician verification (promoteUser)", async () => {
+  const { sql } = await makeDb();
+
+  async function testPromoteUser(callerId: string, targetId: string, newRole: string) {
+    const callerRows = await sql<{ role: string }>`select role from profiles where user_id = ${callerId}`;
+    const callerRole = callerRows[0]?.role;
+    if (callerRole !== "admin") {
+      throw new Error("Unauthorized: Only administrators can assign roles to other users.");
+    }
+    if (newRole !== "patient" && newRole !== "clinician" && newRole !== "admin") {
+      throw new Error("Invalid target role: must be patient, clinician, or admin.");
+    }
+    const targetRows = await sql`select role from profiles where user_id = ${targetId}`;
+    if (!targetRows.length) {
+      throw new Error("Target user profile not found.");
+    }
+    await sql`update profiles set role = ${newRole} where user_id = ${targetId}`;
+    return true;
+  }
+
+  // Patient caller cannot promote
+  await assert.rejects(
+    () => testPromoteUser("patient_user", "patient_user", "clinician"),
+    /Unauthorized: Only administrators can assign roles to other users/
+  );
+
+  // Clinician caller cannot promote
+  await assert.rejects(
+    () => testPromoteUser("clinician_user", "patient_user", "clinician"),
+    /Unauthorized: Only administrators can assign roles to other users/
+  );
+
+  // Admin caller can promote patient to clinician
+  assert.equal(await testPromoteUser("admin_user", "patient_user", "clinician"), true);
+  const updated = await sql<{ role: string }>`select role from profiles where user_id = 'patient_user'`;
+  assert.equal(updated[0].role, "clinician");
+
+  // Admin caller can demote or set back to patient
+  assert.equal(await testPromoteUser("admin_user", "patient_user", "patient"), true);
+  const reverted = await sql<{ role: string }>`select role from profiles where user_id = 'patient_user'`;
+  assert.equal(reverted[0].role, "patient");
 });

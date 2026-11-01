@@ -34,14 +34,17 @@ def calculate_growth_rate(dates: list[datetime], volumes: list[float]) -> float:
     return float(round(slope, 3))
 
 
-def calculate_trend(values: list[float]) -> int:
-    """Determines general trajectory: +1 (growth/increasing), -1 (shrinking), 0 (stable)."""
+def calculate_trend(values: list[float], threshold: float = 0.05) -> int:
+    """Determines general trajectory: +1 (growth/increasing), -1 (shrinking), 0 (stable within threshold)."""
     if len(values) < 2:
         return 0
     first, last = values[0], values[-1]
-    if last > first:
+    if first == 0:
+        return 1 if last > 0 else 0
+    rel_change = (last - first) / abs(first)
+    if rel_change > threshold:
         return 1
-    elif last < first:
+    elif rel_change < -threshold:
         return -1
     return 0
 
@@ -112,7 +115,8 @@ def detect_discrepancies(current_findings: list[dict], historical_findings: list
                 if abs(pct_change) > 0.20:
                     discrepancies.append({
                         "finding_id": f_id,
-                        "type": "fibroid_growth" if pct_change > 0 else "fibroid_regression",
+                        "type": "volume_discrepancy",
+                        "subtype": "fibroid_growth" if pct_change > 0 else "fibroid_regression",
                         "percent_change": round(pct_change * 100, 1),
                         "current_volume_mm3": cur_vol,
                         "previous_volume_mm3": hist_vol,

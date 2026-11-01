@@ -10,6 +10,7 @@ import base64
 import os
 import zlib
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
@@ -128,12 +129,13 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     detail = exc.detail
     if isinstance(detail, dict):
         detail = redact_sensitive_data(detail)
+    error_msg = detail if isinstance(detail, str) else (detail.get("error", "Error") if isinstance(detail, dict) else str(detail))
     return JSONResponse(
         status_code=exc.status_code,
         content={
             "success": False,
-            "error": detail if isinstance(detail, str) else str(detail),
-            "detail": detail if isinstance(detail, str) else str(detail),
+            "error": error_msg,
+            "detail": detail,
             "timestamp": datetime.utcnow().isoformat(),
             "request": request.url.path,
         },
@@ -165,16 +167,24 @@ def verify_service_auth(
     auth_header: str | None = Header(None, alias="Authorization"),
     api_key_header: str | None = Header(None, alias="X-API-Key"),
 ) -> bool:
-    """Verifies service authentication if ANATOMYBRIDGE_SERVICE_API_KEY is configured in the environment.
+    """Verifies service authentication. Fails closed in production if no key is configured.
 
     Supports either:
       Authorization: Bearer <token>
       X-API-Key: <token>
-    When ANATOMYBRIDGE_SERVICE_API_KEY is unset, requests proceed without authentication (for local preview/dev).
+    When ANATOMYBRIDGE_SERVICE_API_KEY is unset, requests are rejected unless explicitly
+    opted into local development mode via ANATOMYBRIDGE_DEV_NO_AUTH=1.
     """
     expected = os.environ.get("ANATOMYBRIDGE_SERVICE_API_KEY")
+    dev_mode = os.environ.get("ANATOMYBRIDGE_DEV_NO_AUTH", "").strip().lower() in ("1", "true", "yes")
+
     if not expected:
-        return True
+        if dev_mode:
+            return True
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication failed: ANATOMYBRIDGE_SERVICE_API_KEY is not configured and dev mode (ANATOMYBRIDGE_DEV_NO_AUTH=1) is not enabled.",
+        )
 
     provided = None
     if auth_header and auth_header.startswith("Bearer "):

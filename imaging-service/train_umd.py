@@ -131,16 +131,38 @@ def train_pipeline(args):
             lbl = sitk.GetArrayFromImage(sitk.ReadImage(str(lbl_path))).astype(np.int64)
             p1, p99 = np.percentile(vol, 1), np.percentile(vol, 99)
             vol = np.clip((vol - p1) / (p99 - p1 + 1e-6), 0.0, 1.0)
-            cases.append((vol, lbl))
+            cases.append((img_path, vol, lbl))
 
         if not cases:
             print("ERROR: No matching image and label pairs found.", file=sys.stderr)
             return 1
 
-        split_idx = int(0.8 * len(cases))
-        train_data = cases[:split_idx]
-        val_data = cases[split_idx:]
-        print(f"[*] Loaded {len(cases)} cases (Train: {len(train_data)}, Val: {len(val_data)})")
+        # Patient-level splitting: prevent patient data leakage between train and val
+        from collections import defaultdict
+        import random
+
+        patient_groups = defaultdict(list)
+        for img_path, vol, lbl in cases:
+            base_name = img_path.name.replace(".nii.gz", "").replace(".nii", "")
+            if "_0000" in base_name:
+                patient_id = base_name.split("_0000")[0]
+            elif "_" in base_name:
+                patient_id = base_name.rsplit("_", 1)[0]
+            else:
+                patient_id = base_name
+            patient_groups[patient_id].append((vol, lbl))
+
+        unique_patients = sorted(patient_groups.keys())
+        rng = random.Random(42)
+        rng.shuffle(unique_patients)
+
+        split_idx = int(0.8 * len(unique_patients))
+        train_patients = set(unique_patients[:split_idx])
+        val_patients = set(unique_patients[split_idx:])
+
+        train_data = [item for pid in train_patients for item in patient_groups[pid]]
+        val_data = [item for pid in val_patients for item in patient_groups[pid]]
+        print(f"[*] Loaded {len(cases)} cases across {len(unique_patients)} unique patients (Train: {len(train_data)} cases / {len(train_patients)} patients, Val: {len(val_data)} cases / {len(val_patients)} patients)")
 
     train_loader = DataLoader(UMDDataset(train_data), batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(UMDDataset(val_data), batch_size=1, shuffle=False)

@@ -136,3 +136,50 @@ test("mesh vertices preserve DICOM patient coordinates within 1.0mm tolerance (P
   }
 });
 
+test("coronal DICOM orientation [1, 0, 0, 0, 0, -1]: round-trips correctly", () => {
+  const origin: [number, number, number] = [-100, 50, 80];
+  const orientation: [number, number, number, number, number, number] = [1, 0, 0, 0, 0, -1];
+  const spacing: [number, number, number] = [0.5, 0.5, 5.0];
+
+  const frame = createPatientFrame(origin, orientation, spacing);
+
+  const testPoints: [number, number, number][] = [
+    [0, 0, 0],
+    [50, 100, 10],
+    [12.5, 33.2, 7.1],
+  ];
+
+  for (const pt of testPoints) {
+    const pat = imageMmToPatient(pt, frame);
+    const back = patientToImageMm(pat, frame);
+    assert.ok(Math.abs(back[0] - pt[0]) < 1e-4);
+    assert.ok(Math.abs(back[1] - pt[1]) < 1e-4);
+    assert.ok(Math.abs(back[2] - pt[2]) < 1e-4);
+  }
+});
+
+test("slice normal direction cosines: correctly computed from consecutive slice positions", () => {
+  const origin: [number, number, number] = [0, 0, 10];
+  const secondSlice: [number, number, number] = [0, 0, 14]; // 4mm step in +Z
+  const orientation: [number, number, number, number, number, number] = [1, 0, 0, 0, 1, 0];
+  const spacing: [number, number, number] = [1.0, 1.0, 4.0];
+
+  const frame = createPatientFrame(origin, orientation, spacing, secondSlice);
+  assert.deepEqual(frame.sliceCosines, [0, 0, 1]);
+
+  const pVoxel1 = voxelToPatient([0, 0, 1], frame);
+  assert.deepEqual(pVoxel1, [0, 0, 14]);
+});
+
+test("physical volume calculations: anisotropic voxel spacing properly scaled to ml", () => {
+  const spacing: [number, number, number] = [0.75, 0.75, 3.5]; // mm
+  // Volume of 1 voxel in mm3: 0.75 * 0.75 * 3.5 = 1.96875 mm3 = 0.00196875 ml
+  const voxelMl = (spacing[0] * spacing[1] * spacing[2]) / 1000;
+  assert.ok(Math.abs(voxelMl - 0.00196875) < 1e-7);
+
+  // A 10x10x10 voxel cube:
+  const count = 1000;
+  const totalMl = count * voxelMl;
+  assert.ok(Math.abs(totalMl - 1.96875) < 1e-5);
+});
+

@@ -173,7 +173,7 @@ export const getWorkspace = createServerFn({ method: "GET" })
       profile: profiles[0] ?? {
         user_id: userId,
         display_name: "",
-        role: "clinician",
+        role: "patient",
         active_patient_id: null,
       },
       patients: patients as Workspace["patients"],
@@ -224,6 +224,33 @@ export const setRole = createServerFn({ method: "POST" })
     await sql`update profiles set role = ${data} where user_id = ${context.userId}`;
     await audit(sql, context.userId, "set_role", "profile", context.userId, `Role set to ${data}.`);
     return { ok: true };
+  });
+
+export const promoteUser = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { targetUserId: string; newRole: string }) => {
+    if (!input || typeof input !== "object") throw new Error("Expected an input object.");
+    if (typeof input.targetUserId !== "string" || !input.targetUserId.trim()) {
+      throw new Error("Target user ID is required.");
+    }
+    if (input.newRole !== "patient" && input.newRole !== "clinician" && input.newRole !== "admin") {
+      throw new Error("Invalid target role: must be patient, clinician, or admin.");
+    }
+    return { targetUserId: input.targetUserId.trim(), newRole: input.newRole };
+  })
+  .handler(async ({ context, data: { targetUserId, newRole } }) => {
+    const sql = await getSql();
+    const callerRole = await roleOf(sql, context.userId);
+    if (callerRole !== "admin") {
+      throw new Error("Unauthorized: Only administrators can assign roles to other users.");
+    }
+    const targetRows = await sql`select role from profiles where user_id = ${targetUserId}`;
+    if (!targetRows.length) {
+      throw new Error("Target user profile not found.");
+    }
+    await sql`update profiles set role = ${newRole} where user_id = ${targetUserId}`;
+    await audit(sql, context.userId, "promote_user", "profile", targetUserId, `Role set to ${newRole} by administrator.`);
+    return { ok: true, targetUserId, newRole };
   });
 
 export const setActivePatient = createServerFn({ method: "POST" })
@@ -339,7 +366,7 @@ export const addReview = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     const role = await roleOf(sql, context.userId);
-    if (role === "patient") throw new Error("Verification is a clinician action.");
+    if (role !== "clinician" && role !== "admin") throw new Error("Verification is a clinician action.");
     if (data.targetType === "finding_version") {
       const v = await sql`select id from finding_versions where id = ${data.targetId} and user_id = ${context.userId}`;
       if (!v.length) throw new Error("Finding version not found or not owned.");
@@ -369,7 +396,7 @@ export const correctVersion = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     const role = await roleOf(sql, context.userId);
-    if (role === "patient") throw new Error("Edits are a clinician action.");
+    if (role !== "clinician" && role !== "admin") throw new Error("Edits are a clinician action.");
     const rows = await sql<Record<string, unknown>>`select * from finding_versions where id = ${data.versionId} and user_id = ${context.userId}`;
     const current = rows[0];
     if (!current) throw new Error("Version not found.");
@@ -441,7 +468,7 @@ export const saveLabMeasurement = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     const role = await roleOf(sql, context.userId);
-    if (role === "patient") throw new Error("Recording a measurement is a clinician action.");
+    if (role !== "clinician" && role !== "admin") throw new Error("Recording a measurement is a clinician action.");
     const id = await insertLabVersion(sql, context.userId, data);
     await audit(sql, context.userId, "new_version", "finding_version", id, "Volume lab measurement recorded as a new version. Prior versions were not overwritten.");
     return { ok: true, id };
@@ -456,7 +483,7 @@ export const decideCorrespondence = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     const role = await roleOf(sql, context.userId);
-    if (role === "patient") throw new Error("Correspondence decisions are a clinician action.");
+    if (role !== "clinician" && role !== "admin") throw new Error("Correspondence decisions are a clinician action.");
     const rows = await sql`select id from correspondences where id = ${data.correspondenceId} and user_id = ${context.userId}`;
     if (!rows.length) throw new Error("Proposal not found.");
     const id = crypto.randomUUID();
@@ -475,7 +502,7 @@ export const resolveDiscrepancy = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     const role = await roleOf(sql, context.userId);
-    if (role === "patient") throw new Error("Discrepancy resolution is a clinician action.");
+    if (role !== "clinician" && role !== "admin") throw new Error("Discrepancy resolution is a clinician action.");
     const rows = await sql`select id from discrepancies where id = ${data.discrepancyId} and user_id = ${context.userId}`;
     if (!rows.length) throw new Error("Discrepancy not found or not owned.");
     await sql`update discrepancies set active = false where id = ${data.discrepancyId} and user_id = ${context.userId}`;
@@ -549,7 +576,8 @@ export const uploadReport = createServerFn({ method: "POST" })
   .validator((input: IngestInput) => input)
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    if ((await roleOf(sql, context.userId)) === "patient") throw new Error("Report upload is a clinician action in this prototype.");
+    const role = await roleOf(sql, context.userId);
+    if (role !== "clinician" && role !== "admin") throw new Error("Report upload is a clinician action in this prototype.");
     // validateIngest, ownership checks, a second de-identification pass and extraction live in reports/store.ts.
     const res = await ingestReport(sql, context.userId, data);
     await audit(
@@ -572,7 +600,8 @@ export const linkReportEvidence = createServerFn({ method: "POST" })
   })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    if ((await roleOf(sql, context.userId)) === "patient") throw new Error("Linking evidence is a clinician action.");
+    const role = await roleOf(sql, context.userId);
+    if (role !== "clinician" && role !== "admin") throw new Error("Linking evidence is a clinician action.");
     const id = await linkReportQuote(sql, context.userId, data);
     await audit(sql, context.userId, "link_evidence", "finding_version", data.findingVersionId, `Report quote [${data.start}, ${data.end}) linked. The version itself was not changed.`);
     return { ok: true, id };
