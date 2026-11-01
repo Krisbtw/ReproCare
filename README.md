@@ -6,7 +6,7 @@ AnatomyBridge does **not** diagnose, prescribe, or claim regulatory clearance. E
 
 ## What runs
 
-- **Signed-in workspace with server-side RBAC**: Better Auth session handling with role verification (`clinician`, `patient`, `admin`). Self-service role escalation is strictly disallowed; protected clinical actions (`saveLabMeasurement`, `correctVersion`, `addReview`, `decideCorrespondence`, `resolveDiscrepancy`, `uploadReport`, `linkReportEvidence`) enforce verified roles. Cross-tenant and patient self-record isolation are strictly enforced.
+- **Signed-in workspace with server-side RBAC**: Better Auth session handling with role verification (`clinician`, `patient`, `admin`). Self-service role escalation is strictly disallowed; protected clinical actions (`saveLabMeasurement`, `correctVersion`, `addReview`, `decideCorrespondence`, `resolveDiscrepancy`, `uploadReport`, `linkReportEvidence`) enforce verified roles via positive allowlists. Administrator-controlled clinician verification endpoint (`promoteUser`) manages role assignments. Fallback profiles default safely to `patient`. Cross-tenant and patient self-record isolation are strictly enforced.
 - **Four synthetic pathways**: Fibroids (Meera), endometriosis (Aisha), PCOS context with 2023 International PCOS Guideline gynecological age evaluation (Kavya), and ovarian cyst follow-up (Divya).
 - **ReproTrace rules engine**: Follow-up comparison with rigid 3D image registration. Demotes un-registered or unsupported shifts to provisional `needs_review` status; classifies discrepancies (size, velocity, category, spatial) and supports clinician resolution.
 - **Volume Lab (in-browser 3D imaging workspace)**:
@@ -37,13 +37,13 @@ AnatomyBridge does **not** diagnose, prescribe, or claim regulatory clearance. E
 - `src/lib/reports/` — Report text extraction, scanned PDF detection, de-identification, and structured regex parsing
 - `src/lib/reprotrace/` — ReproTrace correspondence and discrepancy rules engine
 - `imaging-service/` — FastAPI imaging microservice, PyTorch 3D U-Net architecture (`app/unet.py`), model adapter (`app/models.py`), training pipeline (`train_umd.py`), and test suite (`tests/`)
-- `migrations/` — SQL database migrations (`0001` to `0005`) for auth, clinical finding versions, append-only triggers, menarche tracking, and report storage
+- `migrations/` — SQL database migrations (`0001` to `0007`) for auth, clinical finding versions, append-only triggers, menarche tracking, and report storage
 - `docs/` — Comprehensive engineering, clinical, research, and regulatory documentation
 
 ## Verification and test results
 
 ```bash
-# Run all application test suites (203 passing tests)
+# Run all application test suites (210 passing tests)
 npm run test:app
 
 # Run TypeScript type check (0 errors)
@@ -58,9 +58,9 @@ node scripts/test-interactions.mjs
 
 ### Verified Test Summary (2026-10-31)
 
-- **Application Unit & Integration Tests**: **203 tests pass, 0 fail** across 18 test suites in `npm run test:app`.
+- **Application Unit & Integration Tests**: **210 tests pass, 0 fail** across 18 test suites in `npm run test:app`.
 - **TypeScript strict check**: Clean (`npm run typecheck` passes with 0 errors).
-- **Python Imaging Service Tests**: 25 pytest tests passing on synthetic datasets (`test_auth.py`, `test_cors.py`, `test_score.py`, `test_inspect.py`).
+- **Python Imaging Service Tests**: 109 pytest tests passing across 16 test files (`test_auth.py`, `test_cors.py`, `test_score.py`, `test_inspect.py`).
 - **Browser QA Verification**: Tested in Microsoft Edge via Playwright on both Desktop (1280x800) and Mobile (390x844). Verified 200 OK status, zero console errors, zero uncaught exceptions, and complete interactive walkthroughs (registration, Volume Lab preprocessing, segmentation, mesh export, report ingestion, ReproTrace correspondence). Screenshots saved in `screenshots/`.
 
 ## Documentation
