@@ -56,6 +56,7 @@ type Seg = {
   seedValue: number | null;
   smooth: number;
   at: Date;
+  aiModel?: AiSegmentSuccess["model"];
 };
 type FindingChoice = { id: string; label: string };
 export type RecordFindingInput = {
@@ -574,11 +575,32 @@ export function VolumeLab({
       setError(`AI mask dimensions [${ai.mask.dims.join(", ")}] do not match volume dimensions [${volume.dims.join(", ")}].`);
       return;
     }
+    if (
+      Math.abs(ai.mask.spacingMm[0] - volume.spacingMm[0]) > 0.02 ||
+      Math.abs(ai.mask.spacingMm[1] - volume.spacingMm[1]) > 0.02 ||
+      Math.abs(ai.mask.spacingMm[2] - volume.spacingMm[2]) > 0.02
+    ) {
+      setError(
+        `AI mask voxel spacing [${ai.mask.spacingMm.map((v) => v.toFixed(3)).join(", ")}] mm does not match source volume spacing [${volume.spacingMm.map((v) => v.toFixed(3)).join(", ")}] mm.`,
+      );
+      return;
+    }
     const measurement = measureMask(ai.mask);
     let mesh: Seg["mesh"] = null;
     if (measurement.voxelCount > 0) {
       mesh = meshFromMask(ai.mask, { blurIterations: 1, taubinIterations: params.smooth });
     }
+    const steps: string[] = [
+      `Series slices: ${seriesFiles.length}`,
+      `Model: ${ai.model.name} (${ai.model.id})`,
+      ...(ai.model.architecture ? [`Architecture: ${ai.model.architecture}`] : []),
+      ...(ai.model.modelVersion ? [`Model version: ${ai.model.modelVersion}`] : []),
+      ...(ai.model.checkpointSha256 ? [`Checkpoint SHA-256: ${ai.model.checkpointSha256.slice(0, 16)}…`] : []),
+      `Target structure: ${ai.structureName}`,
+      `Voxels segmented: ${ai.voxelCount} (${measurement.volumeMl.toFixed(2)} mL)`,
+      `Geometry verification: dims [${ai.mask.dims.join("×")}], spacing [${ai.mask.spacingMm.map((v) => v.toFixed(2)).join("×")} mm] aligned with source scan`,
+      ai.note || "Experimental learned model output. Not clinically validated; requires clinician verification.",
+    ];
     const result: SegmentResult = {
       segmenter: `${ai.model.name} · ${ai.structureName}`,
       isLearnedModel: true,
@@ -586,17 +608,12 @@ export function VolumeLab({
       window: { lower: 0, upper: 1 },
       voxelCount: measurement.voxelCount,
       volumeMl: measurement.volumeMl,
-      steps: [
-        `Series slices: ${seriesFiles.length}`,
-        `Model: ${ai.model.name} (${ai.model.id})`,
-        `Target structure: ${ai.structureName}`,
-        `Voxels segmented: ${ai.voxelCount} (${measurement.volumeMl.toFixed(2)} mL)`,
-        ai.note || "Genuine learned model output. Not clinician-verified.",
-      ],
+      steps,
       warnings: ai.voxelCount === 0 ? ["No voxels were predicted for this structure by the model."] : [],
       accepted: ai.voxelCount > 0,
       note: ai.note,
     };
+    setShowMask(true);
     setSeg({
       result,
       measurement,
@@ -605,6 +622,7 @@ export function VolumeLab({
       seedValue: null,
       smooth: params.smooth,
       at: new Date(),
+      aiModel: ai.model,
     });
     setRecDone(null);
     setShowSteps(false);
@@ -693,7 +711,7 @@ export function VolumeLab({
       accepted: seg.result.accepted,
       isLearnedModel: Boolean(seg.result.isLearnedModel),
       clinicianConfirmed: recClinicianConfirmed,
-      modelId: seg.result.isLearnedModel ? "umd_monai_fibroid" : null,
+      modelId: seg.result.isLearnedModel ? (seg.aiModel?.id ?? "umd_monai_fibroid") : null,
       measurement: seg.measurement,
       seed: seg.seed,
       recordHash: fnv1a(JSON.stringify(record)),
@@ -1321,7 +1339,22 @@ export function VolumeLab({
                 This is seeded region growing inside an intensity window, then cleanup. It has no anatomical knowledge: it cannot tell a fibroid from any other tissue of similar intensity. A person must judge the outline against the images.
               </p>
               <div className="mt-4 border-t border-line/60 pt-4">
-                <ModelStatusPanel seriesFiles={seriesFiles} disabled={busy} onSegmentSuccess={handleAiSegmentSuccess} />
+                <ModelStatusPanel
+                  seriesFiles={seriesFiles}
+                  sourceGeometry={{
+                    dims: volume.dims,
+                    spacingMm: volume.spacingMm,
+                    originLpsMm: patientFrame?.origin ?? null,
+                    directionCosines: patientFrame
+                      ? [...patientFrame.rowCosines, ...patientFrame.colCosines, ...patientFrame.sliceCosines]
+                      : null,
+                    frameOfReferenceUid: patientFrame?.frameOfReferenceUid ?? null,
+                  }}
+                  disabled={busy}
+                  showOverlay={showMask}
+                  onToggleOverlay={setShowMask}
+                  onSegmentSuccess={handleAiSegmentSuccess}
+                />
               </div>
             </Card>
 

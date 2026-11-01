@@ -90,10 +90,19 @@ export type ProxyModelStatus = {
   name: string;
   connected: boolean;
   reason: string;
-  modality: string;
-  intended_structures: string[];
-  licence_note: string;
+  modality?: string;
+  intended_structures?: string[];
+  licence_note?: string;
   is_learned_model: boolean;
+  label_map?: Record<string, string> | null;
+  architecture?: string;
+  model_version?: string | null;
+  dataset_version?: string | null;
+  checkpoint_sha256?: string | null;
+  training_mode?: string | null;
+  is_clinical_grade?: boolean;
+  trained_at?: string | null;
+  validation_metrics?: Record<string, unknown> | null;
 };
 
 /** List available segmentation models. Requires verified clinician or administrator credentials. */

@@ -1,24 +1,20 @@
-# AnatomyBridge imaging service (Python)
+# AnatomyBridge / ReproCare Imaging Service (Python)
 
-Separate process from the web app. The web app does **not call it yet**; it keeps working without it. Run it on its own, or score masks with the command line.
+Stateless FastAPI microservice for 3D DICOM series geometry verification, physical-spacing segmentation metrics, and `SimpleUnet3D` / `nnU-Net v2` uterine MRI segmentation.
 
-What is real and tested (25 pytest tests, synthetic data only):
-- `POST /series/inspect`: DICOM series geometry (order by slice normal, gaps, duplicates, mixed orientation, matrix, spacing, series). Patient tags are never returned.
-- `POST /metrics/score`, `python -m app.score pred ref`: Dice, Jaccard, HD95, Hausdorff, mean surface distance, volume difference, components, with physical spacing. Returns `null` when a number is unsupported.
-- `GET /models`, `GET /health`: say honestly whether a model is connected.
+## Capabilities
 
-What is not real here:
-- `POST /segment/nnunet_umd` runs `nnUNetv2_predict` on weights **you** supply. **No weights are bundled, none were trained, and the prediction path has never run.** Without weights it answers 503 and returns no mask. The label map (which number is a fibroid) is never assumed; you must give it in `ANATOMYBRIDGE_NNUNET_LABELS`.
+- `POST /series/inspect`: Orders DICOM slices along the right-handed slice normal (`ImageOrientationPatient` cross product), detects slice gaps, duplicate positions, mixed orientations, mixed matrix dimensions, and mixed series UIDs, strips all 18 identifying DICOM PHI tags in memory, and returns full 3D coordinate geometry (`origin_lps_mm`, `direction_cosines`, `frame_of_reference_uid`, `pixel_spacing_mm`, `slice_spacing_mm`).
+- `POST /segment/{model_id}`: Runs validated 3D MRI segmentation (`umd_monai_fibroid` / `umd_unet3d_fibroid` using `SimpleUnet3D`, or `nnunet_umd` using external `nnUNetv2_predict`).
+  - **Model Honesty:** If trained weights are not configured (`ANATOMYBRIDGE_UMD_WEIGHTS`) or fail SHA-256 / architecture compatibility checks, `/models` reports `connected: false` and `/segment/{model_id}` returns `503 Service Unavailable` with no fabricated mask.
+  - **Architectural Transparency:** `SimpleUnet3D` is a custom 3D U-Net (`imaging-service/app/unet.py`), **not** a MONAI model.
+  - **Geometry Preservation:** Validates input 3D volume dimensions, finite intensities, dynamic range, and orthonormal direction cosines, and verifies that the output segmentation mask preserves exact `shape_zyx`, `spacing_zyx_mm`, `origin_lps_mm`, `direction_cosines`, and `frame_of_reference_uid`.
+- `POST /metrics/score` & `python3 -m app.score`: Computes Dice, Jaccard/IoU, precision, sensitivity, Hausdorff, HD95, mean surface distance, physical volume in mL, and false-positive/false-negative component counts. Returns `null` when a metric is undefined (e.g., when a class is absent in both masks) rather than inflating Dice with `1.0`.
+- `train_umd.py`: Reproducible training and evaluation pipeline with data-governance gates (`app/privacy.py`), dataset validation (`app/dataset_validation.py`), subject-level 3-way `train`/`val`/`test` splitting (`app/dataset_split.py`), combined weighted Cross-Entropy + soft Dice loss, and SHA-256 checkpoint provenance.
 
-```bash
-cd imaging-service
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-python -m pytest -q
-uvicorn app.main:app --port 8100     # http://localhost:8100/docs
-python -m app.score pred.nii.gz ref.nii.gz --label 3
-```
+## Governance & Documentation
 
-`openapi.json` in this folder is generated from the app (`python -c "import json;from app.main import app;print(json.dumps(app.openapi(),indent=2))"`).
-
-Limits: uncompressed DICOM only (no compressed transfer-syntax plugins installed); uploads are read in memory and not stored; no authentication on this service, so run it on a trusted network only.
+- [`../docs/DATASET_PROVENANCE.md`](../docs/DATASET_PROVENANCE.md) — UMD dataset provenance, CC BY 4.0 licence verification, and limitations.
+- [`../docs/DATA_GOVERNANCE_AND_PRIVACY.md`](../docs/DATA_GOVERNANCE_AND_PRIVACY.md) — DICOM PHI scrubbing and 4-category training data protection gates.
+- [`../docs/INDIAN_REGULATORY_AND_ETHICAL_READINESS.md`](../docs/INDIAN_REGULATORY_AND_ETHICAL_READINESS.md) — ICMR (2017, 2023), DPDP Act (2023), and CDSCO MDR (2017) readiness matrix.
+- [`../docs/MODEL_TRAINING_AND_EVALUATION.md`](../docs/MODEL_TRAINING_AND_EVALUATION.md) — Architecture, subject-level splitting, class-imbalance loss, and absent-class evaluation policy.

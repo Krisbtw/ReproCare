@@ -11,9 +11,11 @@ import argparse
 import json
 
 import numpy as np
-import SimpleITK as sitk
 
 from . import metrics
+from .nifti_io import register_sitk_fallback
+
+sitk = register_sitk_fallback()
 
 
 def main() -> None:

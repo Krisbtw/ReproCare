@@ -1,30 +1,96 @@
-"""DICOM series inspection and volume stacking.
+"""DICOM series inspection and 3D volume assembly with full spatial geometry preservation.
 
-Reports problems and never repairs them. Patient name, ID, birth date and other
-identifying tags are never read into the report.
+Reads raw DICOM bytes in memory, drops patient-identifying tags on arrival,
+orders slices by projection onto the slice normal (`ImageOrientationPatient`
+cross product dotted with `ImagePositionPatient`), and flags any geometry
+problem that makes a 3D volume unsafe to stack:
+
+  - unreadable files
+  - missing position / orientation / pixel spacing tags
+  - multiple SeriesInstanceUIDs mixed in one upload
+  - slices with inconsistent orientation (gantry tilt / mixed planes)
+  - slices with inconsistent matrix size or pixel spacing
+  - duplicate slice positions
+  - gaps or uneven step size along the slice normal
+
+Preserves full 3D coordinate-frame geometry (`origin_lps_mm`, `direction_cosines`,
+`spacing_zyx_mm`, `shape_zyx`, and non-identifying `frame_of_reference_uid`) so
+downstream AI segmentation and export can verify exact physical alignment.
 """
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Iterable
 
 import numpy as np
-import pydicom
-from pydicom.errors import InvalidDicomError
 
-# Only these tags leave this module. Everything else, including patient tags, is dropped.
-SAFE_TAGS = ("Modality", "SeriesDescription", "SliceThickness", "Rows", "Columns", "BitsAllocated")
+from .dicom_io import register_pydicom_fallback
 
-ORIENT_TOL = 1e-3
-GAP_RATIO = 1.5
-DUP_RATIO = 0.1
+pydicom = register_pydicom_fallback()
+
+
+# Tags that may identify a person. Never copied out of a FileDataset, and
+# deleted before a dataset stays in memory for pixel stacking.
+_PHI_KEYWORDS = (
+    "PatientName",
+    "PatientID",
+    "PatientBirthDate",
+    "PatientSex",
+    "PatientAge",
+    "PatientAddress",
+    "PatientTelephoneNumbers",
+    "OtherPatientIDs",
+    "OtherPatientNames",
+    "IssuerOfPatientID",
+    "InstitutionName",
+    "InstitutionAddress",
+    "ReferringPhysicianName",
+    "PerformingPhysicianName",
+    "PhysiciansOfRecord",
+    "OperatorsName",
+    "AccessionNumber",
+    "StudyID",
+)
+
+
+@dataclass
+class SliceInfo:
+    index: int
+    position_along_normal_mm: float
+    rows: int
+    columns: int
+    pixel_spacing_mm: tuple[float, float]
+    orientation: tuple[float, ...]
+    origin_lps_mm: tuple[float, float, float]
+    series_uid_hash: str
+    frame_of_reference_uid: str | None
 
 
 @dataclass
 class Problem:
     code: str
-    message: str
+    detail: str
+
+
+@dataclass
+class VolumeGeometry:
+    """Complete physical 3D coordinate geometry for a stacked DICOM volume."""
+
+    shape_zyx: tuple[int, int, int]
+    spacing_zyx_mm: tuple[float, float, float]
+    origin_lps_mm: tuple[float, float, float]
+    direction_cosines: tuple[float, float, float, float, float, float, float, float, float]
+    frame_of_reference_uid: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "shape_zyx": list(self.shape_zyx),
+            "spacing_zyx_mm": [round(float(v), 6) for v in self.spacing_zyx_mm],
+            "origin_lps_mm": [round(float(v), 6) for v in self.origin_lps_mm],
+            "direction_cosines": [round(float(v), 6) for v in self.direction_cosines],
+            "frame_of_reference_uid": self.frame_of_reference_uid,
+        }
 
 
 @dataclass
@@ -32,131 +98,226 @@ class SeriesReport:
     n_files: int
     n_readable: int
     n_unreadable: int
-    series_uids: int
     slice_count: int
     rows: int | None
     columns: int | None
-    pixel_spacing_mm: tuple[float, float] | None  # (row spacing, column spacing)
+    pixel_spacing_mm: tuple[float, float] | None
     slice_spacing_mm: float | None
+    modality: str | None
+    series_description: str | None
+    volume_ready: bool
     problems: list[Problem] = field(default_factory=list)
-    safe_metadata: dict = field(default_factory=dict)
-    volume_ready: bool = False
+    origin_lps_mm: tuple[float, float, float] | None = None
+    direction_cosines: tuple[float, ...] | None = None
+    frame_of_reference_uid: str | None = None
 
     def to_dict(self) -> dict:
-        return {
-            "n_files": self.n_files,
-            "n_readable": self.n_readable,
-            "n_unreadable": self.n_unreadable,
-            "series_uids": self.series_uids,
-            "slice_count": self.slice_count,
-            "rows": self.rows,
-            "columns": self.columns,
-            "pixel_spacing_mm": self.pixel_spacing_mm,
-            "slice_spacing_mm": self.slice_spacing_mm,
-            "problems": [p.__dict__ for p in self.problems],
-            "safe_metadata": self.safe_metadata,
-            "volume_ready": self.volume_ready,
-        }
+        return asdict(self)
 
 
-def _read(blobs: Iterable[bytes]):
-    ok, bad = [], 0
-    for b in blobs:
-        try:
-            ds = pydicom.dcmread(io.BytesIO(b), force=False)
-            if not hasattr(ds, "ImageOrientationPatient") or not hasattr(ds, "ImagePositionPatient"):
-                bad += 1
-                continue
-            ok.append(ds)
-        except (InvalidDicomError, Exception):  # noqa: BLE001 - any parse failure counts as unreadable
-            bad += 1
-    return ok, bad
+def _strip_phi(ds: pydicom.Dataset) -> None:
+    for kw in _PHI_KEYWORDS:
+        if kw in ds:
+            del ds[kw]
 
 
-def _normal(ds) -> np.ndarray:
-    iop = np.array(ds.ImageOrientationPatient, dtype=float)
-    return np.cross(iop[:3], iop[3:])
+def _normal(iop: Iterable[float]) -> np.ndarray:
+    vals = [float(x) for x in iop]
+    row = np.asarray(vals[:3], dtype=np.float64)
+    col = np.asarray(vals[3:6], dtype=np.float64)
+    n = np.cross(row, col)
+    norm = np.linalg.norm(n)
+    return n / norm if norm > 0 else n
 
 
-def inspect(blobs: list[bytes]) -> tuple[SeriesReport, list]:
-    """Return (report, datasets sorted along the slice normal)."""
-    datasets, bad = _read(blobs)
-    rep = SeriesReport(
-        n_files=len(blobs), n_readable=len(datasets), n_unreadable=bad, series_uids=0,
-        slice_count=len(datasets), rows=None, columns=None, pixel_spacing_mm=None, slice_spacing_mm=None,
+def _direction_tuple(iop: Iterable[float]) -> tuple[float, float, float, float, float, float, float, float, float]:
+    vals = [float(x) for x in iop]
+    row = np.asarray(vals[:3], dtype=np.float64)
+    col = np.asarray(vals[3:6], dtype=np.float64)
+    r_norm = np.linalg.norm(row)
+    c_norm = np.linalg.norm(col)
+    if r_norm > 0:
+        row = row / r_norm
+    if c_norm > 0:
+        col = col / c_norm
+    n = np.cross(row, col)
+    n_norm = np.linalg.norm(n)
+    if n_norm > 0:
+        n = n / n_norm
+    return (
+        float(row[0]), float(row[1]), float(row[2]),
+        float(col[0]), float(col[1]), float(col[2]),
+        float(n[0]), float(n[1]), float(n[2]),
     )
-    if bad:
-        rep.problems.append(Problem("unreadable_files", f"{bad} file(s) were not readable DICOM images with position and orientation."))
-    if not datasets:
-        rep.problems.append(Problem("no_images", "No readable DICOM images."))
-        return rep, []
 
-    uids = {str(getattr(d, "SeriesInstanceUID", "")) for d in datasets}
-    rep.series_uids = len(uids)
-    if len(uids) > 1:
-        rep.problems.append(Problem("mixed_series", f"{len(uids)} different series in one upload. Split them first."))
 
-    first = datasets[0]
-    rep.rows, rep.columns = int(first.Rows), int(first.Columns)
-    ps = getattr(first, "PixelSpacing", None)
-    if ps is not None:
-        rep.pixel_spacing_mm = (float(ps[0]), float(ps[1]))
+def inspect(raw_files: list[bytes], stop_before_pixels: bool = True) -> tuple[SeriesReport, list[tuple[float, pydicom.Dataset]]]:
+    readable: list[pydicom.Dataset] = []
+    unreadable = 0
+    for b in raw_files:
+        try:
+            ds = pydicom.dcmread(io.BytesIO(b), stop_before_pixels=stop_before_pixels, force=False)
+            if "SOPClassUID" not in ds and "Modality" not in ds and "Rows" not in ds:
+                unreadable += 1
+                continue
+            _strip_phi(ds)
+            readable.append(ds)
+        except Exception:
+            unreadable += 1
+
+    problems: list[Problem] = []
+    if unreadable:
+        problems.append(Problem("unreadable_files", f"{unreadable} file(s) were not valid DICOM"))
+
+    if not readable:
+        return (
+            SeriesReport(
+                n_files=len(raw_files),
+                n_readable=0,
+                n_unreadable=unreadable,
+                slice_count=0,
+                rows=None,
+                columns=None,
+                pixel_spacing_mm=None,
+                slice_spacing_mm=None,
+                modality=None,
+                series_description=None,
+                volume_ready=False,
+                problems=problems or [Problem("empty", "no readable DICOM slices")],
+            ),
+            [],
+        )
+
+    series_uids = {str(ds.get("SeriesInstanceUID", "")) for ds in readable}
+    if len(series_uids) > 1:
+        problems.append(Problem("mixed_series", f"{len(series_uids)} different SeriesInstanceUIDs in upload"))
+
+    positioned: list[tuple[float, np.ndarray, pydicom.Dataset]] = []
+    missing_geom = 0
+    for ds in readable:
+        ipp = ds.get("ImagePositionPatient")
+        iop = ds.get("ImageOrientationPatient")
+        ps = ds.get("PixelSpacing")
+        if ipp is None or iop is None or ps is None or "Rows" not in ds or "Columns" not in ds:
+            missing_geom += 1
+            continue
+        n = _normal(iop)
+        z = float(np.dot(np.asarray([float(x) for x in ipp], dtype=np.float64), n))
+        positioned.append((z, np.asarray([float(x) for x in iop], dtype=np.float64), ds))
+
+    if missing_geom:
+        problems.append(Problem("missing_geometry", f"{missing_geom} slice(s) lack position, orientation, or pixel spacing"))
+
+    if not positioned:
+        return (
+            SeriesReport(
+                n_files=len(raw_files),
+                n_readable=len(readable),
+                n_unreadable=unreadable,
+                slice_count=0,
+                rows=None,
+                columns=None,
+                pixel_spacing_mm=None,
+                slice_spacing_mm=None,
+                modality=str(readable[0].get("Modality", "")) or None,
+                series_description=str(readable[0].get("SeriesDescription", "")) or None,
+                volume_ready=False,
+                problems=problems,
+            ),
+            [],
+        )
+
+    positioned.sort(key=lambda t: t[0])
+    ref_iop = positioned[0][1]
+    for _, iop, _ in positioned[1:]:
+        if not np.allclose(iop, ref_iop, atol=1e-2):
+            problems.append(Problem("mixed_orientation", "slices do not share a single ImageOrientationPatient"))
+            break
+
+    shapes = {(int(ds.Rows), int(ds.Columns)) for _, _, ds in positioned}
+    if len(shapes) > 1:
+        problems.append(Problem("mixed_dimensions", f"inconsistent slice matrix sizes: {sorted(shapes)}"))
+
+    spacings = {(round(float(ds.PixelSpacing[0]), 4), round(float(ds.PixelSpacing[1]), 4)) for _, _, ds in positioned}
+    if len(spacings) > 1:
+        problems.append(Problem("mixed_pixel_spacing", f"inconsistent PixelSpacing across slices: {sorted(spacings)}"))
+
+    zs = np.asarray([z for z, _, _ in positioned], dtype=np.float64)
+    slice_spacing: float | None = None
+    if len(zs) < 2:
+        problems.append(Problem("too_few_slices", "need at least 2 positioned slices to form a volume"))
     else:
-        rep.problems.append(Problem("no_pixel_spacing", "PixelSpacing missing. Physical measurements are not possible."))
-    rep.safe_metadata = {t: _plain(getattr(first, t, None)) for t in SAFE_TAGS if hasattr(first, t)}
+        dz = np.diff(zs)
+        if np.any(np.abs(dz) < 1e-3):
+            problems.append(Problem("duplicate_positions", "two or more slices share the same spatial position"))
+        pos_dz = dz[dz >= 1e-3]
+        if len(pos_dz):
+            median_step = float(np.median(pos_dz))
+            slice_spacing = round(median_step, 4)
+            if np.any(np.abs(pos_dz - median_step) > max(0.05 * median_step, 0.1)):
+                problems.append(
+                    Problem(
+                        "slice_gap",
+                        f"uneven slice spacing (median {median_step:.2f} mm, range {pos_dz.min():.2f}–{pos_dz.max():.2f} mm)",
+                    )
+                )
 
-    if any((int(d.Rows), int(d.Columns)) != (rep.rows, rep.columns) for d in datasets):
-        rep.problems.append(Problem("mixed_matrix", "Slices have different matrix sizes."))
-    ref_iop = np.array(first.ImageOrientationPatient, dtype=float)
-    if any(np.abs(np.array(d.ImageOrientationPatient, dtype=float) - ref_iop).max() > ORIENT_TOL for d in datasets):
-        rep.problems.append(Problem("mixed_orientation", "Slice orientation changes within the series."))
-    if ps is not None and any(
-        not np.allclose([float(x) for x in getattr(d, "PixelSpacing", [np.nan, np.nan])], [float(ps[0]), float(ps[1])], atol=1e-4)
-        for d in datasets
-    ):
-        rep.problems.append(Problem("mixed_pixel_spacing", "Pixel spacing differs between slices."))
+    ds0 = positioned[0][2]
+    rows, cols = int(ds0.Rows), int(ds0.Columns)
+    ps0 = (float(ds0.PixelSpacing[0]), float(ds0.PixelSpacing[1]))
+    ipp0 = ds0.get("ImagePositionPatient")
+    origin0 = (float(ipp0[0]), float(ipp0[1]), float(ipp0[2])) if ipp0 is not None else (0.0, 0.0, 0.0)
+    dir_cosines = _direction_tuple(ref_iop)
+    for_uid = str(ds0.get("FrameOfReferenceUID", "")).strip() or None
 
-    n = _normal(first)
-    ordered = sorted(datasets, key=lambda d: float(np.dot(np.array(d.ImagePositionPatient, dtype=float), n)))
-    pos = np.array([float(np.dot(np.array(d.ImagePositionPatient, dtype=float), n)) for d in ordered])
-    if len(pos) > 1:
-        diffs = np.diff(pos)
-        med = float(np.median(np.abs(diffs)))
-        rep.slice_spacing_mm = med if med > 0 else None
-        dups = int(np.sum(np.abs(diffs) < max(med * DUP_RATIO, 1e-6)))
-        if dups:
-            rep.problems.append(Problem("duplicate_positions", f"{dups} slice(s) share a position with a neighbour."))
-        if med > 0:
-            gaps = int(np.sum(diffs > med * GAP_RATIO))
-            if gaps:
-                rep.problems.append(Problem("slice_gap", f"{gaps} gap(s) larger than {GAP_RATIO}x the median spacing. Slices are missing."))
-    else:
-        rep.problems.append(Problem("single_slice", "One slice only. Not a volume."))
-
-    rep.volume_ready = len(rep.problems) == 0
-    return rep, ordered
-
-
-def stack_volume(blobs: list[bytes]) -> tuple[np.ndarray, tuple[float, float, float], SeriesReport]:
-    """Stack a clean series to (z, y, x) float32 in rescaled units. Refuses anything not volume-ready."""
-    rep, ordered = inspect(blobs)
-    if not rep.volume_ready:
-        raise ValueError("Series is not volume-ready: " + "; ".join(p.code for p in rep.problems))
-    slices = []
-    for d in ordered:
-        arr = d.pixel_array.astype(np.float32)
-        slope = float(getattr(d, "RescaleSlope", 1.0))
-        intercept = float(getattr(d, "RescaleIntercept", 0.0))
-        slices.append(arr * slope + intercept)
-    vol = np.stack(slices, axis=0)
-    ps = rep.pixel_spacing_mm
-    assert ps is not None and rep.slice_spacing_mm is not None
-    return vol, (rep.slice_spacing_mm, ps[0], ps[1]), rep  # spacing in (z, y, x) order
+    report = SeriesReport(
+        n_files=len(raw_files),
+        n_readable=len(readable),
+        n_unreadable=unreadable,
+        slice_count=len(positioned),
+        rows=rows,
+        columns=cols,
+        pixel_spacing_mm=ps0,
+        slice_spacing_mm=slice_spacing,
+        modality=str(ds0.get("Modality", "")) or None,
+        series_description=str(ds0.get("SeriesDescription", "")) or None,
+        volume_ready=(len(problems) == 0),
+        problems=problems,
+        origin_lps_mm=origin0,
+        direction_cosines=dir_cosines,
+        frame_of_reference_uid=for_uid,
+    )
+    return report, [(z, ds) for z, _, ds in positioned]
 
 
-def _plain(v):
-    if isinstance(v, bool):
-        return str(v)
-    if isinstance(v, (int, float)):
-        return float(v) if isinstance(v, float) else int(v)
-    return str(v)
+def stack_volume(raw_files: list[bytes]) -> tuple[np.ndarray, tuple[float, float, float], SeriesReport]:
+    report, ordered = inspect(raw_files, stop_before_pixels=False)
+    if not report.volume_ready or report.slice_spacing_mm is None or report.pixel_spacing_mm is None:
+        codes = ", ".join(p.code for p in report.problems) or "not volume_ready"
+        raise ValueError(f"Refusing to stack unsafe series ({codes})")
+
+    planes = []
+    for _, ds in ordered:
+        arr = ds.pixel_array.astype(np.float32)
+        slope = float(getattr(ds, "RescaleSlope", 1.0) or 1.0)
+        intercept = float(getattr(ds, "RescaleIntercept", 0.0) or 0.0)
+        planes.append(arr * slope + intercept)
+
+    vol = np.stack(planes, axis=0)  # (Z, Y, X)
+    spacing_zyx = (report.slice_spacing_mm, report.pixel_spacing_mm[0], report.pixel_spacing_mm[1])
+    return vol, spacing_zyx, report
+
+
+def stack_volume_with_geometry(raw_files: list[bytes]) -> tuple[np.ndarray, VolumeGeometry, SeriesReport]:
+    """Stack DICOM series into a 3D volume and return full physical coordinate geometry."""
+    vol, spacing_zyx, report = stack_volume(raw_files)
+    origin_lps = report.origin_lps_mm or (0.0, 0.0, 0.0)
+    direction = report.direction_cosines or (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    geometry = VolumeGeometry(
+        shape_zyx=(int(vol.shape[0]), int(vol.shape[1]), int(vol.shape[2])),
+        spacing_zyx_mm=(float(spacing_zyx[0]), float(spacing_zyx[1]), float(spacing_zyx[2])),
+        origin_lps_mm=(float(origin_lps[0]), float(origin_lps[1]), float(origin_lps[2])),
+        direction_cosines=tuple(float(v) for v in direction),  # type: ignore[arg-type]
+        frame_of_reference_uid=report.frame_of_reference_uid,
+    )
+    return vol, geometry, report

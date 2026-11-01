@@ -1,16 +1,15 @@
 /**
  * Client for the optional Python imaging service (imaging-service/, FastAPI).
  *
- * Scope: a SECOND, independent geometry check of the same DICOM series. The browser
- * check (series.ts, via dicom-parser) and the service check (pydicom + numpy) were
- * written separately. Where they disagree, both answers are shown. Nothing here picks
- * a winner, repairs a series, or changes what the Volume lab does.
- *
- * The web app keeps working when the service is absent: every function returns a
- * typed failure instead of throwing, and the UI hides the send button unless an
- * operator configured VITE_IMAGING_SERVICE_URL.
+ * Scope:
+ *   1. Independent geometry cross-check of a DICOM series (`/series/inspect`).
+ *   2. Runtime validation and medical-image geometry alignment verification of AI
+ *      segmentation responses (`/segment/{model_id}`) so Volume Lab never accepts or
+ *      displays a mask whose dimensions, voxel spacing, origin, orientation, or
+ *      coordinate frame disagree with the source MRI scan.
  */
 import type { SeriesReport } from "./series.ts";
+import type { Mask, Vec3 } from "./volume.ts";
 
 export const SERVICE_MAX_FILES = 1000; // imaging-service/app/main.py MAX_FILES
 export const SERVICE_MAX_BYTES_EACH = 64 * 1024 * 1024; // MAX_BYTES_EACH
@@ -31,6 +30,9 @@ export type ServiceSeriesReport = {
   problems: ServiceProblem[];
   safe_metadata: Record<string, unknown>;
   volume_ready: boolean;
+  origin_lps_mm?: [number, number, number] | null;
+  direction_cosines?: number[] | null;
+  frame_of_reference_uid?: string | null;
 };
 
 export type ServiceHealth = { status: string; service: string; any_model_connected: boolean };
@@ -52,15 +54,7 @@ export function serviceUrl(raw: string | null | undefined): string | null {
   }
 }
 
-/** Configured bearer token or API key for authenticating with the imaging service.
- *
- * @deprecated Direct browser-to-service calls with a token are superseded by the server-side
- * proxy at /api/imaging-proxy/*. This function is kept so that existing callers that pass an
- * explicit `token` argument (e.g. tests or the /health check from an operator admin page) still
- * work, but it NO LONGER reads VITE_IMAGING_SERVICE_TOKEN from the environment — that variable
- * should be removed from deployments. The proxy reads ANATOMYBRIDGE_SERVICE_API_KEY from
- * server-side process.env, which is never inlined into the browser bundle.
- */
+/** Configured bearer token or API key for authenticating with the imaging service. */
 export function serviceToken(raw?: string | null | undefined): string | null {
   const t = typeof raw === "string" ? raw.trim() : "";
   return t.length > 0 ? t : null;
@@ -80,10 +74,19 @@ export function parseServiceReport(json: unknown): ServiceSeriesReport | null {
   for (const p of j.problems) {
     if (!p || typeof p !== "object") return null;
     const code = (p as Record<string, unknown>).code;
-    const message = (p as Record<string, unknown>).message;
+    const message = (p as Record<string, unknown>).message ?? (p as Record<string, unknown>).detail;
     if (typeof code !== "string") return null;
     problems.push({ code, message: typeof message === "string" ? message : "" });
   }
+  const orig = j.origin_lps_mm;
+  const originLps =
+    Array.isArray(orig) && orig.length === 3 && isNum(orig[0]) && isNum(orig[1]) && isNum(orig[2])
+      ? ([orig[0], orig[1], orig[2]] as [number, number, number])
+      : null;
+  const dir = j.direction_cosines;
+  const dirCosines =
+    Array.isArray(dir) && (dir.length === 6 || dir.length === 9) && dir.every(isNum) ? (dir as number[]) : null;
+
   return {
     n_files: numOrNull(j.n_files) ?? 0,
     n_readable: numOrNull(j.n_readable) ?? 0,
@@ -97,7 +100,303 @@ export function parseServiceReport(json: unknown): ServiceSeriesReport | null {
     problems,
     safe_metadata: j.safe_metadata && typeof j.safe_metadata === "object" ? (j.safe_metadata as Record<string, unknown>) : {},
     volume_ready: j.volume_ready,
+    origin_lps_mm: originLps,
+    direction_cosines: dirCosines,
+    frame_of_reference_uid: typeof j.frame_of_reference_uid === "string" ? j.frame_of_reference_uid : null,
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* AI Segmentation Response & Geometry Alignment Validation            */
+/* ------------------------------------------------------------------ */
+
+export type ParsedSegmentationResponse = {
+  modelId: string;
+  modelName: string;
+  isLearnedModel: boolean;
+  architecture: string;
+  modelVersion: string | null;
+  datasetVersion: string | null;
+  checkpointSha256: string | null;
+  trainingMode: string | null;
+  isClinicalGrade: boolean;
+  shapeZyx: [number, number, number];
+  spacingZyxMm: [number, number, number];
+  originLpsMm: [number, number, number] | null;
+  directionCosines: number[] | null;
+  frameOfReferenceUid: string | null;
+  labels: Record<string, string>;
+  maskB64Zlib: string;
+  note: string;
+};
+
+export type SourceScanGeometry = {
+  dims: Vec3; // [nx, ny, nz]
+  spacingMm: Vec3; // [dx, dy, dz]
+  originLpsMm?: Vec3 | null;
+  directionCosines?: number[] | null; // 6 or 9 elements (rowCosines, colCosines[, normal])
+  frameOfReferenceUid?: string | null;
+};
+
+export type GeometryAlignmentCheck = {
+  aligned: boolean;
+  problems: string[];
+};
+
+/**
+ * Parse and validate the JSON payload returned by `/segment/{model_id}` (both new and legacy field shapes).
+ */
+export function parseSegmentationResponse(raw: unknown): ParsedSegmentationResponse | null {
+  if (!raw || typeof raw !== "object") return null;
+  const j = raw as Record<string, unknown>;
+
+  const shape = j.shape_zyx;
+  if (
+    !Array.isArray(shape) ||
+    shape.length !== 3 ||
+    !isNum(shape[0]) ||
+    !isNum(shape[1]) ||
+    !isNum(shape[2]) ||
+    shape[0] <= 0 ||
+    shape[1] <= 0 ||
+    shape[2] <= 0
+  ) {
+    return null;
+  }
+
+  const sp = j.spacing_zyx_mm;
+  if (
+    !Array.isArray(sp) ||
+    sp.length !== 3 ||
+    !isNum(sp[0]) ||
+    !isNum(sp[1]) ||
+    !isNum(sp[2]) ||
+    sp[0] <= 0 ||
+    sp[1] <= 0 ||
+    sp[2] <= 0
+  ) {
+    return null;
+  }
+
+  const maskStr =
+    typeof j.mask_b64_zlib === "string" && j.mask_b64_zlib.length > 0
+      ? j.mask_b64_zlib
+      : typeof j.mask === "string" && j.mask.length > 0
+        ? j.mask
+        : null;
+  if (!maskStr) return null;
+
+  const rawLabels = (j.labels ?? j.label_map) as Record<string, unknown> | undefined;
+  const labels: Record<string, string> = {};
+  if (rawLabels && typeof rawLabels === "object") {
+    for (const [k, v] of Object.entries(rawLabels)) {
+      if (typeof v === "string") labels[String(k)] = v;
+    }
+  }
+  if (Object.keys(labels).length === 0) return null;
+
+  const modelObj = (j.model && typeof j.model === "object" ? j.model : {}) as Record<string, unknown>;
+  const provObj = (j.provenance && typeof j.provenance === "object" ? j.provenance : {}) as Record<string, unknown>;
+
+  const modelId =
+    typeof modelObj.id === "string"
+      ? modelObj.id
+      : typeof j.model_id === "string"
+        ? j.model_id
+        : "umd_monai_fibroid";
+  const modelName =
+    typeof modelObj.name === "string"
+      ? modelObj.name
+      : typeof provObj.model_name === "string"
+        ? provObj.model_name
+        : modelId;
+  const architecture =
+    typeof modelObj.architecture === "string"
+      ? modelObj.architecture
+      : typeof provObj.architecture === "string"
+        ? provObj.architecture
+        : "SimpleUnet3D (custom 3D U-Net)";
+  const modelVersion =
+    typeof modelObj.model_version === "string"
+      ? modelObj.model_version
+      : typeof provObj.model_version === "string"
+        ? provObj.model_version
+        : null;
+  const datasetVersion =
+    typeof modelObj.dataset_version === "string"
+      ? modelObj.dataset_version
+      : typeof provObj.dataset_version === "string"
+        ? provObj.dataset_version
+        : null;
+  const checkpointSha256 =
+    typeof modelObj.checkpoint_sha256 === "string"
+      ? modelObj.checkpoint_sha256
+      : typeof provObj.checkpoint_sha256 === "string"
+        ? provObj.checkpoint_sha256
+        : null;
+  const trainingMode =
+    typeof modelObj.training_mode === "string"
+      ? modelObj.training_mode
+      : typeof provObj.training_mode === "string"
+        ? provObj.training_mode
+        : null;
+  const isClinicalGrade = Boolean(modelObj.is_clinical_grade ?? provObj.is_clinical_grade ?? false);
+
+  const orig = j.origin_lps_mm;
+  const originLpsMm: [number, number, number] | null =
+    Array.isArray(orig) && orig.length === 3 && isNum(orig[0]) && isNum(orig[1]) && isNum(orig[2])
+      ? [orig[0], orig[1], orig[2]]
+      : null;
+
+  const dir = j.direction_cosines;
+  const directionCosines: number[] | null =
+    Array.isArray(dir) && (dir.length === 6 || dir.length === 9) && dir.every(isNum) ? (dir as number[]) : null;
+
+  const frameOfReferenceUid =
+    typeof j.frame_of_reference_uid === "string" && j.frame_of_reference_uid.trim()
+      ? j.frame_of_reference_uid.trim()
+      : null;
+
+  const note =
+    typeof j.note === "string" && j.note.trim()
+      ? j.note.trim()
+      : `Experimental learned model output (${architecture}). Not clinically validated; requires clinician verification.`;
+
+  return {
+    modelId,
+    modelName,
+    isLearnedModel: Boolean(modelObj.is_learned_model ?? true),
+    architecture,
+    modelVersion,
+    datasetVersion,
+    checkpointSha256,
+    trainingMode,
+    isClinicalGrade,
+    shapeZyx: [Math.round(shape[0]), Math.round(shape[1]), Math.round(shape[2])],
+    spacingZyxMm: [sp[0], sp[1], sp[2]],
+    originLpsMm,
+    directionCosines,
+    frameOfReferenceUid,
+    labels,
+    maskB64Zlib: maskStr,
+    note,
+  };
+}
+
+/**
+ * Validate that a returned AI segmentation mask aligns with the source MRI scan's
+ * dimensions, voxel spacing, origin, orientation cosines, and coordinate frame.
+ */
+export function validateSegmentationGeometryAlignment(
+  source: SourceScanGeometry,
+  seg: ParsedSegmentationResponse,
+): GeometryAlignmentCheck {
+  const problems: string[] = [];
+  const [nz, ny, nx] = seg.shapeZyx;
+  const [dz, dy, dx] = seg.spacingZyxMm;
+
+  if (source.dims[0] !== nx || source.dims[1] !== ny || source.dims[2] !== nz) {
+    problems.push(
+      `Dimension mismatch: source scan is [${source.dims.join(", ")}] (X, Y, Z), but segmentation mask is [${nx}, ${ny}, ${nz}].`,
+    );
+  }
+
+  const spTol = 0.02;
+  if (
+    Math.abs(source.spacingMm[0] - dx) > spTol ||
+    Math.abs(source.spacingMm[1] - dy) > spTol ||
+    Math.abs(source.spacingMm[2] - dz) > spTol
+  ) {
+    problems.push(
+      `Voxel spacing mismatch: source scan is [${source.spacingMm.map((v) => v.toFixed(3)).join(", ")}] mm, ` +
+        `but segmentation mask is [${dx.toFixed(3)}, ${dy.toFixed(3)}, ${dz.toFixed(3)}] mm.`,
+    );
+  }
+
+  if (source.originLpsMm && seg.originLpsMm) {
+    const origTol = 0.25; // mm
+    const maxDiff = Math.max(
+      Math.abs(source.originLpsMm[0] - seg.originLpsMm[0]),
+      Math.abs(source.originLpsMm[1] - seg.originLpsMm[1]),
+      Math.abs(source.originLpsMm[2] - seg.originLpsMm[2]),
+    );
+    if (maxDiff > origTol) {
+      problems.push(
+        `Origin mismatch: source scan origin [${source.originLpsMm.map((v) => v.toFixed(2)).join(", ")}] mm ` +
+          `differs from segmentation origin [${seg.originLpsMm.map((v) => v.toFixed(2)).join(", ")}] mm.`,
+      );
+    }
+  }
+
+  if (source.directionCosines && seg.directionCosines) {
+    const nCmp = Math.min(6, source.directionCosines.length, seg.directionCosines.length);
+    for (let i = 0; i < nCmp; i++) {
+      if (Math.abs(source.directionCosines[i] - seg.directionCosines[i]) > 0.02) {
+        problems.push("Orientation mismatch: direction cosines of segmentation mask disagree with source MRI scan.");
+        break;
+      }
+    }
+  }
+
+  if (
+    source.frameOfReferenceUid &&
+    seg.frameOfReferenceUid &&
+    source.frameOfReferenceUid !== seg.frameOfReferenceUid
+  ) {
+    problems.push(
+      `Coordinate frame mismatch: FrameOfReferenceUID '${seg.frameOfReferenceUid}' != '${source.frameOfReferenceUid}'.`,
+    );
+  }
+
+  return { aligned: problems.length === 0, problems };
+}
+
+/**
+ * Extract a binary `Mask` for a specific class (`targetClass === 0` selects all foreground `> 0`,
+ * otherwise selects `label === targetClass`) from a decompressed multi-class label volume.
+ */
+export function extractClassMaskFromVolume(
+  decompressedLabels: Uint8Array,
+  shapeZyx: [number, number, number],
+  spacingZyxMm: [number, number, number],
+  targetClass: number,
+  allowedLabels?: Record<string, string>,
+): { mask: Mask; voxelCount: number; classVoxelCounts: Record<string, number> } {
+  const [nz, ny, nx] = shapeZyx;
+  const expectedLength = nx * ny * nz;
+  if (decompressedLabels.length !== expectedLength) {
+    throw new Error(
+      `Decompressed segmentation buffer length (${decompressedLabels.length}) does not match volume dimensions ${nx}×${ny}×${nz} (${expectedLength}).`,
+    );
+  }
+
+  const allowedSet = allowedLabels
+    ? new Set(Object.keys(allowedLabels).map((k) => Number(k)))
+    : null;
+
+  const maskData = new Uint8Array(expectedLength);
+  let targetCount = 0;
+  const classVoxelCounts: Record<string, number> = {};
+
+  for (let i = 0; i < expectedLength; i++) {
+    const val = decompressedLabels[i];
+    if (allowedSet && !allowedSet.has(val)) {
+      throw new Error(`Predicted segmentation contains unknown label value ${val}.`);
+    }
+    const key = String(val);
+    classVoxelCounts[key] = (classVoxelCounts[key] ?? 0) + 1;
+    const match = targetClass === 0 ? (val > 0 ? 1 : 0) : val === targetClass ? 1 : 0;
+    maskData[i] = match;
+    if (match) targetCount++;
+  }
+
+  const mask: Mask = {
+    dims: [nx, ny, nz],
+    spacingMm: [spacingZyxMm[2], spacingZyxMm[1], spacingZyxMm[0]],
+    data: maskData,
+  };
+
+  return { mask, voxelCount: targetCount, classVoxelCounts };
 }
 
 /* ------------------------------------------------------------------ */
