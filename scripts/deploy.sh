@@ -28,3 +28,4 @@ if [ -f "scripts/verify_deployment.sh" ]; then
 fi
 
 echo "=== Deployment Finished ==="
+

@@ -47,3 +47,4 @@ fi
 
 rm -rf "$RESTORE_TEMP"
 echo "=== Restore completed successfully ==="
+

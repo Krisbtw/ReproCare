@@ -36,3 +36,4 @@ groups:
         annotations:
           summary: "Rate limit exceeded (instance {{ $labels.instance }})"
           description: "Rate limit exceeded for {{ $labels.endpoint }}"
+

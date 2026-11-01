@@ -105,3 +105,4 @@ spec:
       port: 8100
       targetPort: 8100
   type: ClusterIP
+

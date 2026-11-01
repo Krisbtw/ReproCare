@@ -36,3 +36,4 @@ rm -rf "$BACKUP_DIR"
 find backups/ -name "reprocare_backup_*.tar.gz" -type f -mtime +7 -delete 2>/dev/null || true
 
 echo "✔ Backup completed: backups/reprocare_backup_$TIMESTAMP.tar.gz"
+
