@@ -1,4 +1,6 @@
 import type { Sql } from "../db.ts";
+import { storeImagingArtifact } from "../imaging/storage.server.ts";
+import { computeVoxelBoundaryUncertainty } from "../reprotrace/params.ts";
 
 export type LabVersionInput = {
   findingId: string;
@@ -16,6 +18,7 @@ export type LabVersionInput = {
   segmentationSource?: string | null;
   modelId?: string | null;
   segmentationRunId?: string | null;
+  weightsSha256?: string | null;
   volumeMm3?: number | null;
   uncertaintyMm3?: number | null;
   newStudy?: {
@@ -25,6 +28,7 @@ export type LabVersionInput = {
     description?: string;
     accession?: string;
     sourceNote?: string;
+    studyInstanceUid?: string | null;
   };
   newSeries?: {
     seriesNumber?: number;
@@ -33,10 +37,49 @@ export type LabVersionInput = {
     sliceCount?: number;
     pixelSpacingMm?: string;
     sliceThicknessMm?: number;
+    seriesInstanceUid?: string | null;
+    frameOfReferenceUid?: string | null;
+    geometryJson?: string | null;
+    volumeSha256?: string | null;
   };
+  clinicianConfirmed?: boolean;
+  seedPoint?: [number, number, number] | null;
+  /** Optional persistent imaging artifacts to store and link to the finding version */
+  sourceDicomFiles?: Array<{
+    name?: string;
+    fileName?: string;
+    data?: Uint8Array | Buffer | string;
+    dataBase64?: string;
+    instanceNumber?: number;
+    sopInstanceUid?: string;
+    metadata?: Record<string, unknown>;
+  }>;
+  maskArtifact?: {
+    filename?: string;
+    fileName?: string;
+    mimeType?: string;
+    data?: Uint8Array | Buffer | string;
+    dataBase64?: string;
+    metadata?: Record<string, unknown>;
+  } | null;
+  meshArtifact?: {
+    filename?: string;
+    fileName?: string;
+    mimeType?: string;
+    data?: Uint8Array | Buffer | string;
+    dataBase64?: string;
+    metadata?: Record<string, unknown>;
+  } | null;
 };
 
 const num = (v: unknown) => Number(v ?? 0);
+
+function toBuffer(raw: Uint8Array | Buffer | string): Buffer {
+  if (typeof raw === "string") {
+    return Buffer.from(raw, "base64");
+  }
+  return Buffer.from(raw);
+}
 
 async function enforceVerifiedClinicianIfProfileExists(sql: Sql, userId: string): Promise<void> {
   if (!userId || typeof userId !== "string" || !userId.trim()) {
@@ -69,7 +112,7 @@ async function enforceVerifiedClinicianIfProfileExists(sql: Sql, userId: string)
   }
 }
 
-/** Appends version N+1 for a finding from a Volume lab measurement. Never updates or deletes an earlier row. */
+/** Appends version N+1 for a finding from a Volume lab measurement and persists linked source imaging/masks. */
 export async function insertLabVersion(sql: Sql, userId: string, data: LabVersionInput): Promise<string> {
   if (!userId || typeof userId !== "string" || !userId.trim()) {
     throw new Error("Unauthorized: Authentication is required.");
@@ -81,6 +124,11 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
 
   await enforceVerifiedClinicianIfProfileExists(sql, userId);
 
+  const findingRows = await sql<{ patient_id: string }>`
+    select patient_id from findings where id = ${data.findingId} and user_id = ${userId} limit 1
+  `;
+  const patientId = findingRows[0]?.patient_id ?? data.newStudy?.patientId ?? "";
+
   let targetStudyId = current.study_id as string;
   let targetSeriesId = data.seriesId ?? null;
   let targetObservedOn = current.observed_on as string;
@@ -90,8 +138,10 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
     if (!patientCheck.length) throw new Error("Patient not found for new study.");
     targetStudyId = crypto.randomUUID();
     targetObservedOn = data.newStudy.studyDate ?? new Date().toISOString().slice(0, 10);
-    await sql`insert into studies (id, user_id, patient_id, modality, study_date, description, accession, synthetic, source_note)
-      values (
+    try {
+      await sql`insert into studies (
+        id, user_id, patient_id, modality, study_date, description, accession, synthetic, source_note, study_instance_uid
+      ) values (
         ${targetStudyId},
         ${userId},
         ${data.newStudy.patientId},
@@ -100,12 +150,30 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
         ${data.newStudy.description ?? "Uploaded DICOM study"},
         ${data.newStudy.accession ?? "ACC-" + Date.now().toString().slice(-6)},
         false,
-        ${data.newStudy.sourceNote ?? "Uploaded in Volume Lab"}
+        ${data.newStudy.sourceNote ?? "Uploaded in Volume Lab"},
+        ${data.newStudy.studyInstanceUid ?? null}
       )`;
+    } catch {
+      await sql`insert into studies (id, user_id, patient_id, modality, study_date, description, accession, synthetic, source_note)
+        values (
+          ${targetStudyId},
+          ${userId},
+          ${data.newStudy.patientId},
+          ${data.newStudy.modality ?? "MR"},
+          ${targetObservedOn},
+          ${data.newStudy.description ?? "Uploaded DICOM study"},
+          ${data.newStudy.accession ?? "ACC-" + Date.now().toString().slice(-6)},
+          false,
+          ${data.newStudy.sourceNote ?? "Uploaded in Volume Lab"}
+        )`;
+    }
     if (data.newSeries) {
       targetSeriesId = crypto.randomUUID();
-      await sql`insert into series (id, user_id, study_id, series_number, description, plane, slice_count, pixel_spacing_mm, slice_thickness_mm)
-        values (
+      try {
+        await sql`insert into series (
+          id, user_id, study_id, series_number, description, plane, slice_count, pixel_spacing_mm, slice_thickness_mm,
+          series_instance_uid, frame_of_reference_uid, geometry_json, volume_sha256
+        ) values (
           ${targetSeriesId},
           ${userId},
           ${targetStudyId},
@@ -114,8 +182,26 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
           ${data.newSeries.plane ?? null},
           ${data.newSeries.sliceCount ?? null},
           ${data.newSeries.pixelSpacingMm ?? null},
-          ${data.newSeries.sliceThicknessMm ?? null}
+          ${data.newSeries.sliceThicknessMm ?? null},
+          ${data.newSeries.seriesInstanceUid ?? null},
+          ${data.newSeries.frameOfReferenceUid ?? null},
+          ${data.newSeries.geometryJson ?? null},
+          ${data.newSeries.volumeSha256 ?? null}
         )`;
+      } catch {
+        await sql`insert into series (id, user_id, study_id, series_number, description, plane, slice_count, pixel_spacing_mm, slice_thickness_mm)
+          values (
+            ${targetSeriesId},
+            ${userId},
+            ${targetStudyId},
+            ${data.newSeries.seriesNumber ?? 1},
+            ${data.newSeries.description ?? "DICOM Series"},
+            ${data.newSeries.plane ?? null},
+            ${data.newSeries.sliceCount ?? null},
+            ${data.newSeries.pixelSpacingMm ?? null},
+            ${data.newSeries.sliceThicknessMm ?? null}
+          )`;
+      }
     }
   } else if (data.studyId) {
     const studyCheck = await sql<{ id: string; study_date: string }>`select id, study_date from studies where id = ${data.studyId} and user_id = ${userId}`;
@@ -133,24 +219,154 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
     }
   }
 
-  const id = crypto.randomUUID();
+  const versionId = crypto.randomUUID();
   const centroidJson = data.centroidMm ? JSON.stringify(data.centroidMm) : null;
   const frameVal = data.frame ?? (data.centroidMm ? "dicom_lps" : "unavailable");
+
+  // Compute physical volume and boundary uncertainty if not explicitly provided
+  const computedVolMm3 =
+    data.volumeMm3 != null && Number.isFinite(data.volumeMm3)
+      ? Number(data.volumeMm3)
+      : Math.round((4 / 3) * Math.PI * (data.axes[0] / 2) * (data.axes[1] / 2) * (data.axes[2] / 2));
+
+  let spacingTriple: [number, number, number] = [1.0, 1.0, 3.0];
+  if (data.newSeries?.pixelSpacingMm) {
+    const parts = data.newSeries.pixelSpacingMm.split("\\").map(Number);
+    const sz = data.newSeries.sliceThicknessMm ?? 3.0;
+    if (parts.length === 2 && parts.every((v) => Number.isFinite(v) && v > 0) && Number.isFinite(sz) && sz > 0) {
+      spacingTriple = [parts[1], parts[0], sz];
+    }
+  }
+  const computedUncertaintyMm3 =
+    data.uncertaintyMm3 != null && Number.isFinite(data.uncertaintyMm3)
+      ? Number(data.uncertaintyMm3)
+      : Math.round(computeVoxelBoundaryUncertainty(computedVolMm3, spacingTriple));
+
+  let primaryDicomObjectId: string | null = null;
+  let storedMaskObjectId: string | null = null;
+  let segmentationRunId: string | null = data.segmentationRunId ?? null;
+
+  // 1. Persist source DICOM files if supplied
+  if (patientId && data.sourceDicomFiles && data.sourceDicomFiles.length > 0) {
+    for (let i = 0; i < data.sourceDicomFiles.length; i++) {
+      const f = data.sourceDicomFiles[i];
+      const payload = f.data ?? f.dataBase64;
+      if (!payload) continue;
+      const stored = await storeImagingArtifact(sql, {
+        userId,
+        patientId,
+        studyId: targetStudyId,
+        seriesId: targetSeriesId,
+        kind: "dicom",
+        filename: f.name || f.fileName || `slice-${String(i).padStart(4, "0")}.dcm`,
+        instanceNumber: f.instanceNumber ?? i + 1,
+        sopInstanceUid: f.sopInstanceUid ?? null,
+        data: toBuffer(payload),
+        metadata: f.metadata,
+      });
+      if (!primaryDicomObjectId) {
+        primaryDicomObjectId = stored.id;
+      }
+    }
+  }
+
+  // 2. Persist segmentation mask artifact if supplied
+  const maskPayload = data.maskArtifact?.data ?? data.maskArtifact?.dataBase64;
+  if (patientId && data.maskArtifact && maskPayload) {
+    const maskStored = await storeImagingArtifact(sql, {
+      userId,
+      patientId,
+      studyId: targetStudyId,
+      seriesId: targetSeriesId,
+      sourceObjectId: primaryDicomObjectId,
+      kind: "mask",
+      filename: data.maskArtifact.filename || data.maskArtifact.fileName || "segmentation-mask.bin",
+      mimeType: data.maskArtifact.mimeType,
+      data: toBuffer(maskPayload),
+      metadata: data.maskArtifact.metadata ?? {
+        axesMm: data.axes,
+        volumeMm3: computedVolMm3,
+        segmentationSource: data.segmentationSource ?? "classical_region_growing",
+        modelId: data.modelId ?? null,
+      },
+    });
+    storedMaskObjectId = maskStored.id;
+
+    if (!segmentationRunId) {
+      segmentationRunId = crypto.randomUUID();
+      await sql`
+        insert into segmentation_runs (
+          id, user_id, series_id, model_id, weights_sha256, params_json,
+          mask_object_id, label_counts, volume_mm3, status
+        ) values (
+          ${segmentationRunId},
+          ${userId},
+          ${targetSeriesId},
+          ${data.modelId ?? data.segmentationSource ?? "classical_region_growing"},
+          ${data.weightsSha256 ?? null},
+          ${JSON.stringify({ sliceIndex: data.sliceIndex, provenanceHash: data.provenanceHash ?? null, seedPoint: data.seedPoint ?? null, clinicianConfirmed: data.clinicianConfirmed ?? false })},
+          ${storedMaskObjectId},
+          ${JSON.stringify(data.maskArtifact.metadata?.labelCounts ?? {})},
+          ${computedVolMm3},
+          'completed'
+        )
+      `.catch(() => null);
+    }
+  }
+
+  // 3. Persist 3D surface mesh artifact if supplied
+  const meshPayload = data.meshArtifact?.data ?? data.meshArtifact?.dataBase64;
+  if (patientId && data.meshArtifact && meshPayload) {
+    await storeImagingArtifact(sql, {
+      userId,
+      patientId,
+      studyId: targetStudyId,
+      seriesId: targetSeriesId,
+      sourceObjectId: storedMaskObjectId ?? primaryDicomObjectId,
+      kind: "mesh",
+      filename: data.meshArtifact.filename || data.meshArtifact.fileName || "surface-mesh.stl",
+      mimeType: data.meshArtifact.mimeType,
+      data: toBuffer(meshPayload),
+      metadata: data.meshArtifact.metadata ?? {},
+    });
+  }
 
   await sql`insert into finding_versions (
     id, user_id, finding_id, version_no, previous_version_id, study_id, observed_on, location_label, figo,
     centroid_mm, axes_mm, longest_mm, measurement_basis, frame, segmentation_source, model_id, quality, modality,
     report_longest_mm, change_reason, series_id, volume_mm3, volume_method, segmentation_run_id, uncertainty_mm3
   ) values (
-    ${id}, ${userId}, ${data.findingId}, ${num(current.version_no) + 1}, ${current.id as string},
+    ${versionId}, ${userId}, ${data.findingId}, ${num(current.version_no) + 1}, ${current.id as string},
     ${targetStudyId}, ${targetObservedOn}, ${current.location_label as string}, ${current.figo as string | null},
     ${centroidJson}, ${JSON.stringify(data.axes)}, ${data.longest}, ${"principal-axis extents of a seeded mask (not a caliper plane)"},
     ${frameVal}, ${data.segmentationSource ?? "classical_region_growing"}, ${data.modelId ?? null}, ${"adequate"}, ${current.modality as string},
-    ${null}, ${"Volume lab: " + data.reason}, ${targetSeriesId}, ${data.volumeMm3 ?? null},
-    ${data.segmentationSource ? "voxel_counting" : "ellipsoid_formula"}, ${data.segmentationRunId ?? null}, ${data.uncertaintyMm3 ?? null}
+    ${null}, ${"Volume lab: " + data.reason}, ${targetSeriesId}, ${computedVolMm3},
+    ${data.segmentationSource ? "voxel_counting" : "ellipsoid_formula"}, ${segmentationRunId}, ${computedUncertaintyMm3}
   )`;
 
-  await sql`insert into evidence_links (id, user_id, finding_version_id, kind, study_id, series_id, report_id, quote, slice_index, note)
-    values (${crypto.randomUUID()}, ${userId}, ${id}, ${"lab_segmentation"}, ${targetStudyId}, ${targetSeriesId}, ${null}, ${null}, ${data.sliceIndex}, ${data.evidenceNote})`;
-  return id;
+  // Link finding_version_id back onto the newly stored objects if migration 0011 is active
+  if (primaryDicomObjectId || storedMaskObjectId) {
+    await sql`
+      update imaging_objects
+      set finding_version_id = ${versionId}
+      where user_id = ${userId}
+        and id in (${primaryDicomObjectId ?? ""}, ${storedMaskObjectId ?? ""})
+    `.catch(() => null);
+  }
+
+  try {
+    await sql`insert into evidence_links (
+      id, user_id, finding_version_id, kind, study_id, series_id, report_id, quote, slice_index, note,
+      imaging_object_id, mask_object_id
+    ) values (
+      ${crypto.randomUUID()}, ${userId}, ${versionId}, ${"lab_segmentation"},
+      ${targetStudyId}, ${targetSeriesId}, ${null}, ${null}, ${data.sliceIndex}, ${data.evidenceNote},
+      ${primaryDicomObjectId}, ${storedMaskObjectId}
+    )`;
+  } catch {
+    await sql`insert into evidence_links (id, user_id, finding_version_id, kind, study_id, series_id, report_id, quote, slice_index, note)
+      values (${crypto.randomUUID()}, ${userId}, ${versionId}, ${"lab_segmentation"}, ${targetStudyId}, ${targetSeriesId}, ${null}, ${null}, ${data.sliceIndex}, ${data.evidenceNote})`;
+  }
+
+  return versionId;
 }

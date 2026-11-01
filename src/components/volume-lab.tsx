@@ -75,6 +75,19 @@ export type RecordFindingInput = {
   segmentationRunId?: string | null;
   volumeMm3?: number | null;
   uncertaintyMm3?: number | null;
+  sourceDicomFiles?: Array<{
+    fileName?: string;
+    sopInstanceUid?: string;
+    instanceNumber?: number;
+    dataBase64: string;
+    metadata?: Record<string, unknown>;
+  }>;
+  maskArtifact?: {
+    fileName?: string;
+    dataBase64: string;
+    mimeType?: string;
+    metadata?: Record<string, unknown>;
+  };
   newStudy?: {
     patientId: string;
     modality?: string;
@@ -768,6 +781,25 @@ export function VolumeLab({
         segmentationSource: f.segmentationSource,
         segmentationRunId: f.segmentationRunId,
         volumeMm3: Math.round(f.volumeMl * 1000),
+        uncertaintyMm3: seg.measurement.uncertaintyMm3 ?? undefined,
+        maskArtifact: {
+          fileName: `${opened.series.seriesUid || "series"}_mask.rle.json`,
+          mimeType: "application/json",
+          dataBase64: btoa(
+            JSON.stringify({
+              dims: seg.result.mask.dims,
+              spacingMm: seg.result.mask.spacingMm,
+              voxelCount: seg.measurement.voxelCount,
+              volumeMm3: seg.measurement.volumeMm3,
+            }),
+          ),
+          metadata: {
+            dims: seg.result.mask.dims,
+            spacingMm: seg.result.mask.spacingMm,
+            voxelCount: seg.measurement.voxelCount,
+            method: f.segmentationSource,
+          },
+        },
         newStudy: newStudyPayload,
         newSeries: newSeriesPayload,
       });

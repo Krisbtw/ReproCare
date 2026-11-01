@@ -1,5 +1,5 @@
 /**
- * DICOM Patient-Coordinate System (LPS) transformations.
+ * DICOM Patient-Coordinate System (LPS) transformations and geometry validation.
  *
  * Implements DICOM Standard PS 3.3 C.7.6.2.1.1 (Image Position and Image Orientation Patient).
  * The patient coordinate system is right-handed and anatomical:
@@ -7,7 +7,8 @@
  *   +Y = Patient Posterior (P)
  *   +Z = Patient Superior / Head (S)
  *
- * Converts image-index space and mesh vertices into genuine anatomical coordinates in millimetres.
+ * Converts image-index space and mesh vertices into genuine anatomical coordinates in millimetres,
+ * and validates spacing and orientation before longitudinal comparison.
  */
 import type { Mesh } from "./isosurface.ts";
 import type { Vec3 } from "./volume.ts";
@@ -25,6 +26,12 @@ export type PatientFrame = {
   spacingMm: Vec3;
   /** DICOM Frame of Reference UID if available. */
   frameOfReferenceUid?: string | null;
+};
+
+export type PatientFrameValidation = {
+  valid: boolean;
+  reasons: string[];
+  normalizedFrame: PatientFrame | null;
 };
 
 function dot(a: Vec3, b: Vec3): number {
@@ -49,6 +56,100 @@ function normalize(v: Vec3): Vec3 {
   return [v[0] / n, v[1] / n, v[2] / n];
 }
 
+function isFiniteTriple(v: unknown): v is Vec3 {
+  return Array.isArray(v) && v.length === 3 && v.every((x) => typeof x === "number" && Number.isFinite(x));
+}
+
+/**
+ * Validates voxel spacing and patient orientation geometry before computing patient-space
+ * coordinates or comparing findings across studies.
+ */
+export function validatePatientFrame(
+  frame: Partial<PatientFrame> | null | undefined,
+): PatientFrameValidation {
+  if (!frame || typeof frame !== "object") {
+    return {
+      valid: false,
+      reasons: ["Patient coordinate frame is missing (no DICOM position or orientation metadata)."],
+      normalizedFrame: null,
+    };
+  }
+
+  const reasons: string[] = [];
+  if (!isFiniteTriple(frame.spacingMm) || frame.spacingMm.some((s) => s <= 0 || s > 500)) {
+    reasons.push(
+      `Invalid or missing voxel spacing ${JSON.stringify(frame.spacingMm)}; physical millimetres cannot be established.`,
+    );
+  }
+  if (!isFiniteTriple(frame.origin)) {
+    reasons.push("Missing or non-finite ImagePositionPatient (origin).");
+  }
+  if (!isFiniteTriple(frame.rowCosines) || !isFiniteTriple(frame.colCosines)) {
+    reasons.push("Missing or non-finite ImageOrientationPatient direction cosines.");
+  }
+
+  if (reasons.length > 0) {
+    return { valid: false, reasons, normalizedFrame: null };
+  }
+
+  const rNorm = norm(frame.rowCosines!);
+  const cNorm = norm(frame.colCosines!);
+  if (rNorm < 1e-4 || cNorm < 1e-4) {
+    return {
+      valid: false,
+      reasons: ["Zero-length row or column direction cosine vector."],
+      normalizedFrame: null,
+    };
+  }
+
+  const rowUnit: Vec3 = [frame.rowCosines![0] / rNorm, frame.rowCosines![1] / rNorm, frame.rowCosines![2] / rNorm];
+  const colUnit: Vec3 = [frame.colCosines![0] / cNorm, frame.colCosines![1] / cNorm, frame.colCosines![2] / cNorm];
+  const orthoDot = Math.abs(dot(rowUnit, colUnit));
+  if (orthoDot > 0.05) {
+    return {
+      valid: false,
+      reasons: [`Row and column direction cosines are not orthogonal (|dot| = ${orthoDot.toFixed(4)} > 0.05).`],
+      normalizedFrame: null,
+    };
+  }
+
+  const rightHandNormal = normalize(cross(rowUnit, colUnit));
+  let sliceUnit: Vec3 = rightHandNormal;
+  if (isFiniteTriple(frame.sliceCosines)) {
+    const sNorm = norm(frame.sliceCosines);
+    if (sNorm < 1e-4) {
+      return {
+        valid: false,
+        reasons: ["Zero-length slice normal vector."],
+        normalizedFrame: null,
+      };
+    }
+    sliceUnit = [frame.sliceCosines[0] / sNorm, frame.sliceCosines[1] / sNorm, frame.sliceCosines[2] / sNorm];
+    // Slice normal must align with cross(row, col) (either +1 or -1 depending on slice acquisition order)
+    const align = Math.abs(dot(sliceUnit, rightHandNormal));
+    if (align < 0.95) {
+      return {
+        valid: false,
+        reasons: [`Slice normal vector is not orthogonal to image plane (alignment ${align.toFixed(4)} < 0.95).`],
+        normalizedFrame: null,
+      };
+    }
+  }
+
+  return {
+    valid: true,
+    reasons: [],
+    normalizedFrame: {
+      origin: [frame.origin![0], frame.origin![1], frame.origin![2]],
+      rowCosines: rowUnit,
+      colCosines: colUnit,
+      sliceCosines: sliceUnit,
+      spacingMm: [frame.spacingMm![0], frame.spacingMm![1], frame.spacingMm![2]],
+      frameOfReferenceUid: frame.frameOfReferenceUid ?? null,
+    },
+  };
+}
+
 /**
  * Builds a patient coordinate frame from DICOM ImagePositionPatient, ImageOrientationPatient, and spacing.
  */
@@ -59,8 +160,27 @@ export function createPatientFrame(
   secondSliceOrigin?: Vec3 | null,
   frameOfReferenceUid?: string | null,
 ): PatientFrame {
-  const rowCosines: Vec3 = normalize([orientation[0], orientation[1], orientation[2]]);
-  const colCosines: Vec3 = normalize([orientation[3], orientation[4], orientation[5]]);
+  if (!isFiniteTriple(spacingMm) || spacingMm.some((s) => s <= 0)) {
+    throw new Error(`Invalid voxel spacing [${spacingMm.join(", ")}]: all spacing axes must be finite and > 0 mm.`);
+  }
+  if (!isFiniteTriple(origin)) {
+    throw new Error("Invalid ImagePositionPatient origin: must be three finite numbers in mm.");
+  }
+  if (!Array.isArray(orientation) || orientation.length !== 6 || orientation.some((v) => !Number.isFinite(v))) {
+    throw new Error("Invalid ImageOrientationPatient: expected 6 finite direction cosines.");
+  }
+
+  const rowRaw: Vec3 = [orientation[0], orientation[1], orientation[2]];
+  const colRaw: Vec3 = [orientation[3], orientation[4], orientation[5]];
+  if (norm(rowRaw) < 1e-6 || norm(colRaw) < 1e-6) {
+    throw new Error("Invalid ImageOrientationPatient: zero-length direction vector.");
+  }
+
+  const rowCosines: Vec3 = normalize(rowRaw);
+  const colCosines: Vec3 = normalize(colRaw);
+  if (Math.abs(dot(rowCosines, colCosines)) > 0.05) {
+    throw new Error("Invalid ImageOrientationPatient: row and column direction cosines are not orthogonal.");
+  }
 
   let sliceCosines: Vec3;
   if (secondSliceOrigin) {
@@ -69,7 +189,7 @@ export function createPatientFrame(
       secondSliceOrigin[1] - origin[1],
       secondSliceOrigin[2] - origin[2],
     ];
-    sliceCosines = normalize(diff);
+    sliceCosines = norm(diff) > 1e-6 ? normalize(diff) : normalize(cross(rowCosines, colCosines));
   } else {
     sliceCosines = normalize(cross(rowCosines, colCosines));
   }
@@ -184,4 +304,3 @@ export function meshBounds(mesh: Mesh): { min: Vec3; max: Vec3; center: Vec3; sp
   const span: Vec3 = [maxX - minX, maxY - minY, maxZ - minZ];
   return { min, max, center, span };
 }
-

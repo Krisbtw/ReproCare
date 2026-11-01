@@ -2,12 +2,22 @@
 
 import type { RegistrationTransform, RegistrationTransformInput } from "../imaging/registration.ts";
 import { transformPoint, validateTransformMatrix } from "../imaging/registration.ts";
-import { REPROTRACE_PARAMS } from "./params.ts";
+import {
+  DEFAULT_REPROTRACE_THRESHOLDS,
+  REPROTRACE_PARAMS,
+  computeVoxelBoundaryUncertainty,
+  type ChangeAttributionCategory,
+  type CorrespondenceOutcome,
+  type ReproTraceThresholds,
+} from "./params.ts";
+import { computeShapeSimilarity } from "./matching.ts";
+import { attributeLongitudinalChange, parseExaminationDateMs } from "./trends.ts";
 
 export const ENGINE_VERSION = "reprotrace-rules-1";
 
 export type MatchCategory =
   | "likely_same"
+  | "confirmed_match"
   | "potentially_new"
   | "possible_resolved"
   | "uncertain"
@@ -24,11 +34,19 @@ export type Snap = {
   organ: string;
   structure: string;
   locationLabel: string;
+  laterality?: string | null;
+  figo?: string | null;
   modality: string;
   frame: Frame;
   centroidMm: [number, number, number] | null;
   axesMm: [number, number, number] | null;
   longestMm: number | null;
+  volumeMm3?: number | null;
+  spacingMm?: [number, number, number] | null;
+  uncertaintyMm?: number | null;
+  uncertaintyMm3?: number | null;
+  basis?: string | null;
+  source?: string | null;
   quality: "adequate" | "limited" | "unknown";
 };
 
@@ -60,7 +78,7 @@ export type RegistrationLookupEntry = {
   id?: string | null;
   registrationId?: string | null;
   supported?: boolean;
-  status?: "verified" | "unverified" | "failed" | RegistrationQualityStatus;
+  status?: "verified" | "unverified" | "failed" | "computed" | RegistrationQualityStatus;
   transform?: RegistrationTransformInput | string | null;
   ncc?: number | null;
   nccScore?: number | null;
@@ -73,6 +91,16 @@ export type RegistrationLookupEntry = {
   notes?: string[];
 };
 
+export interface ClinicianCorrespondenceDecision {
+  correspondenceId?: string;
+  fromVersionId?: string | null;
+  toVersionId?: string | null;
+  decision: "accept" | "reject" | "defer";
+  note?: string | null;
+  decidedByUserId?: string | null;
+  decidedAt?: string | null;
+}
+
 export type Proposal = {
   fromId: string | null;
   toId: string | null;
@@ -81,9 +109,20 @@ export type Proposal = {
   fromSeriesId?: string | null;
   toSeriesId?: string | null;
   category: MatchCategory;
+  outcome?: CorrespondenceOutcome;
   score: number;
   rationale: string;
   provisional: boolean;
+  distanceMm?: number | null;
+  volumeDeltaPct?: number | null;
+  elapsedDays?: number | null;
+  growthRateMm3PerMonth?: number | null;
+  uncertaintyMm?: number | null;
+  uncertaintyMm3?: number | null;
+  attributionCategory?: ChangeAttributionCategory;
+  clinicianDecision?: "accept" | "reject" | "defer" | null;
+  reviewedByUserId?: string | null;
+  reviewedAt?: string | null;
   registrationQuality?: RegistrationQualityInfo | null;
 };
 
@@ -108,11 +147,43 @@ export function ellipsoidVolumeMm3(axes: [number, number, number]): number {
   return (4 / 3) * Math.PI * (axes[0] / 2) * (axes[1] / 2) * (axes[2] / 2);
 }
 
+export function snapshotVolumeMm3(s: Pick<Snap, "volumeMm3" | "axesMm" | "longestMm">): number | null {
+  if (s.volumeMm3 != null && Number.isFinite(s.volumeMm3) && s.volumeMm3 > 0) {
+    return s.volumeMm3;
+  }
+  if (s.axesMm && s.axesMm.every((x) => Number.isFinite(x) && x > 0)) {
+    return ellipsoidVolumeMm3(s.axesMm);
+  }
+  if (s.longestMm != null && Number.isFinite(s.longestMm) && s.longestMm > 0) {
+    return ellipsoidVolumeMm3([s.longestMm, s.longestMm, s.longestMm]);
+  }
+  return null;
+}
+
 function dist(a: [number, number, number], b: [number, number, number]): number {
   const dx = a[0] - b[0];
   const dy = a[1] - b[1];
   const dz = a[2] - b[2];
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function mapCategoryToOutcome(
+  category: MatchCategory,
+  clinicianDecision?: "accept" | "reject" | "defer" | null,
+): CorrespondenceOutcome {
+  if (clinicianDecision === "accept" || category === "confirmed_match") {
+    return "confirmed_match";
+  }
+  if (clinicianDecision === "reject" || category === "potentially_new") {
+    return "possible_new_finding";
+  }
+  if (category === "likely_same") {
+    return "probable_match_review_required";
+  }
+  if (category === "possible_resolved") {
+    return "possible_resolved_finding";
+  }
+  return "uncertain_correspondence";
 }
 
 /**
@@ -192,7 +263,12 @@ export function evaluateRegistrationEntry(
   }
 
   // 2. Check explicit failed status
-  if (entry.status === "failed" || entry.status === "invalid_transform" || entry.status === "insufficient_quality" || entry.status === "series_mismatch") {
+  if (
+    entry.status === "failed" ||
+    entry.status === "invalid_transform" ||
+    entry.status === "insufficient_quality" ||
+    entry.status === "series_mismatch"
+  ) {
     notes.push("Follow-up image registration was attempted but spatial correspondence could not be established");
     return {
       quality: {
@@ -339,7 +415,7 @@ export function evaluateRegistrationEntry(
   return {
     quality: {
       id: entry.registrationId ?? entry.id ?? null,
-        registrationId: entry.registrationId ?? entry.id ?? null,
+      registrationId: entry.registrationId ?? entry.id ?? null,
       status: entry.status === "unverified" ? "unverified" : "verified",
       supported: true,
       nccScore,
@@ -403,7 +479,12 @@ export function resolveRegistrationForSnapshots(
 
     // 5. Scan map values for matching fixedStudyId + movingStudyId
     for (const entry of registrations.values()) {
-      if (entry.fixedStudyId && entry.movingStudyId && entry.fixedStudyId === a.studyId && entry.movingStudyId === b.studyId) {
+      if (
+        entry.fixedStudyId &&
+        entry.movingStudyId &&
+        entry.fixedStudyId === a.studyId &&
+        entry.movingStudyId === b.studyId
+      ) {
         return evaluateRegistrationEntry(entry, ctx);
       }
     }
@@ -423,7 +504,13 @@ export function resolveRegistrationForSnapshots(
     }
 
     // 7. If a registrations map was explicitly provided, or if snapshots are in non-schematic frames across studies/series, report missing registration explicitly
-    if (registrations.size > 0 || a.frame === "dicom_lps" || b.frame === "dicom_lps" || a.seriesId || b.seriesId) {
+    if (
+      registrations.size > 0 ||
+      a.frame === "dicom_lps" ||
+      b.frame === "dicom_lps" ||
+      a.seriesId ||
+      b.seriesId
+    ) {
       return evaluateRegistrationEntry(null, ctx);
     }
   }
@@ -431,43 +518,89 @@ export function resolveRegistrationForSnapshots(
   // If no registration map was provided, still check if snapshots are in unregistered dicom_lps frames across different studies or series
   const differentStudies = a.studyId !== b.studyId;
   const differentSeries = Boolean(a.seriesId && b.seriesId && a.seriesId !== b.seriesId);
-  if ((a.frame === "dicom_lps" || b.frame === "dicom_lps") && (differentStudies || differentSeries)) {
+  if (
+    (a.frame === "dicom_lps" || b.frame === "dicom_lps") &&
+    (differentStudies || differentSeries)
+  ) {
     return evaluateRegistrationEntry(null, ctx);
   }
 
   return null;
 }
 
-function pairScore(a: Snap, b: Snap): { score: number; category: MatchCategory; notes: string[] } | null {
+function hasContradictoryLocation(labelA: string, labelB: string): boolean {
+  const a = (labelA || "").toLowerCase();
+  const b = (labelB || "").toLowerCase();
+  if ((a.includes("left") && b.includes("right")) || (a.includes("right") && b.includes("left"))) {
+    return true;
+  }
+  if (
+    (a.includes("anterior") && b.includes("posterior")) ||
+    (a.includes("posterior") && b.includes("anterior"))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function pairScore(
+  a: Snap,
+  b: Snap,
+  thresholds: ReproTraceThresholds = DEFAULT_REPROTRACE_THRESHOLDS,
+): {
+  score: number;
+  category: MatchCategory;
+  notes: string[];
+  separationMm: number | null;
+} | null {
   if (a.organ !== b.organ || a.structure !== b.structure) return null;
+  if (hasContradictoryLocation(a.locationLabel, b.locationLabel)) {
+    return null;
+  }
+
   const notes: string[] = [];
   let score = 0.35;
-  if (a.locationLabel && a.locationLabel === b.locationLabel) {
+  const sameLabel = Boolean(a.locationLabel && a.locationLabel === b.locationLabel);
+  if (sameLabel) {
     score += 0.25;
     notes.push("same recorded anatomical label");
   } else if (a.locationLabel && b.locationLabel) {
     score -= 0.05;
     notes.push("anatomical labels differ");
   }
+
   let separation: number | null = null;
   if (a.centroidMm && b.centroidMm) {
     separation = dist(a.centroidMm, b.centroidMm);
     notes.push(`centroid separation ${separation.toFixed(1)} mm in the stored frame`);
-    if (separation <= DIST_SAME) score += 0.3;
-    else if (separation <= DIST_FAR) score += 0.1;
+    if (separation <= thresholds.distSameMm) score += 0.3;
+    else if (separation <= thresholds.distFarMm) score += 0.1;
     else score -= 0.25;
   } else {
     score -= 0.2;
     notes.push("at least one observation has no centroid");
   }
+
   const la = longestOf(a.axesMm, a.longestMm);
   const lb = longestOf(b.axesMm, b.longestMm);
   if (la && lb && la > 0 && lb > 0) {
     const ratio = Math.max(la, lb) / Math.min(la, lb);
     notes.push(`longest-axis ratio ${ratio.toFixed(2)}`);
-    if (ratio <= 1.35) score += 0.15;
-    else if (ratio <= 1.8) score += 0.05;
-    else score -= 0.1;
+    if (ratio <= 1.35) {
+      score += 0.15;
+    } else if (ratio <= 1.8) {
+      // If the lesion is at virtually the same coordinate with the same anatomical label and consistent 3D shape,
+      // allow moderate growth/shrinkage without penalizing it below likely_same
+      const shapeSim = computeShapeSimilarity(a.axesMm, b.axesMm);
+      if (separation != null && separation <= 10 && sameLabel && shapeSim >= 0.75) {
+        score += 0.13;
+        notes.push(`consistent 3D aspect ratio (${shapeSim.toFixed(2)}) during growth/regression`);
+      } else {
+        score += 0.05;
+      }
+    } else {
+      score -= 0.1;
+    }
   }
   if (a.modality !== b.modality) {
     score -= 0.08;
@@ -480,8 +613,10 @@ function pairScore(a: Snap, b: Snap): { score: number; category: MatchCategory; 
   score = Math.max(0, Math.min(0.99, score));
 
   let category: MatchCategory = "needs_review";
-  if (separation != null && separation <= DIST_SAME && score >= 0.72) category = "likely_same";
-  else if (separation != null && separation <= DIST_FAR && score >= 0.45) category = "uncertain";
+  if (separation != null && separation <= thresholds.distSameMm && score >= 0.72)
+    category = "likely_same";
+  else if (separation != null && separation <= thresholds.distFarMm && score >= 0.45)
+    category = "uncertain";
   else category = "needs_review";
 
   if (a.quality !== "adequate" || b.quality !== "adequate") {
@@ -495,7 +630,7 @@ function pairScore(a: Snap, b: Snap): { score: number; category: MatchCategory; 
       "coordinate frame is schematic, not an image-to-image registration, so this cannot be confirmed automatically",
     );
   }
-  return { score, category, notes };
+  return { score, category, notes, separationMm: separation };
 }
 
 /** Pair observations between two spatially described studies. Does not merge records. */
@@ -504,7 +639,19 @@ export function matchStudies(
   next: Snap[],
   registration?: RegistrationLookupEntry | null,
   registrationsMap?: Map<string, RegistrationLookupEntry> | null,
+  options?: {
+    clinicianDecisions?: ClinicianCorrespondenceDecision[];
+    thresholds?: ReproTraceThresholds;
+  },
 ): Proposal[] {
+  const thresholds = options?.thresholds ?? DEFAULT_REPROTRACE_THRESHOLDS;
+  const decisionByPair = new Map<string, ClinicianCorrespondenceDecision>();
+  for (const d of options?.clinicianDecisions ?? []) {
+    if (d.fromVersionId && d.toVersionId) {
+      decisionByPair.set(`${d.fromVersionId}->${d.toVersionId}`, d);
+    }
+  }
+
   const candidates: {
     i: number;
     j: number;
@@ -513,11 +660,18 @@ export function matchStudies(
     notes: string[];
     evalA: Snap;
     evalB: Snap;
+    separationMm: number | null;
     regQuality: RegistrationQualityInfo | null;
+    decision?: ClinicianCorrespondenceDecision;
   }[] = [];
 
   prior.forEach((rawA, i) => {
     next.forEach((rawB, j) => {
+      const decision = decisionByPair.get(`${rawA.id}->${rawB.id}`);
+      if (decision?.decision === "reject") {
+        return;
+      }
+
       const resolved = resolveRegistrationForSnapshots(rawA, rawB, registrationsMap, registration);
       let evalA: Snap = rawA;
       let evalB: Snap = rawB;
@@ -531,8 +685,10 @@ export function matchStudies(
         };
       }
 
-      const scored = pairScore(evalA, evalB);
-      if (!scored || scored.score < PAIR_FLOOR) return;
+      const scored = pairScore(evalA, evalB, thresholds);
+      if (!scored || (scored.score < thresholds.pairFloorScore && decision?.decision !== "accept")) {
+        return;
+      }
 
       let cat = scored.category;
       const notes = [...scored.notes];
@@ -541,23 +697,30 @@ export function matchStudies(
         notes.push(...resolved.quality.notes);
         if (!resolved.quality.supported) {
           if (cat === "likely_same") {
-            cat =
-              resolved.quality.status === "failed" || resolved.quality.status === "invalid_transform"
-                ? "uncertain"
-                : "uncertain";
+            cat = "uncertain";
           }
         }
+      }
+
+      if (decision?.decision === "accept") {
+        cat = "likely_same";
+        notes.push("Clinician reviewed and accepted longitudinal correspondence");
+      } else if (decision?.decision === "defer") {
+        cat = "uncertain";
+        notes.push("Clinician deferred correspondence for follow-up review");
       }
 
       candidates.push({
         i,
         j,
-        score: scored.score,
+        score: decision?.decision === "accept" ? Math.max(0.95, scored.score) : scored.score,
         category: cat,
         notes,
         evalA,
         evalB,
+        separationMm: scored.separationMm,
         regQuality: resolved?.quality ?? null,
+        decision,
       });
     });
   });
@@ -574,9 +737,51 @@ export function matchStudies(
     const b = c.evalB;
     const regSupported = c.regQuality ? c.regQuality.supported : false;
     const isProvisional =
-      a.frame !== "image_registered" ||
-      b.frame !== "image_registered" ||
-      (c.regQuality ? !regSupported : true);
+      c.decision?.decision === "accept"
+        ? false
+        : a.frame !== "image_registered" ||
+          b.frame !== "image_registered" ||
+          (c.regQuality ? !regSupported : true);
+
+    const v1 = snapshotVolumeMm3(a);
+    const v2 = snapshotVolumeMm3(b);
+    const t1 = parseExaminationDateMs(a.date);
+    const t2 = parseExaminationDateMs(b.date);
+    const elapsedDays =
+      t1 !== null && t2 !== null && t2 > t1 ? (t2 - t1) / (1000 * 60 * 60 * 24) : null;
+    const volumeDeltaPct =
+      v1 != null && v2 != null && v1 > 0 ? Number((((v2 - v1) / v1) * 100).toFixed(2)) : null;
+    const growthRateMm3PerMonth =
+      v1 != null &&
+      v2 != null &&
+      elapsedDays != null &&
+      elapsedDays >= thresholds.minElapsedDaysForGrowthRate
+        ? Number((((v2 - v1) / elapsedDays) * 30.4375).toFixed(1))
+        : null;
+
+    const attribution = attributeLongitudinalChange({
+      priorVolumeMm3: v1,
+      currentVolumeMm3: v2,
+      priorUncertaintyMm3: a.uncertaintyMm3,
+      currentUncertaintyMm3: b.uncertaintyMm3,
+      priorSpacingMm: a.spacingMm,
+      currentSpacingMm: b.spacingMm,
+      priorMethod: a.source ?? a.basis,
+      currentMethod: b.source ?? b.basis,
+      priorModality: a.modality,
+      currentModality: b.modality,
+      registrationQualityScore: c.regQuality?.nccScore,
+      registrationResidualMm: c.regQuality?.residualMm,
+      registrationDegraded: c.regQuality ? !c.regQuality.supported && c.regQuality.status !== "missing" : false,
+      imageQualityDegraded: a.quality !== "adequate" || b.quality !== "adequate",
+      elapsedDays,
+      thresholds,
+    });
+
+    const uA = a.uncertaintyMm ?? (a.spacingMm ? 0.5 * Math.hypot(...a.spacingMm) : 2.0);
+    const uB = b.uncertaintyMm ?? (b.spacingMm ? 0.5 * Math.hypot(...b.spacingMm) : 2.0);
+    const uReg = c.regQuality?.residualMm ?? 0;
+    const combinedUncertaintyMm = Number(Math.hypot(uA, uB, uReg).toFixed(2));
 
     proposals.push({
       fromId: a.id,
@@ -586,9 +791,20 @@ export function matchStudies(
       fromSeriesId: a.seriesId ?? null,
       toSeriesId: b.seriesId ?? null,
       category: c.category,
+      outcome: mapCategoryToOutcome(c.category, c.decision?.decision),
       score: Number(c.score.toFixed(2)),
       rationale: `${c.notes.join(". ")}.`,
       provisional: isProvisional,
+      distanceMm: c.separationMm != null ? Number(c.separationMm.toFixed(2)) : null,
+      volumeDeltaPct,
+      elapsedDays: elapsedDays != null ? Number(elapsedDays.toFixed(2)) : null,
+      growthRateMm3PerMonth,
+      uncertaintyMm: combinedUncertaintyMm,
+      uncertaintyMm3: Number(attribution.combinedUncertaintyMm3.toFixed(1)),
+      attributionCategory: attribution.category,
+      clinicianDecision: c.decision?.decision ?? null,
+      reviewedByUserId: c.decision?.decidedByUserId ?? null,
+      reviewedAt: c.decision?.decidedAt ?? null,
       registrationQuality:
         c.regQuality ?? {
           id: null,
@@ -609,6 +825,7 @@ export function matchStudies(
   prior.forEach((a, i) => {
     if (usedPrior.has(i)) return;
     const small = (longestOf(a.axesMm, a.longestMm) ?? 99) < 20;
+    const cat: MatchCategory = small ? "needs_review" : "possible_resolved";
     proposals.push({
       fromId: a.id,
       toId: null,
@@ -616,12 +833,14 @@ export function matchStudies(
       toStudyId: next[0]?.studyId ?? null,
       fromSeriesId: a.seriesId ?? null,
       toSeriesId: next[0]?.seriesId ?? null,
-      category: small ? "needs_review" : "possible_resolved",
+      category: cat,
+      outcome: small ? "uncertain_correspondence" : "possible_resolved_finding",
       score: small ? 0.34 : 0.48,
       rationale: small
         ? "Not paired on the later study. Longest axis under 20 mm makes non-visualization unreliable, so this stays in review rather than being called resolved."
         : "No geometric counterpart met the pairing threshold on the later study. Non-visualization is not treated as proof of resolution.",
       provisional: true,
+      attributionCategory: "insufficient_evidence",
     });
   });
   next.forEach((b, j) => {
@@ -634,10 +853,12 @@ export function matchStudies(
       fromSeriesId: prior[0]?.seriesId ?? null,
       toSeriesId: b.seriesId ?? null,
       category: "potentially_new",
+      outcome: "possible_new_finding",
       score: 0.5,
       rationale:
         "No counterpart on the earlier study met the pairing threshold. This is a potential new observation, not a confirmed new lesion.",
       provisional: b.frame !== "image_registered",
+      attributionCategory: "insufficient_evidence",
     });
   });
   return proposals;
@@ -648,13 +869,18 @@ export type StudyGroup = { studyId: string; date: string; snaps: Snap[] };
 /**
  * Spatial match across chronologically ordered studies.
  *
- * Resolves registration transformations consistently across both series IDs (`${fixedSeriesId}:${movingSeriesId}`)
- * and study IDs (`${fromStudyId}:${toStudyId}`), validates transformation matrices, and gates correspondence
- * confidence on registration quality.
+ * Strictly validates and orders studies by parsed examination date (`date`), deduplicates
+ * duplicate study IDs, resolves registration transformations consistently across both
+ * series IDs (`${fixedSeriesId}:${movingSeriesId}`) and study IDs (`${fromStudyId}:${toStudyId}`),
+ * validates transformation matrices, and gates correspondence confidence on registration quality.
  */
 export function matchChronology(
   groupsOrSnaps: StudyGroup[] | Snap[],
   registrations?: Map<string, RegistrationLookupEntry> | null,
+  options?: {
+    clinicianDecisions?: ClinicianCorrespondenceDecision[];
+    thresholds?: ReproTraceThresholds;
+  },
 ): Proposal[] {
   let groups: StudyGroup[];
   if (groupsOrSnaps.length > 0 && !("snaps" in groupsOrSnaps[0])) {
@@ -671,16 +897,37 @@ export function matchChronology(
   } else {
     groups = groupsOrSnaps as StudyGroup[];
   }
-  const spatial = groups
-    .map((g) => ({
-      ...g,
-      snaps: g.snaps.filter((s) => s.centroidMm && s.frame !== "unavailable"),
-    }))
-    .filter((g) => g.snaps.length > 0)
-    .sort((a, b) => a.date.localeCompare(b.date));
+
+  const seenStudyIds = new Set<string>();
+  const validGroups: Array<{ group: StudyGroup; ms: number; index: number }> = [];
+
+  groups.forEach((g, idx) => {
+    if (!g.studyId || seenStudyIds.has(g.studyId)) return;
+    const ms = parseExaminationDateMs(g.date);
+    if (ms === null) return;
+    const spatialSnaps = g.snaps.filter((s) => s.centroidMm && s.frame !== "unavailable");
+    if (spatialSnaps.length === 0) return;
+    seenStudyIds.add(g.studyId);
+    validGroups.push({
+      group: { ...g, snaps: spatialSnaps },
+      ms,
+      index: idx,
+    });
+  });
+
+  validGroups.sort((a, b) => (a.ms !== b.ms ? a.ms - b.ms : a.index - b.index));
+
   const out: Proposal[] = [];
-  for (let i = 1; i < spatial.length; i += 1) {
-    out.push(...matchStudies(spatial[i - 1].snaps, spatial[i].snaps, undefined, registrations));
+  for (let i = 1; i < validGroups.length; i += 1) {
+    out.push(
+      ...matchStudies(
+        validGroups[i - 1].group.snaps,
+        validGroups[i].group.snaps,
+        undefined,
+        registrations,
+        options,
+      ),
+    );
   }
   return out;
 }
@@ -690,14 +937,22 @@ export type DiscCategory =
   | "method_difference"
   | "segmentation_disagreement"
   | "reporting_inconsistency"
-  | "unresolved_uncertainty";
+  | "unresolved_uncertainty"
+  | "protocol_or_spacing_difference"
+  | "image_quality_limitation"
+  | "registration_uncertainty";
 
 export type Discrepancy = {
   category: DiscCategory;
+  attributionCategory?: ChangeAttributionCategory;
   summary: string;
   detail: string;
   leftRef: string;
   rightRef: string;
+  volumeDeltaPct?: number | null;
+  elapsedDays?: number | null;
+  growthRateMm3PerMonth?: number | null;
+  uncertaintyMm3?: number | null;
 };
 
 export type Measure = {
@@ -709,6 +964,9 @@ export type Measure = {
   locationLabel: string;
   longestMm: number | null;
   axesMm: [number, number, number] | null;
+  volumeMm3?: number | null;
+  spacingMm?: [number, number, number] | null;
+  uncertaintyMm3?: number | null;
   source: string;
   reportLongestMm: number | null;
   quality: string;
@@ -717,24 +975,100 @@ export type Measure = {
 export function sameMethodChange(a: Measure, b: Measure): Discrepancy | null {
   if (a.longestMm == null || b.longestMm == null) return null;
   if (a.modality !== b.modality) return null;
-  if (a.basis !== b.basis) {
+
+  // Enforce chronological order between a and b if both dates are parseable
+  const msA = parseExaminationDateMs(a.date);
+  const msB = parseExaminationDateMs(b.date);
+  const [earlier, later] =
+    msA !== null && msB !== null && msB < msA ? [b, a] : [a, b];
+
+  const elapsedDays =
+    msA !== null && msB !== null ? Math.abs(msB - msA) / (1000 * 60 * 60 * 24) : null;
+
+  if (earlier.basis !== later.basis) {
     return {
       category: "unresolved_uncertainty",
+      attributionCategory: "segmentation_method_difference",
       summary: "Same modality, different measurement basis",
       detail:
         "The lengths were not taken on the same recorded basis, so the numeric gap is not interpreted as growth or shrinkage.",
-      leftRef: a.id,
-      rightRef: b.id,
+      leftRef: earlier.id,
+      rightRef: later.id,
+      elapsedDays,
     };
   }
-  const rel = Math.abs(a.longestMm - b.longestMm) / Math.min(a.longestMm, b.longestMm);
+
+  if (earlier.quality === "limited" || later.quality === "limited") {
+    const relQ =
+      Math.abs(earlier.longestMm - later.longestMm) /
+      Math.min(earlier.longestMm, later.longestMm);
+    if (relQ > 0.15) {
+      return {
+        category: "unresolved_uncertainty",
+        attributionCategory: "image_quality_limitation",
+        summary: `Measurement difference under limited image quality (${earlier.date} to ${later.date})`,
+        detail:
+          "At least one study has limited image quality; apparent size difference may reflect motion or incomplete visualization rather than anatomical change.",
+        leftRef: earlier.id,
+        rightRef: later.id,
+        elapsedDays,
+      };
+    }
+  }
+
+  // Check spacing difference if both specify spacingMm
+  if (earlier.spacingMm && later.spacingMm) {
+    const sliceDiff = Math.abs(earlier.spacingMm[2] - later.spacingMm[2]);
+    if (sliceDiff > REPROTRACE_PARAMS.MAX_SLICE_THICKNESS_GAP_MM) {
+      return {
+        category: "unresolved_uncertainty",
+        attributionCategory: "protocol_or_spacing_difference",
+        summary: `Slice thickness differs (${earlier.spacingMm[2]} mm vs ${later.spacingMm[2]} mm)`,
+        detail: `Acquisition slice thickness changed by ${sliceDiff.toFixed(1)} mm between ${earlier.date} and ${later.date}; partial-volume effects limit direct comparison.`,
+        leftRef: earlier.id,
+        rightRef: later.id,
+        elapsedDays,
+      };
+    }
+  }
+
+  const v1 =
+    earlier.volumeMm3 ??
+    (earlier.axesMm ? ellipsoidVolumeMm3(earlier.axesMm) : null);
+  const v2 =
+    later.volumeMm3 ?? (later.axesMm ? ellipsoidVolumeMm3(later.axesMm) : null);
+  const volumeDeltaPct =
+    v1 != null && v2 != null && v1 > 0
+      ? Number((((v2 - v1) / v1) * 100).toFixed(1))
+      : null;
+  const growthRateMm3PerMonth =
+    v1 != null && v2 != null && elapsedDays != null && elapsedDays >= 14
+      ? Number((((v2 - v1) / elapsedDays) * 30.4375).toFixed(1))
+      : null;
+  const u1 =
+    earlier.uncertaintyMm3 ??
+    (v1 != null ? computeVoxelBoundaryUncertainty(v1, earlier.spacingMm ?? undefined) : 0);
+  const u2 =
+    later.uncertaintyMm3 ??
+    (v2 != null ? computeVoxelBoundaryUncertainty(v2, later.spacingMm ?? undefined) : 0);
+  const combinedUncertaintyMm3 = Number(Math.hypot(u1, u2).toFixed(1));
+
+  const rel =
+    Math.abs(earlier.longestMm - later.longestMm) /
+    Math.min(earlier.longestMm, later.longestMm);
   if (rel <= 0.15) return null;
+
   return {
     category: "measurable_difference",
-    summary: `Longest axis ${a.longestMm.toFixed(0)} mm (${a.date}) to ${b.longestMm.toFixed(0)} mm (${b.date})`,
+    attributionCategory: "genuine_anatomical_change",
+    summary: `Longest axis ${earlier.longestMm.toFixed(0)} mm (${earlier.date}) to ${later.longestMm.toFixed(0)} mm (${later.date})`,
     detail: `Relative change is ${(rel * 100).toFixed(0)}% where modality and measurement basis match. ReproTrace calls this a measurable difference only. It is not a determination of progression, response, or clinical significance.`,
-    leftRef: a.id,
-    rightRef: b.id,
+    leftRef: earlier.id,
+    rightRef: later.id,
+    volumeDeltaPct,
+    elapsedDays: elapsedDays != null ? Number(elapsedDays.toFixed(2)) : null,
+    growthRateMm3PerMonth,
+    uncertaintyMm3: combinedUncertaintyMm3 > 0 ? combinedUncertaintyMm3 : null,
   };
 }
 
@@ -744,6 +1078,7 @@ export function methodGap(a: Measure, b: Measure): Discrepancy | null {
   if (!a.locationLabel || a.locationLabel !== b.locationLabel) return null;
   return {
     category: "method_difference",
+    attributionCategory: "protocol_or_spacing_difference",
     summary: `${a.modality} ${a.longestMm.toFixed(0)} mm vs ${b.modality} ${b.longestMm.toFixed(0)} mm (${a.locationLabel})`,
     detail:
       "Different modalities are not treated as a before-and-after of one measurement. Plane, boundary definition, and resolution commonly move the number without a biological change being knowable from these two values alone.",
@@ -755,16 +1090,18 @@ export function methodGap(a: Measure, b: Measure): Discrepancy | null {
 export function segmentationGap(a: Measure, b: Measure): Discrepancy | null {
   if (a.findingId !== b.findingId || a.source === b.source) return null;
   if (!a.axesMm || !b.axesMm) return null;
-  const va = ellipsoidVolumeMm3(a.axesMm);
-  const vb = ellipsoidVolumeMm3(b.axesMm);
+  const va = a.volumeMm3 ?? ellipsoidVolumeMm3(a.axesMm);
+  const vb = b.volumeMm3 ?? ellipsoidVolumeMm3(b.axesMm);
   const rel = Math.abs(va - vb) / Math.min(va, vb);
   if (rel <= 0.2) return null;
   return {
     category: "segmentation_disagreement",
+    attributionCategory: "segmentation_method_difference",
     summary: "Stored geometry and a later edit disagree by more than 20% volume",
     detail: `Ellipsoid volumes differ by ${(rel * 100).toFixed(0)}% (${Math.round(va)} mm³ vs ${Math.round(vb)} mm³). The earlier version is kept. Demonstration geometry is not a trained model output.`,
     leftRef: a.id,
     rightRef: b.id,
+    volumeDeltaPct: Number((((vb - va) / va) * 100).toFixed(1)),
   };
 }
 
@@ -774,6 +1111,7 @@ export function reportGap(m: Measure): Discrepancy | null {
   if (delta <= 3) return null;
   return {
     category: "reporting_inconsistency",
+    attributionCategory: "insufficient_evidence",
     summary: `Report states ${m.reportLongestMm.toFixed(0)} mm; structured record states ${m.longestMm.toFixed(0)} mm`,
     detail:
       "The narrative measurement and the structured measurement disagree by more than 3 mm. Neither value is overwritten.",

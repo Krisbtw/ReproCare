@@ -11,8 +11,18 @@ import {
   type Snap,
   type Measure,
   type RegistrationLookupEntry,
+  type ClinicianCorrespondenceDecision,
 } from "../reprotrace/engine.ts";
 import { validateTransformMatrix, type RegistrationTransformInput } from "../imaging/registration.ts";
+import {
+  storeImagingArtifact,
+  getImagingArtifact,
+  listImagingArtifacts,
+  verifyImagingObjectIntegrity,
+  purgeImagingArtifact,
+  getHistoricalFindingImagingEvidence,
+  type ImagingArtifactKind,
+} from "../imaging/storage.server.ts";
 import { insertLabVersion, type LabVersionInput } from "./lab-version.ts";
 import { applyMenarcheYear } from "./menarche.ts";
 import { ingestReport, linkReportQuote, type IngestInput, type QuoteLinkInput } from "../reports/store.ts";
@@ -1125,8 +1135,14 @@ export async function recomputeReproTrace(
   `;
   if (studies.length === 0) return { proposalsCount: 0, discrepanciesCount: 0 };
 
-  const seriesRows = await sql<{ id: string; study_id: string; quality: string }>`
-    select id, study_id, quality
+  const seriesRows = await sql<{
+    id: string;
+    study_id: string;
+    quality: string;
+    pixel_spacing_mm?: string | null;
+    slice_thickness_mm?: number | null;
+  }>`
+    select id, study_id, quality, pixel_spacing_mm, slice_thickness_mm
     from series
     where user_id = ${userId}
       and study_id in (select id from studies where patient_id = ${patientId} and user_id = ${userId})
@@ -1135,10 +1151,19 @@ export async function recomputeReproTrace(
 
   const seriesToStudy = new Map<string, string>();
   const studyDefaultSeries = new Map<string, string>();
+  const seriesSpacingMap = new Map<string, [number, number, number]>();
   for (const sr of seriesRows) {
     seriesToStudy.set(sr.id, sr.study_id);
     if (!studyDefaultSeries.has(sr.study_id)) {
       studyDefaultSeries.set(sr.study_id, sr.id);
+    }
+    if (sr.pixel_spacing_mm && sr.slice_thickness_mm != null) {
+      const parts = String(sr.pixel_spacing_mm)
+        .split(/[\\,/\s]+/)
+        .map((x) => Number(x));
+      if (parts.length >= 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1]) && parts[0] > 0 && parts[1] > 0 && Number(sr.slice_thickness_mm) > 0) {
+        seriesSpacingMap.set(sr.id, [parts[0], parts[1], Number(sr.slice_thickness_mm)]);
+      }
     }
   }
 
@@ -1171,14 +1196,26 @@ export async function recomputeReproTrace(
     order by observed_on, version_no
   `;
 
-  // Also query series_id from finding_versions (if migration 0009 was applied) and evidence_links
-  const versionSeriesRows = await sql<{ id: string; series_id: string | null }>`
-    select id, series_id from finding_versions
+  // Also query series_id, volume_mm3, uncertainty_mm3, segmentation_source from finding_versions (if migration 0009 was applied)
+  const versionExtraRows = await sql<{
+    id: string;
+    series_id: string | null;
+    volume_mm3?: number | null;
+    uncertainty_mm3?: number | null;
+    segmentation_source?: string | null;
+  }>`
+    select id, series_id, volume_mm3, uncertainty_mm3, segmentation_source from finding_versions
     where user_id = ${userId} and finding_id in (select id from findings where patient_id = ${patientId} and user_id = ${userId})
   `.catch(() => []);
   const versionSeriesMap = new Map<string, string>();
-  for (const r of versionSeriesRows) {
+  const versionVolumeMap = new Map<string, { volumeMm3: number | null; uncertaintyMm3: number | null; source: string | null }>();
+  for (const r of versionExtraRows) {
     if (r.series_id) versionSeriesMap.set(r.id, r.series_id);
+    versionVolumeMap.set(r.id, {
+      volumeMm3: r.volume_mm3 != null ? Number(r.volume_mm3) : null,
+      uncertaintyMm3: r.uncertainty_mm3 != null ? Number(r.uncertainty_mm3) : null,
+      source: r.segmentation_source ?? null,
+    });
   }
 
   const evidenceSeriesRows = await sql<{ finding_version_id: string; series_id: string | null }>`
@@ -1281,6 +1318,8 @@ export async function recomputeReproTrace(
       const f = findings.find((x) => x.id === v.finding_id);
       const resolvedSeriesId =
         versionSeriesMap.get(v.id) ?? studyDefaultSeries.get(v.study_id) ?? null;
+      const vExtra = versionVolumeMap.get(v.id);
+      const spacingMm = resolvedSeriesId ? (seriesSpacingMap.get(resolvedSeriesId) ?? null) : null;
       return {
         id: v.id,
         findingId: v.finding_id,
@@ -1295,13 +1334,49 @@ export async function recomputeReproTrace(
         centroidMm: parseTriple(v.centroid_mm),
         axesMm: parseTriple(v.axes_mm),
         longestMm: v.longest_mm == null ? null : Number(v.longest_mm),
+        volumeMm3: vExtra?.volumeMm3 ?? null,
+        uncertaintyMm3: vExtra?.uncertaintyMm3 ?? null,
+        spacingMm,
+        basis: v.basis,
+        source: vExtra?.source ?? null,
         quality: (v.quality as Snap["quality"]) ?? "adequate",
       };
     });
     return { studyId: s.id, date: s.study_date, snaps };
   });
 
-  const proposals = matchChronology(studyGroups, regMap.size > 0 ? regMap : undefined);
+  // Load any prior clinician correspondence decisions so accepted/rejected/deferred decisions are preserved
+  const priorDecisionRows = await sql<{
+    correspondence_id: string;
+    from_version_id: string | null;
+    to_version_id: string | null;
+    decision: "accept" | "reject" | "defer";
+    note: string;
+    user_id: string;
+    at: string;
+  }>`
+    select cd.correspondence_id, c.from_version_id, c.to_version_id, cd.decision, cd.note, cd.user_id, cd.created_at::text as at
+    from correspondence_decisions cd
+    join correspondences c on c.id = cd.correspondence_id
+    where c.patient_id = ${patientId} and cd.user_id = ${userId}
+    order by cd.created_at desc
+  `.catch(() => []);
+
+  const clinicianDecisions: ClinicianCorrespondenceDecision[] = priorDecisionRows.map((d) => ({
+    correspondenceId: d.correspondence_id,
+    fromVersionId: d.from_version_id,
+    toVersionId: d.to_version_id,
+    decision: d.decision,
+    note: d.note,
+    decidedByUserId: d.user_id,
+    decidedAt: d.at,
+  }));
+
+  const proposals = matchChronology(
+    studyGroups,
+    regMap.size > 0 ? regMap : undefined,
+    { clinicianDecisions },
+  );
 
   try {
     await sql`
@@ -1324,26 +1399,47 @@ export async function recomputeReproTrace(
         insert into correspondences (
           id, user_id, patient_id, from_version_id, to_version_id, from_study_id, to_study_id,
           from_series_id, to_series_id, registration_id, registration_status, registration_ncc, registration_residual_mm,
-          category, score, rationale, provisional, engine_version, active
+          category, score, rationale, provisional,
+          attribution_category, uncertainty_mm, distance_mm, volume_delta_pct, elapsed_days, growth_rate_mm3_per_month,
+          engine_version, active
         ) values (
           ${corrId}, ${userId}, ${patientId},
           ${p.fromId}, ${p.toId}, ${p.fromStudyId}, ${p.toStudyId},
           ${p.fromSeriesId ?? null}, ${p.toSeriesId ?? null},
           ${rq?.registrationId ?? rq?.id ?? null}, ${rq?.status ?? null}, ${rq?.nccScore ?? null}, ${rq?.residualMm ?? null},
-          ${p.category}, ${p.score}, ${p.rationale}, ${p.provisional}, ${ENGINE_VERSION}, true
+          ${p.category}, ${p.score}, ${p.rationale}, ${p.provisional},
+          ${p.attributionCategory ?? null}, ${p.uncertaintyMm ?? null}, ${p.distanceMm ?? null},
+          ${p.volumeDeltaPct ?? null}, ${p.elapsedDays ?? null}, ${p.growthRateMm3PerMonth ?? null},
+          ${ENGINE_VERSION}, true
         )
       `;
     } catch {
-      await sql`
-        insert into correspondences (
-          id, user_id, patient_id, from_version_id, to_version_id, from_study_id, to_study_id,
-          category, score, rationale, provisional, engine_version, active
-        ) values (
-          ${corrId}, ${userId}, ${patientId},
-          ${p.fromId}, ${p.toId}, ${p.fromStudyId}, ${p.toStudyId},
-          ${p.category}, ${p.score}, ${p.rationale}, ${p.provisional}, ${ENGINE_VERSION}, true
-        )
-      `;
+      try {
+        await sql`
+          insert into correspondences (
+            id, user_id, patient_id, from_version_id, to_version_id, from_study_id, to_study_id,
+            from_series_id, to_series_id, registration_id, registration_status, registration_ncc, registration_residual_mm,
+            category, score, rationale, provisional, engine_version, active
+          ) values (
+            ${corrId}, ${userId}, ${patientId},
+            ${p.fromId}, ${p.toId}, ${p.fromStudyId}, ${p.toStudyId},
+            ${p.fromSeriesId ?? null}, ${p.toSeriesId ?? null},
+            ${rq?.registrationId ?? rq?.id ?? null}, ${rq?.status ?? null}, ${rq?.nccScore ?? null}, ${rq?.residualMm ?? null},
+            ${p.category}, ${p.score}, ${p.rationale}, ${p.provisional}, ${ENGINE_VERSION}, true
+          )
+        `;
+      } catch {
+        await sql`
+          insert into correspondences (
+            id, user_id, patient_id, from_version_id, to_version_id, from_study_id, to_study_id,
+            category, score, rationale, provisional, engine_version, active
+          ) values (
+            ${corrId}, ${userId}, ${patientId},
+            ${p.fromId}, ${p.toId}, ${p.fromStudyId}, ${p.toStudyId},
+            ${p.category}, ${p.score}, ${p.rationale}, ${p.provisional}, ${ENGINE_VERSION}, true
+          )
+        `;
+      }
     }
   }
 
@@ -1380,17 +1476,44 @@ export async function recomputeReproTrace(
       reportLongestMm: v2.report_longest_mm,
       quality: v2.quality,
     };
+    const s1Id = versionSeriesMap.get(v1.id) ?? studyDefaultSeries.get(v1.study_id) ?? null;
+    const s2Id = versionSeriesMap.get(v2.id) ?? studyDefaultSeries.get(v2.study_id) ?? null;
+    m1.volumeMm3 = versionVolumeMap.get(v1.id)?.volumeMm3 ?? null;
+    m1.uncertaintyMm3 = versionVolumeMap.get(v1.id)?.uncertaintyMm3 ?? null;
+    m1.spacingMm = s1Id ? (seriesSpacingMap.get(s1Id) ?? null) : null;
+    m2.volumeMm3 = versionVolumeMap.get(v2.id)?.volumeMm3 ?? null;
+    m2.uncertaintyMm3 = versionVolumeMap.get(v2.id)?.uncertaintyMm3 ?? null;
+    m2.spacingMm = s2Id ? (seriesSpacingMap.get(s2Id) ?? null) : null;
+
     const disc = sameMethodChange(m1, m2);
     if (disc) {
-      await sql`
-        insert into discrepancies (
-          id, user_id, patient_id, category, summary, detail, left_ref, right_ref, engine_version, active
-        ) values (
-          ${crypto.randomUUID()}, ${userId}, ${patientId},
-          ${disc.category}, ${disc.summary}, ${disc.detail},
-          ${v1.id}, ${v2.id}, ${ENGINE_VERSION}, true
-        )
-      `;
+      const discId = crypto.randomUUID();
+      try {
+        await sql`
+          insert into discrepancies (
+            id, user_id, patient_id, category, attribution_category, summary, detail,
+            left_ref, right_ref, uncertainty_mm3, volume_delta_pct, elapsed_days, growth_rate_mm3_per_month,
+            engine_version, active
+          ) values (
+            ${discId}, ${userId}, ${patientId},
+            ${disc.category}, ${disc.attributionCategory ?? null}, ${disc.summary}, ${disc.detail},
+            ${disc.leftRef}, ${disc.rightRef},
+            ${disc.uncertaintyMm3 ?? null}, ${disc.volumeDeltaPct ?? null},
+            ${disc.elapsedDays ?? null}, ${disc.growthRateMm3PerMonth ?? null},
+            ${ENGINE_VERSION}, true
+          )
+        `;
+      } catch {
+        await sql`
+          insert into discrepancies (
+            id, user_id, patient_id, category, summary, detail, left_ref, right_ref, engine_version, active
+          ) values (
+            ${discId}, ${userId}, ${patientId},
+            ${disc.category}, ${disc.summary}, ${disc.detail},
+            ${disc.leftRef}, ${disc.rightRef}, ${ENGINE_VERSION}, true
+          )
+        `;
+      }
       discrepanciesCount++;
     }
   }
@@ -1895,4 +2018,320 @@ export const getPcosAssessments = createServerFn({ method: "POST" })
   .handler(async ({ context, data: patientId }) => {
     const sql = await getSql();
     return executeGetPcosAssessments(sql, context.userId, patientId);
+  });
+
+
+// ============================================================================
+// Sprint 3: Persistent Medical Imaging Storage & Longitudinal Provenance APIs
+// ============================================================================
+
+export async function executeStoreImagingArtifact(
+  sql: Sql,
+  rawUserId: string,
+  data: {
+    patientId: string;
+    studyId?: string | null;
+    seriesId?: string | null;
+    findingVersionId?: string | null;
+    sourceObjectId?: string | null;
+    sopInstanceUid?: string | null;
+    instanceNumber?: number | null;
+    kind: ImagingArtifactKind;
+    fileName?: string | null;
+    mimeType?: string | null;
+    dataBase64: string;
+    metadata?: Record<string, unknown>;
+  },
+) {
+  const auth = await requireVerifiedClinicianOrAdmin(
+    sql,
+    rawUserId,
+    "uploading or persisting a medical imaging artifact",
+  );
+  await requirePatientRecordAccess(sql, auth.userId, data.patientId, "store imaging artifact");
+  const buffer = Buffer.from(data.dataBase64, "base64");
+  return storeImagingArtifact(sql, {
+    userId: auth.userId,
+    patientId: data.patientId,
+    studyId: data.studyId ?? null,
+    seriesId: data.seriesId ?? null,
+    findingVersionId: data.findingVersionId ?? null,
+    sourceObjectId: data.sourceObjectId ?? null,
+    sopInstanceUid: data.sopInstanceUid ?? null,
+    instanceNumber: data.instanceNumber ?? null,
+    kind: data.kind,
+    fileName: data.fileName ?? null,
+    mimeType: data.mimeType ?? null,
+    data: buffer,
+    metadata: data.metadata,
+  });
+}
+
+export const uploadImagingArtifact = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator(
+    (input: {
+      patientId: string;
+      studyId?: string | null;
+      seriesId?: string | null;
+      findingVersionId?: string | null;
+      sourceObjectId?: string | null;
+      sopInstanceUid?: string | null;
+      instanceNumber?: number | null;
+      kind: ImagingArtifactKind;
+      fileName?: string | null;
+      mimeType?: string | null;
+      dataBase64: string;
+      metadata?: Record<string, unknown>;
+    }) => {
+      if (!input.patientId || typeof input.patientId !== "string") {
+        throw new Error("patientId is required.");
+      }
+      if (!input.dataBase64 || typeof input.dataBase64 !== "string") {
+        throw new Error("dataBase64 payload is required.");
+      }
+      return input;
+    },
+  )
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeStoreImagingArtifact(sql, context.userId, data);
+  });
+
+export async function executeGetImagingArtifact(
+  sql: Sql,
+  rawUserId: string,
+  objectId: string,
+  includeData: boolean = true,
+) {
+  const userId = requireAuthenticatedUser(rawUserId);
+  const res = await getImagingArtifact(sql, userId, objectId, includeData);
+  if (!res) {
+    throw new Error("Imaging artifact not found or access denied.");
+  }
+  return {
+    record: res.record,
+    integrity: res.integrity,
+    dataBase64: res.data ? res.data.toString("base64") : undefined,
+  };
+}
+
+export const retrieveImagingArtifact = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { objectId: string; includeData?: boolean }) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeGetImagingArtifact(
+      sql,
+      context.userId,
+      data.objectId,
+      data.includeData ?? true,
+    );
+  });
+
+export async function executeListImagingArtifacts(
+  sql: Sql,
+  rawUserId: string,
+  filter: {
+    patientId: string;
+    studyId?: string;
+    seriesId?: string;
+    findingVersionId?: string;
+    kind?: ImagingArtifactKind;
+    includePurged?: boolean;
+  },
+) {
+  const { auth } = await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    filter.patientId,
+    "list imaging artifacts",
+  );
+  return listImagingArtifacts(sql, auth.userId, filter);
+}
+
+export const listPatientImagingArtifacts = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator(
+    (input: {
+      patientId: string;
+      studyId?: string;
+      seriesId?: string;
+      findingVersionId?: string;
+      kind?: ImagingArtifactKind;
+      includePurged?: boolean;
+    }) => input,
+  )
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeListImagingArtifacts(sql, context.userId, data);
+  });
+
+export async function executeVerifyImagingObjectIntegrity(
+  sql: Sql,
+  rawUserId: string,
+  objectId: string,
+) {
+  const userId = requireAuthenticatedUser(rawUserId);
+  return verifyImagingObjectIntegrity(sql, userId, objectId);
+}
+
+export const checkImagingIntegrity = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((objectId: string) => objectId)
+  .handler(async ({ context, data: objectId }) => {
+    const sql = await getSql();
+    return executeVerifyImagingObjectIntegrity(sql, context.userId, objectId);
+  });
+
+export async function executePurgeImagingArtifact(
+  sql: Sql,
+  rawUserId: string,
+  data: { objectId: string; reason: string },
+) {
+  const auth = await requireVerifiedClinicianOrAdmin(
+    sql,
+    rawUserId,
+    "purging an imaging artifact under retention policy",
+  );
+  return purgeImagingArtifact(sql, auth.userId, data.objectId, data.reason);
+}
+
+export const deleteImagingArtifact = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { objectId: string; reason: string }) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executePurgeImagingArtifact(sql, context.userId, data);
+  });
+
+export async function executeGetHistoricalFindingImagingEvidence(
+  sql: Sql,
+  rawUserId: string,
+  findingVersionId: string,
+) {
+  const userId = requireAuthenticatedUser(rawUserId);
+  return getHistoricalFindingImagingEvidence(sql, userId, findingVersionId);
+}
+
+export const getFindingImagingEvidence = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((findingVersionId: string) => findingVersionId)
+  .handler(async ({ context, data: findingVersionId }) => {
+    const sql = await getSql();
+    return executeGetHistoricalFindingImagingEvidence(sql, context.userId, findingVersionId);
+  });
+
+/**
+ * Retrieve complete longitudinal comparison provenance for a correspondence record (Task 2E):
+ * - Source and target examinations (`fromStudy`, `toStudy`, `fromSeries`, `toSeries`)
+ * - Original finding references and full version measurements (`fromVersion`, `toVersion`)
+ * - Registration information and quality metrics (`registration`)
+ * - Matching confidence, physical distance, and uncertainty (`correspondence`)
+ * - Discrepancy attribution explanation (`discrepancies`)
+ * - Clinician review decisions, review dates, reviewer identities, and immutable audit history (`decisions`, `reviews`, `auditHistory`)
+ */
+export async function executeGetLongitudinalComparisonProvenance(
+  sql: Sql,
+  rawUserId: string,
+  correspondenceId: string,
+) {
+  const userId = requireAuthenticatedUser(rawUserId);
+  const corrRows = await sql<Record<string, unknown>>`
+    select * from correspondences where id = ${correspondenceId} and user_id = ${userId}
+  `;
+  if (!corrRows.length) {
+    throw new Error("Longitudinal correspondence not found or access denied.");
+  }
+  const correspondence = corrRows[0];
+  const patientId = correspondence.patient_id as string;
+  await requirePatientRecordAccess(sql, userId, patientId, "view longitudinal comparison provenance");
+
+  const fromVersionId = correspondence.from_version_id as string | null;
+  const toVersionId = correspondence.to_version_id as string | null;
+
+  const fromEvidence = fromVersionId
+    ? await getHistoricalFindingImagingEvidence(sql, userId, fromVersionId).catch(() => null)
+    : null;
+  const toEvidence = toVersionId
+    ? await getHistoricalFindingImagingEvidence(sql, userId, toVersionId).catch(() => null)
+    : null;
+
+  const regId = correspondence.registration_id as string | null;
+  const regRows = regId
+    ? await sql<Record<string, unknown>>`
+        select * from registrations where id = ${regId} and user_id = ${userId}
+      `.catch(() => [])
+    : [];
+
+  const decisions = await sql<Record<string, unknown>>`
+    select * from correspondence_decisions
+    where correspondence_id = ${correspondenceId} and user_id = ${userId}
+    order by created_at desc
+  `.catch(() => []);
+
+  const reviews = await sql<Record<string, unknown>>`
+    select * from reviews
+    where target_type = 'correspondence' and target_id = ${correspondenceId} and user_id = ${userId}
+    order by created_at desc
+  `.catch(() => []);
+
+  const discrepancies =
+    fromVersionId && toVersionId
+      ? await sql<Record<string, unknown>>`
+          select * from discrepancies
+          where user_id = ${userId}
+            and patient_id = ${patientId}
+            and ((left_ref = ${fromVersionId} and right_ref = ${toVersionId})
+              or (left_ref = ${toVersionId} and right_ref = ${fromVersionId}))
+          order by created_at desc
+        `.catch(() => [])
+      : [];
+
+  const auditHistory = await sql<Record<string, unknown>>`
+    select * from audit_events
+    where user_id = ${userId} and entity_id = ${correspondenceId}
+    order by at desc
+  `.catch(() => []);
+
+  return {
+    correspondence,
+    sourceExamination: fromEvidence
+      ? {
+          study: fromEvidence.study,
+          series: fromEvidence.series,
+          finding: fromEvidence.finding,
+          findingVersion: fromEvidence.findingVersion,
+          segmentationRun: fromEvidence.segmentationRun,
+          sourceDicomObjects: fromEvidence.sourceDicomObjects,
+          maskObjects: fromEvidence.maskObjects,
+          integritySummary: fromEvidence.integritySummary,
+        }
+      : null,
+    targetExamination: toEvidence
+      ? {
+          study: toEvidence.study,
+          series: toEvidence.series,
+          finding: toEvidence.finding,
+          findingVersion: toEvidence.findingVersion,
+          segmentationRun: toEvidence.segmentationRun,
+          sourceDicomObjects: toEvidence.sourceDicomObjects,
+          maskObjects: toEvidence.maskObjects,
+          integritySummary: toEvidence.integritySummary,
+        }
+      : null,
+    registration: regRows[0] ?? null,
+    discrepancies,
+    clinicianDecisions: decisions,
+    clinicianReviews: reviews,
+    auditHistory,
+  };
+}
+
+export const getLongitudinalComparisonProvenance = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((correspondenceId: string) => correspondenceId)
+  .handler(async ({ context, data: correspondenceId }) => {
+    const sql = await getSql();
+    return executeGetLongitudinalComparisonProvenance(sql, context.userId, correspondenceId);
   });
