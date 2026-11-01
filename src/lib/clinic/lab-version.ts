@@ -38,12 +38,48 @@ export type LabVersionInput = {
 
 const num = (v: unknown) => Number(v ?? 0);
 
+async function enforceVerifiedClinicianIfProfileExists(sql: Sql, userId: string): Promise<void> {
+  if (!userId || typeof userId !== "string" || !userId.trim()) {
+    throw new Error("Unauthorized: Authentication is required.");
+  }
+  const profileRows = await sql<{ role: string }>`select role from profiles where user_id = ${userId}`.catch(() => []);
+  if (profileRows.length === 0) return;
+  const role = profileRows[0].role;
+  if (role === "admin") return;
+  if (role !== "clinician") {
+    throw new Error("Unauthorized: Recording a measurement is a clinician action.");
+  }
+  const verifRows = await sql<{ status: string; licence_no: string; registry: string }>`
+    select status, licence_no, registry
+    from clinician_verifications
+    where user_id = ${userId}
+    order by coalesce(decided_at, requested_at) desc, requested_at desc, id desc
+    limit 1
+  `.catch(() => []);
+  const v = verifRows[0];
+  const approved =
+    Boolean(v) &&
+    (v.status === "verified" || v.status === "approved") &&
+    String(v.licence_no ?? "").trim().length > 0 &&
+    String(v.registry ?? "").trim().length > 0;
+  if (!approved) {
+    throw new Error(
+      `Unauthorized: Clinician verification is not approved (status: ${v?.status ?? "unverified"}). A role string alone does not authorize clinical operations.`,
+    );
+  }
+}
+
 /** Appends version N+1 for a finding from a Volume lab measurement. Never updates or deletes an earlier row. */
 export async function insertLabVersion(sql: Sql, userId: string, data: LabVersionInput): Promise<string> {
+  if (!userId || typeof userId !== "string" || !userId.trim()) {
+    throw new Error("Unauthorized: Authentication is required.");
+  }
   const found = await sql<Record<string, unknown>>`select * from finding_versions
     where finding_id = ${data.findingId} and user_id = ${userId} order by version_no desc limit 1`;
   const current = found[0];
   if (!current) throw new Error("Finding not found.");
+
+  await enforceVerifiedClinicianIfProfileExists(sql, userId);
 
   let targetStudyId = current.study_id as string;
   let targetSeriesId = data.seriesId ?? null;

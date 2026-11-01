@@ -30,6 +30,37 @@ function isIsoDate(s: string): boolean {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 
+async function enforceVerifiedClinicianIfProfileExists(sql: Sql, userId: string, actionLabel: string): Promise<void> {
+  if (!userId || typeof userId !== "string" || !userId.trim()) {
+    throw new Error("Unauthorized: Authentication is required.");
+  }
+  const profileRows = await sql<{ role: string }>`select role from profiles where user_id = ${userId}`.catch(() => []);
+  if (profileRows.length === 0) return;
+  const role = profileRows[0].role;
+  if (role === "admin") return;
+  if (role !== "clinician") {
+    throw new Error(`Unauthorized: ${actionLabel} is a clinician action.`);
+  }
+  const verifRows = await sql<{ status: string; licence_no: string; registry: string }>`
+    select status, licence_no, registry
+    from clinician_verifications
+    where user_id = ${userId}
+    order by coalesce(decided_at, requested_at) desc, requested_at desc, id desc
+    limit 1
+  `.catch(() => []);
+  const v = verifRows[0];
+  const approved =
+    Boolean(v) &&
+    (v.status === "verified" || v.status === "approved") &&
+    String(v.licence_no ?? "").trim().length > 0 &&
+    String(v.registry ?? "").trim().length > 0;
+  if (!approved) {
+    throw new Error(
+      `Unauthorized: Clinician verification is not approved (status: ${v?.status ?? "unverified"}). A role string alone does not authorize ${actionLabel.toLowerCase()}.`,
+    );
+  }
+}
+
 export function validateIngest(input: IngestInput): IngestInput {
   if (!input.patientId) throw new Error("Choose a record.");
   if (!["txt", "docx", "pdf"].includes(input.fileKind)) throw new Error("Only TXT, DOCX and PDF reports are accepted.");
@@ -52,6 +83,10 @@ export function validateIngest(input: IngestInput): IngestInput {
 }
 
 export async function ingestReport(sql: Sql, userId: string, raw: IngestInput): Promise<IngestResult> {
+  if (!userId || typeof userId !== "string" || !userId.trim()) {
+    throw new Error("Unauthorized: Authentication is required.");
+  }
+  await enforceVerifiedClinicianIfProfileExists(sql, userId, "Report upload");
   const input = validateIngest(raw);
   const owned = await sql<{ id: string }>`select id from patients where id = ${input.patientId} and user_id = ${userId}`;
   if (!owned.length) throw new Error("Record not found.");
@@ -91,6 +126,9 @@ export type QuoteLinkInput = { findingVersionId: string; reportId: string; start
  * It never edits the version itself.
  */
 export async function linkReportQuote(sql: Sql, userId: string, input: QuoteLinkInput): Promise<string> {
+  if (!userId || typeof userId !== "string" || !userId.trim()) {
+    throw new Error("Unauthorized: Authentication is required.");
+  }
   const note = String(input.note ?? "").trim().slice(0, 400);
   const v = await sql<{ id: string; patient_id: string }>`
     select fv.id, f.patient_id from finding_versions fv join findings f on f.id = fv.finding_id
@@ -101,6 +139,9 @@ export async function linkReportQuote(sql: Sql, userId: string, input: QuoteLink
     where r.id = ${input.reportId} and r.user_id = ${userId}`;
   if (!r[0]) throw new Error("Report not found.");
   if (r[0].patient_id !== v[0].patient_id) throw new Error("The report and the finding belong to different records. Not linked.");
+
+  await enforceVerifiedClinicianIfProfileExists(sql, userId, "Linking evidence");
+
   if (!quoteMatches(r[0].body, input.start, input.end, input.quote)) {
     throw new Error("The quote does not match the stored report text at those positions. Nothing was linked.");
   }

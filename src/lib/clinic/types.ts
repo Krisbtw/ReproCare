@@ -67,6 +67,7 @@ export type VersionRow = {
   version_no: number;
   previous_version_id: string | null;
   study_id: string;
+  series_id?: string | null;
   observed_on: string;
   location_label: string;
   figo: string | null;
@@ -139,6 +140,12 @@ export type CorrespondenceRow = {
   to_version_id: string | null;
   from_study_id: string | null;
   to_study_id: string | null;
+  from_series_id?: string | null;
+  to_series_id?: string | null;
+  registration_id?: string | null;
+  registration_status?: string | null;
+  registration_ncc?: number | null;
+  registration_residual_mm?: number | null;
   category: string;
   score: number | null;
   rationale: string;
@@ -230,13 +237,21 @@ export type ExtractionRow = {
 
 export type ModelRow = { id: string; name: string; status: string; note: string };
 
+export type ClinicianVerificationStatus =
+  | "pending"
+  | "verified"
+  | "approved"
+  | "rejected"
+  | "suspended"
+  | "revoked";
+
 export type ClinicianVerificationRow = {
   id: string;
   user_id: string;
   licence_no: string;
   registry: string;
   evidence_note: string;
-  status: "pending" | "verified" | "revoked";
+  status: ClinicianVerificationStatus;
   decided_by: string | null;
   decided_at: string | null;
   reason: string;
@@ -249,12 +264,16 @@ export type RegistrationRow = {
   id: string;
   user_id: string;
   patient_id: string;
+  fixed_study_id?: string | null;
+  moving_study_id?: string | null;
   fixed_series_id: string;
   moving_series_id: string;
   ncc_score: number;
   residual_mm: number;
   transform_matrix_json: string;
   status: "verified" | "unverified" | "failed";
+  quality_note?: string;
+  matrix_valid?: boolean;
   created_at: string;
 };
 
@@ -292,7 +311,15 @@ export type PcosAssessmentItem = {
 };
 
 export type Workspace = {
-  profile: { user_id: string; display_name: string; role: string; active_patient_id: string | null };
+  profile: {
+    user_id: string;
+    display_name: string;
+    role: string;
+    stored_role?: string;
+    verification_status?: string;
+    is_verified_clinician?: boolean;
+    active_patient_id: string | null;
+  };
   patients: PatientRow[];
   studies: StudyRow[];
   series: SeriesRow[];

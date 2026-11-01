@@ -1,164 +1,106 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import type { Sql } from "../db.ts";
 import { insertLabVersion } from "./lab-version.ts";
+import { executeExplainPlain } from "./plain.ts";
+import { requireClinicianOrAdmin as requireProxyClinicianOrAdmin } from "../../routes/api/-imaging-proxy.ts";
+import { updateMenarcheYear } from "./menarche.ts";
+import { ingestReport, linkReportQuote } from "../reports/store.ts";
+import {
+  storeImagingArtifact,
+  getImagingArtifact,
+  listImagingArtifacts,
+} from "../imaging/storage.server.ts";
+import {
+  resolveUserAuthorization,
+  requireAuthenticatedUser,
+  requireVerifiedClinicianOrAdmin,
+  requireAdmin,
+  requirePatientRecordAccess,
+  executeGetWorkspace,
+  executeSetRole,
+  executePromoteUser,
+  executeRequestClinicianVerification,
+  executeVerifyClinician,
+  executeSetActivePatient,
+  executeAddSymptom,
+  executeAddCycle,
+  executeAddLab,
+  executeSetMenarcheYear,
+  executeCorrectVersion,
+  executeSaveLabMeasurement,
+  executeAddReview,
+  executeDecideCorrespondence,
+  executeSaveDicomMeta,
+  executeSaveVolumeRegistration,
+  executeUploadReport,
+  executeLinkReportEvidence,
+  executeExportRecord,
+  executeSaveEndometriosisRecord,
+  executeGetEndometriosisRecords,
+  executeSaveOvarianCystRecord,
+  executeGetOvarianCystRecords,
+  executeSavePcosAssessment,
+  executeGetPcosAssessments,
+} from "./server.ts";
+
+const MIGRATION_FILES = [
+  new URL("../../../migrations/0002_anatomybridge.sql", import.meta.url),
+  new URL("../../../migrations/0003_append_only.sql", import.meta.url),
+  new URL("../../../migrations/0004_menarche_year.sql", import.meta.url),
+  new URL("../../../migrations/0005_report_ingestion.sql", import.meta.url),
+  new URL("../../../migrations/0007_fix_profile_default.sql", import.meta.url),
+  new URL("../../../migrations/0008_clinician_verification.sql", import.meta.url),
+  new URL("../../../migrations/0009_imaging_and_provenance.sql", import.meta.url),
+  new URL("../../../migrations/0010_sprint1_auth_and_registration.sql", import.meta.url),
+];
+
+const COMBINED_MIGRATION_SQL = MIGRATION_FILES.map((file) => readFileSync(file, "utf8")).join("\n");
 
 async function makeDb(): Promise<{ pg: PGlite; sql: Sql }> {
   const pg = new PGlite();
-  await pg.exec(`
-    create table if not exists profiles (
-      user_id text primary key,
-      display_name text not null default '',
-      role text not null default 'patient' check (role in ('patient', 'clinician', 'admin')),
-      active_patient_id text,
-      created_at timestamptz not null default now()
-    );
-    create table if not exists patients (
-      id text primary key,
-      user_id text not null,
-      code text not null,
-      display_name text not null,
-      year_of_birth integer,
-      pathway text not null,
-      synopsis text not null,
-      is_self boolean not null default false,
-      synthetic boolean not null default true
-    );
-    create table if not exists studies (
-      id text primary key,
-      user_id text not null,
-      patient_id text not null references patients (id) on delete cascade,
-      modality text not null,
-      study_date date not null,
-      description text not null,
-      accession text not null,
-      synthetic boolean not null default true,
-      source_note text not null
-    );
-    create table if not exists series (
-      id text primary key,
-      user_id text not null,
-      study_id text not null references studies (id) on delete cascade,
-      series_number integer not null,
-      description text not null,
-      plane text,
-      slice_thickness_mm double precision,
-      pixel_spacing_mm text,
-      slice_count integer,
-      quality text not null default 'adequate'
-    );
-    create table if not exists findings (
-      id text primary key,
-      user_id text not null,
-      patient_id text not null references patients (id) on delete cascade,
-      code text not null,
-      structure text not null,
-      organ text not null,
-      pathway text not null
-    );
-    create table if not exists finding_versions (
-      id text primary key,
-      user_id text not null,
-      finding_id text not null references findings (id) on delete cascade,
-      version_no integer not null,
-      previous_version_id text,
-      study_id text not null references studies (id) on delete cascade,
-      observed_on date not null,
-      location_label text not null,
-      figo text,
-      centroid_mm text,
-      axes_mm text,
-      longest_mm double precision,
-      measurement_basis text not null,
-      frame text not null,
-      segmentation_source text not null,
-      model_id text,
-      quality text not null default 'adequate',
-      modality text not null,
-      report_longest_mm double precision,
-      change_reason text not null,
-      created_at timestamptz not null default now(),
-      unique (finding_id, version_no)
-    );
-    create table if not exists evidence_links (
-      id text primary key,
-      user_id text not null,
-      finding_version_id text not null references finding_versions (id) on delete cascade,
-      kind text not null,
-      study_id text references studies (id) on delete cascade,
-      series_id text,
-      report_id text,
-      quote text,
-      slice_index integer,
-      note text not null,
-      created_at timestamptz not null default now()
-    );
-    create table if not exists correspondences (
-      id text primary key,
-      user_id text not null,
-      patient_id text not null references patients (id) on delete cascade,
-      from_version_id text not null references finding_versions (id) on delete cascade,
-      to_version_id text not null references finding_versions (id) on delete cascade,
-      category text not null,
-      score double precision not null,
-      rationale text not null,
-      provisional boolean not null default true,
-      engine_version text not null,
-      created_at timestamptz not null default now()
-    );
-    create table if not exists discrepancies (
-      id text primary key,
-      user_id text not null,
-      patient_id text not null references patients (id) on delete cascade,
-      category text not null,
-      summary text not null,
-      detail text not null,
-      left_ref text not null,
-      right_ref text not null,
-      engine_version text not null,
-      active boolean not null default true,
-      created_at timestamptz not null default now()
-    );
-    create table if not exists reviews (
-      id text primary key,
-      user_id text not null,
-      target_type text not null,
-      target_id text not null,
-      status text not null,
-      note text not null,
-      created_at timestamptz not null default now()
-    );
-    create table if not exists clinician_verifications (
-      id text primary key,
-      user_id text not null references profiles (user_id) on delete cascade,
-      licence_no text not null default '',
-      registry text not null default '',
-      evidence_note text not null default '',
-      status text not null default 'pending' check (status in ('pending', 'verified', 'revoked')),
-      decided_by text references profiles (user_id) on delete set null,
-      decided_at timestamptz,
-      reason text not null default '',
-      requested_at timestamptz not null default now()
-    );
-
+  await pg.exec(COMBINED_MIGRATION_SQL + `\n
     insert into profiles (user_id, display_name, role) values ('patient_user', 'Patient Self', 'patient');
-    insert into profiles (user_id, display_name, role) values ('clinician_user', 'Dr Clinician', 'clinician');
+    insert into profiles (user_id, display_name, role) values ('unverified_clinician', 'Dr Unverified', 'clinician');
+    insert into profiles (user_id, display_name, role) values ('pending_clinician', 'Dr Pending', 'clinician');
+    insert into profiles (user_id, display_name, role) values ('approved_clinician', 'Dr Approved', 'clinician');
+    insert into profiles (user_id, display_name, role) values ('rejected_clinician', 'Dr Rejected', 'clinician');
+    insert into profiles (user_id, display_name, role) values ('suspended_clinician', 'Dr Suspended', 'clinician');
+    insert into profiles (user_id, display_name, role) values ('revoked_clinician', 'Dr Revoked', 'clinician');
     insert into profiles (user_id, display_name, role) values ('admin_user', 'Administrator', 'admin');
 
+    insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status)
+      values ('v_pending', 'pending_clinician', 'LIC-PEND', 'GMC', 'Pending check', 'pending');
+    insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status, decided_by, decided_at, reason)
+      values ('v_approved', 'approved_clinician', 'LIC-APP', 'GMC', 'Verified OB/GYN', 'approved', 'admin_user', now(), 'Approved');
+    insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status, decided_by, decided_at, reason)
+      values ('v_rejected', 'rejected_clinician', 'LIC-REJ', 'GMC', 'Invalid number', 'rejected', 'admin_user', now(), 'Registry mismatch');
+    insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status, decided_by, decided_at, reason)
+      values ('v_suspended', 'suspended_clinician', 'LIC-SUSP', 'GMC', 'Audit hold', 'suspended', 'admin_user', now(), 'Suspended pending audit');
+    insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status, decided_by, decided_at, reason)
+      values ('v_revoked', 'revoked_clinician', 'LIC-REV', 'GMC', 'Expired', 'revoked', 'admin_user', now(), 'Expired licence');
+
     insert into patients (id, user_id, code, display_name, year_of_birth, pathway, synopsis, is_self)
-      values ('p_clin', 'clinician_user', 'P01', 'Meera Patel', 1989, 'fibroids', 'Demo record', false);
+      values ('p_clin', 'approved_clinician', 'P01', 'Meera Patel', 1989, 'fibroids', 'Demo record', false);
     insert into patients (id, user_id, code, display_name, year_of_birth, pathway, synopsis, is_self)
       values ('p_pat_self', 'patient_user', 'P02', 'Self Patient', 1992, 'fibroids', 'Self record', true);
     insert into patients (id, user_id, code, display_name, year_of_birth, pathway, synopsis, is_self)
       values ('p_pat_other', 'patient_user', 'P03', 'Other Patient', 1985, 'fibroids', 'Other record', false);
 
     insert into studies (id, user_id, patient_id, modality, study_date, description, accession, source_note)
-      values ('s_clin', 'clinician_user', 'p_clin', 'MR', '2026-01-01', 'Initial MRI', 'ACC-01', 'Synthetic');
+      values ('s_clin', 'approved_clinician', 'p_clin', 'MR', '2026-01-01', 'Initial MRI', 'ACC-01', 'Synthetic');
+    insert into series (id, user_id, study_id, series_number, description, plane, slice_thickness_mm, pixel_spacing_mm, slice_count)
+      values ('ser_clin_1', 'approved_clinician', 's_clin', 1, 'T2 Sagittal', 'sagittal', 3.0, '0.7\\0.7', 32);
+    insert into series (id, user_id, study_id, series_number, description, plane, slice_thickness_mm, pixel_spacing_mm, slice_count)
+      values ('ser_clin_2', 'approved_clinician', 's_clin', 2, 'T2 Axial', 'axial', 3.0, '0.7\\0.7', 32);
     insert into findings (id, user_id, patient_id, code, structure, organ, pathway)
-      values ('f_clin', 'clinician_user', 'p_clin', 'F1', 'fibroid', 'uterus', 'fibroids');
+      values ('f_clin', 'approved_clinician', 'p_clin', 'F1', 'fibroid', 'uterus', 'fibroids');
     insert into finding_versions (id, user_id, finding_id, version_no, study_id, observed_on, location_label, figo, axes_mm, longest_mm, measurement_basis, frame, segmentation_source, change_reason, modality)
-      values ('v_clin', 'clinician_user', 'f_clin', 1, 's_clin', '2026-01-01', 'FIGO 4', '4', '[30,20,15]', 30, 'seeded', 'schematic', 'demo', 'initial', 'MR');
+      values ('v_clin', 'approved_clinician', 'f_clin', 1, 's_clin', '2026-01-01', 'FIGO 4', '4', '[30,20,15]', 30, 'seeded', 'schematic', 'demo', 'initial', 'MR');
+    insert into correspondences (id, user_id, patient_id, from_version_id, to_version_id, category, score, rationale, provisional, engine_version)
+      values ('c_clin', 'approved_clinician', 'p_clin', 'v_clin', 'v_clin', 'uncertain', 0.5, 'Seeded', true, 'reprotrace-rules-0.2');
   `);
 
   const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
@@ -173,209 +115,773 @@ async function makeDb(): Promise<{ pg: PGlite; sql: Sql }> {
   return { pg, sql };
 }
 
-test("RBAC: Patient cannot escalate to clinician or admin", async () => {
+test("RBAC 1: Unauthenticated users are rejected across all protected operations", async () => {
   const { sql } = await makeDb();
-  async function testRoleEscalation(userId: string, targetRole: string) {
-    const rows = await sql<{ role: string }>`select role from profiles where user_id = ${userId}`;
-    const current = rows[0]?.role;
-    if (current === "patient" && (targetRole === "clinician" || targetRole === "admin")) {
-      throw new Error("Unauthorized: Role escalation is not permitted. Only an administrator can assign clinician or admin roles.");
-    }
-    if (current === "clinician" && targetRole === "admin") {
-      throw new Error("Unauthorized: Clinicians cannot self-escalate to administrator.");
-    }
-    await sql`update profiles set role = ${targetRole} where user_id = ${userId}`;
-  }
 
-  await assert.rejects(
-    () => testRoleEscalation("patient_user", "clinician"),
-    /Unauthorized: Role escalation is not permitted/
+  assert.throws(
+    () => requireAuthenticatedUser(null),
+    /Unauthorized: Authentication is required/,
+  );
+  assert.throws(
+    () => requireAuthenticatedUser("   "),
+    /Unauthorized: Authentication is required/,
   );
   await assert.rejects(
-    () => testRoleEscalation("patient_user", "admin"),
-    /Unauthorized: Role escalation is not permitted/
+    () => requireVerifiedClinicianOrAdmin(sql, null as unknown as string),
+    /Unauthorized: Authentication is required/,
   );
   await assert.rejects(
-    () => testRoleEscalation("clinician_user", "admin"),
-    /Unauthorized: Clinicians cannot self-escalate to administrator/
+    () => requireAdmin(sql, undefined as unknown as string),
+    /Unauthorized: Authentication is required/,
   );
 });
 
-test("RBAC: Cross-tenant ownership protection enforces data isolation", async () => {
-  const { sql } = await makeDb();
-  // Patient user tries to record finding measurement on clinician's finding
+test("RBAC 2: Role string alone is never sufficient to establish clinician verification", async () => {
+  const { sql, pg } = await makeDb();
+
+  // unverified_clinician has role='clinician' in profiles, but NO record in clinician_verifications
+  const unverifiedAuth = await resolveUserAuthorization(sql, "unverified_clinician");
+  assert.equal(unverifiedAuth.role, "clinician");
+  assert.equal(unverifiedAuth.verificationStatus, "unverified");
+  assert.equal(unverifiedAuth.isVerifiedClinician, false);
+  assert.equal(unverifiedAuth.effectiveRole, "patient");
+
+  await assert.rejects(
+    () => requireVerifiedClinicianOrAdmin(sql, "unverified_clinician"),
+    /status: unverified/,
+  );
+
+  // Even direct DB-level helpers reject unverified_clinician
+  await pg.exec(`
+    insert into patients (id, user_id, code, display_name, year_of_birth, pathway, synopsis, is_self)
+      values ('p_unver', 'unverified_clinician', 'PU', 'Unverified Pat', 1990, 'fibroids', 'Test', false);
+    insert into studies (id, user_id, patient_id, modality, study_date, description, accession, source_note)
+      values ('s_unver', 'unverified_clinician', 'p_unver', 'MR', '2026-01-01', 'MRI', 'ACC-U', 'Seed');
+    insert into findings (id, user_id, patient_id, code, structure, organ, pathway)
+      values ('f_unver', 'unverified_clinician', 'p_unver', 'FU1', 'fibroid', 'uterus', 'fibroids');
+    insert into finding_versions (id, user_id, finding_id, version_no, study_id, observed_on, location_label, figo, axes_mm, longest_mm, measurement_basis, frame, segmentation_source, change_reason, modality)
+      values ('v_unver', 'unverified_clinician', 'f_unver', 1, 's_unver', '2026-01-01', 'FIGO 4', '4', '[20,15,10]', 20, 'seeded', 'schematic', 'demo', 'initial', 'MR');
+  `);
+
   await assert.rejects(
     () =>
-      insertLabVersion(sql, "patient_user", {
-        findingId: "f_clin",
-        axes: [35, 25, 20],
-        longest: 35,
-        sliceIndex: 10,
-        reason: "Unauthorized measurement attempt",
-        evidenceNote: "evidence",
+      insertLabVersion(sql, "unverified_clinician", {
+        findingId: "f_unver",
+        axes: [25, 20, 15],
+        longest: 25,
+        sliceIndex: 4,
+        reason: "Attempted measurement without verification",
+        evidenceNote: "note",
       }),
-    /Finding not found/
+    /Clinician verification is not approved/,
+  );
+
+  await assert.rejects(
+    () =>
+      ingestReport(sql, "unverified_clinician", {
+        patientId: "p_unver",
+        studyId: null,
+        newStudy: { modality: "MR", date: "2026-02-01", description: "Pelvic MRI" },
+        fileName: "report.txt",
+        fileKind: "txt",
+        sha256: "a".repeat(64),
+        text: "Uterus measures 80 x 50 x 40 mm with a 30 mm intramural fibroid.",
+        warnings: [],
+      }),
+    /Clinician verification is not approved/,
   );
 });
 
-test("RBAC: Patient can only modify their own self-patient record", async () => {
+test("RBAC 3: Verification statuses (pending, approved, verified, rejected, suspended, revoked) are strictly enforced", async () => {
   const { sql } = await makeDb();
-  async function checkPatientAccess(userId: string, patientId: string) {
-    const roleRows = await sql<{ role: string }>`select role from profiles where user_id = ${userId}`;
-    const role = roleRows[0]?.role;
-    const patientRows = await sql<{ id: string; is_self: boolean }>`select id, is_self from patients where id = ${patientId} and user_id = ${userId}`;
-    if (!patientRows.length) throw new Error("Record not found.");
-    if (role === "patient" && !patientRows[0].is_self) {
-      throw new Error("Patient view can modify only your own record.");
-    }
-    return true;
+
+  // Pending clinician -> rejected
+  await assert.rejects(
+    () => requireVerifiedClinicianOrAdmin(sql, "pending_clinician"),
+    /status: pending/,
+  );
+
+  // Rejected clinician -> rejected
+  await assert.rejects(
+    () => requireVerifiedClinicianOrAdmin(sql, "rejected_clinician"),
+    /status: rejected/,
+  );
+
+  // Suspended clinician -> rejected
+  await assert.rejects(
+    () => requireVerifiedClinicianOrAdmin(sql, "suspended_clinician"),
+    /status: suspended/,
+  );
+
+  // Revoked clinician -> rejected
+  await assert.rejects(
+    () => requireVerifiedClinicianOrAdmin(sql, "revoked_clinician"),
+    /status: revoked/,
+  );
+
+  // Approved clinician -> allowed
+  const approvedAuth = await requireVerifiedClinicianOrAdmin(sql, "approved_clinician");
+  assert.equal(approvedAuth.isVerifiedClinician, true);
+
+  // Verified status -> allowed
+  await sql`update clinician_verifications set status = 'verified' where id = 'v_approved'`;
+  const verifiedAuth = await requireVerifiedClinicianOrAdmin(sql, "approved_clinician");
+  assert.equal(verifiedAuth.isVerifiedClinician, true);
+
+  // Administrator -> allowed
+  const adminAuth = await requireVerifiedClinicianOrAdmin(sql, "admin_user");
+  assert.equal(adminAuth.isAdmin, true);
+});
+
+test("RBAC 4: promoteUser cannot bypass the clinician verification workflow", async () => {
+  const { sql } = await makeDb();
+
+  // Patient or clinician cannot call promoteUser
+  await assert.rejects(
+    () =>
+      executePromoteUser(sql, "patient_user", {
+        targetUserId: "patient_user",
+        newRole: "clinician",
+      }),
+    /Only administrators/,
+  );
+  await assert.rejects(
+    () =>
+      executePromoteUser(sql, "approved_clinician", {
+        targetUserId: "patient_user",
+        newRole: "clinician",
+      }),
+    /Only administrators/,
+  );
+
+  // Even an administrator CANNOT promote an unverified, pending, rejected, suspended, or revoked user to 'clinician' via promoteUser!
+  for (const target of [
+    "patient_user",
+    "unverified_clinician",
+    "pending_clinician",
+    "rejected_clinician",
+    "suspended_clinician",
+    "revoked_clinician",
+  ]) {
+    await assert.rejects(
+      () =>
+        executePromoteUser(sql, "admin_user", {
+          targetUserId: target,
+          newRole: "clinician",
+        }),
+      /Verification workflow required/,
+    );
   }
 
-  // Permitted on self record
-  assert.equal(await checkPatientAccess("patient_user", "p_pat_self"), true);
-  // Refused on another patient record
-  await assert.rejects(
-    () => checkPatientAccess("patient_user", "p_pat_other"),
-    /Patient view can modify only your own record/
-  );
-  // Refused on record owned by other user
-  await assert.rejects(
-    () => checkPatientAccess("patient_user", "p_clin"),
-    /Record not found/
-  );
+  // Once the user submits verification and admin approves it via executeVerifyClinician, promoteUser to clinician succeeds
+  const reqRes = await executeRequestClinicianVerification(sql, "patient_user", {
+    licenceNo: "GMC-998877",
+    registry: "GMC",
+    evidenceNote: "Board certified",
+  });
+  await executeVerifyClinician(sql, "admin_user", {
+    verificationId: reqRes.verificationId,
+    decision: "approved",
+    reason: "Confirmed in GMC register",
+  });
+
+  // Admin can demote to patient and then re-promote to clinician because approved verification exists
+  await executePromoteUser(sql, "admin_user", {
+    targetUserId: "patient_user",
+    newRole: "patient",
+  });
+  const promoted = await executePromoteUser(sql, "admin_user", {
+    targetUserId: "patient_user",
+    newRole: "clinician",
+  });
+  assert.equal(promoted.newRole, "clinician");
+
+  // Reset patient_user back to patient for subsequent tests
+  await executeVerifyClinician(sql, "admin_user", {
+    verificationId: reqRes.verificationId,
+    decision: "revoked",
+    reason: "Test cleanup",
+  });
 });
 
-test("RBAC: New profile without explicit role defaults to patient role", async () => {
-  const { sql } = await makeDb();
-  await sql`insert into profiles (user_id, display_name) values ('fresh_user', 'Fresh Newbie')`;
-  const rows = await sql<{ role: string }>`select role from profiles where user_id = 'fresh_user'`;
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].role, "patient");
-});
-
-test("RBAC: Positive allowlist blocks non-clinicians and non-admins from clinician actions", async () => {
+test("RBAC 5: Only administrators can approve, reject, suspend, or revoke clinician verification, and audit records are created", async () => {
   const { sql } = await makeDb();
 
-  function enforceClinicianOrAdmin(role: string) {
-    if (role !== "clinician" && role !== "admin") {
-      throw new Error("Unauthorized: Clinician or administrator privileges required.");
+  // Non-admins cannot call executeVerifyClinician for any decision
+  for (const caller of ["patient_user", "unverified_clinician", "pending_clinician", "approved_clinician", "revoked_clinician"]) {
+    for (const decision of ["approved", "verified", "rejected", "suspended", "revoked"] as const) {
+      await assert.rejects(
+        () =>
+          executeVerifyClinician(sql, caller, {
+            verificationId: "v_pending",
+            decision,
+            reason: "Attempted unauthorized verification decision",
+          }),
+        /Only administrators/,
+      );
     }
-    return true;
   }
 
-  // Allowed
-  assert.equal(enforceClinicianOrAdmin("clinician"), true);
-  assert.equal(enforceClinicianOrAdmin("admin"), true);
+  // Admin approves pending_clinician -> status='approved', role='clinician', audit recorded
+  const approveRes = await executeVerifyClinician(sql, "admin_user", {
+    verificationId: "v_pending",
+    decision: "approved",
+    reason: "Licence verified with GMC",
+  });
+  assert.equal(approveRes.decision, "approved");
+  assert.equal(approveRes.newRole, "clinician");
+  const afterApprove = await requireVerifiedClinicianOrAdmin(sql, "pending_clinician");
+  assert.equal(afterApprove.isVerifiedClinician, true);
 
-  // Denied
-  assert.throws(() => enforceClinicianOrAdmin("patient"), /Unauthorized/);
-  assert.throws(() => enforceClinicianOrAdmin("researcher"), /Unauthorized/);
-  assert.throws(() => enforceClinicianOrAdmin("unverified"), /Unauthorized/);
-});
-
-test("RBAC: Administrator-controlled clinician verification (promoteUser)", async () => {
-  const { sql } = await makeDb();
-
-  async function testPromoteUser(callerId: string, targetId: string, newRole: string) {
-    const callerRows = await sql<{ role: string }>`select role from profiles where user_id = ${callerId}`;
-    const callerRole = callerRows[0]?.role;
-    if (callerRole !== "admin") {
-      throw new Error("Unauthorized: Only administrators can assign roles to other users.");
-    }
-    if (newRole !== "patient" && newRole !== "clinician" && newRole !== "admin") {
-      throw new Error("Invalid target role: must be patient, clinician, or admin.");
-    }
-    const targetRows = await sql`select role from profiles where user_id = ${targetId}`;
-    if (!targetRows.length) {
-      throw new Error("Target user profile not found.");
-    }
-    await sql`update profiles set role = ${newRole} where user_id = ${targetId}`;
-    return true;
-  }
-
-  // Patient caller cannot promote
+  // Admin suspends pending_clinician -> immediately loses access, role='patient', audit recorded
+  const suspendRes = await executeVerifyClinician(sql, "admin_user", {
+    verificationId: "v_pending",
+    decision: "suspended",
+    reason: "Temporary credential suspension",
+  });
+  assert.equal(suspendRes.decision, "suspended");
+  assert.equal(suspendRes.newRole, "patient");
   await assert.rejects(
-    () => testPromoteUser("patient_user", "patient_user", "clinician"),
-    /Unauthorized: Only administrators can assign roles to other users/
+    () => requireVerifiedClinicianOrAdmin(sql, "pending_clinician"),
+    /status: suspended/,
   );
 
-  // Clinician caller cannot promote
+  // Admin reinstates with 'verified' -> regains access
+  await executeVerifyClinician(sql, "admin_user", {
+    verificationId: "v_pending",
+    decision: "verified",
+    reason: "Suspension lifted",
+  });
+  const afterReinstate = await requireVerifiedClinicianOrAdmin(sql, "pending_clinician");
+  assert.equal(afterReinstate.isVerifiedClinician, true);
+
+  // Admin rejects -> loses access immediately
+  await executeVerifyClinician(sql, "admin_user", {
+    verificationId: "v_pending",
+    decision: "rejected",
+    reason: "Rejected on secondary review",
+  });
   await assert.rejects(
-    () => testPromoteUser("clinician_user", "patient_user", "clinician"),
-    /Unauthorized: Only administrators can assign roles to other users/
+    () => requireVerifiedClinicianOrAdmin(sql, "pending_clinician"),
+    /status: rejected/,
   );
 
-  // Admin caller can promote patient to clinician
-  assert.equal(await testPromoteUser("admin_user", "patient_user", "clinician"), true);
-  const updated = await sql<{ role: string }>`select role from profiles where user_id = 'patient_user'`;
-  assert.equal(updated[0].role, "clinician");
+  // Admin revokes -> loses access immediately
+  await executeVerifyClinician(sql, "admin_user", {
+    verificationId: "v_pending",
+    decision: "revoked",
+    reason: "Credentials revoked",
+  });
+  await assert.rejects(
+    () => requireVerifiedClinicianOrAdmin(sql, "pending_clinician"),
+    /status: revoked/,
+  );
 
-  // Admin caller can demote or set back to patient
-  assert.equal(await testPromoteUser("admin_user", "patient_user", "patient"), true);
-  const reverted = await sql<{ role: string }>`select role from profiles where user_id = 'patient_user'`;
-  assert.equal(reverted[0].role, "patient");
-});
-
-test("RBAC: Clinician verification workflow (request, approve, revoke, last admin guard)", async () => {
-  const { sql } = await makeDb();
-
-  // 1. Patient requests verification
-  const vId = "verif_1";
-  await sql`
-    insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status)
-    values (${vId}, 'patient_user', 'MED-12345', 'GMC', 'Certified OB/GYN', 'pending')
+  // Verify audit trail captured every verification transition
+  const audits = await sql<{ action: string; detail: string }>`
+    select action, detail from audit_events
+    where entity_id = 'v_pending'
+    order by at asc
   `;
-  const vRows = await sql<{ status: string }>`select status from clinician_verifications where id = ${vId}`;
-  assert.equal(vRows[0].status, "pending");
+  const actions = audits.map((a) => a.action);
+  assert.ok(actions.includes("verify_clinician"));
+  assert.ok(actions.includes("suspend_clinician"));
+  assert.ok(actions.includes("reject_clinician"));
+  assert.ok(actions.includes("revoke_clinician"));
+  assert.equal(audits.length, 5);
+});
 
-  // 2. Non-admin cannot approve
-  async function testVerifyClinician(callerId: string, verificationId: string, decision: "verified" | "revoked", reason: string) {
-    const callerRows = await sql<{ role: string }>`select role from profiles where user_id = ${callerId}`;
-    if (callerRows[0]?.role !== "admin") {
-      throw new Error("Unauthorized: Only administrators can approve or revoke clinician verifications.");
-    }
-    const verif = await sql<{ user_id: string }>`select user_id from clinician_verifications where id = ${verificationId}`;
-    const targetUserId = verif[0].user_id;
+test("RBAC 6: Revoked clinicians immediately lose privileged access even if profiles.role is tampered with", async () => {
+  const { sql } = await makeDb();
 
-    if (decision === "revoked") {
-      const targetRole = (await sql<{ role: string }>`select role from profiles where user_id = ${targetUserId}`)[0]?.role;
-      if (targetRole === "admin") {
-        const adminCount = (await sql<{ count: number }>`select count(*)::int as count from profiles where role = 'admin'`)[0]?.count;
-        if (Number(adminCount) <= 1) {
-          throw new Error("Action rejected: Cannot revoke or demote the last remaining administrator.");
-        }
-      }
-    }
+  // Initially approved_clinician can perform clinician operations
+  const editRes = await executeCorrectVersion(sql, "approved_clinician", {
+    versionId: "v_clin",
+    axes: [32, 22, 16],
+    reason: "Verified clinician measurement update",
+  });
+  assert.ok(editRes.id);
 
-    const newRole = decision === "verified" ? "clinician" : "patient";
-    await sql`update clinician_verifications set status = ${decision}, decided_by = ${callerId}, decided_at = now(), reason = ${reason} where id = ${verificationId}`;
-    await sql`update profiles set role = ${newRole} where user_id = ${targetUserId}`;
-    return true;
-  }
+  // Admin revokes approved_clinician
+  await executeVerifyClinician(sql, "admin_user", {
+    verificationId: "v_approved",
+    decision: "revoked",
+    reason: "Revoked immediately",
+  });
 
-  // Patient cannot verify
+  // Even if profiles.role were somehow still 'clinician', all clinician operations immediately fail
+  await sql`update profiles set role = 'clinician' where user_id = 'approved_clinician'`;
+
   await assert.rejects(
-    () => testVerifyClinician("patient_user", vId, "verified", "self verify"),
-    /Unauthorized: Only administrators can approve or revoke clinician verifications/
+    () =>
+      executeCorrectVersion(sql, "approved_clinician", {
+        versionId: "v_clin",
+        axes: [34, 24, 18],
+        reason: "Post-revocation attempt",
+      }),
+    /status: revoked/,
   );
 
-  // Admin approves verification -> role becomes clinician
-  assert.equal(await testVerifyClinician("admin_user", vId, "verified", "Credentials confirmed with registry"), true);
-  const pRows = await sql<{ role: string }>`select role from profiles where user_id = 'patient_user'`;
-  assert.equal(pRows[0].role, "clinician");
+  await assert.rejects(
+    () =>
+      executeSaveLabMeasurement(sql, "approved_clinician", {
+        findingId: "f_clin",
+        axes: [34, 24, 18],
+        longest: 34,
+        sliceIndex: 5,
+        reason: "Post-revocation lab measurement",
+        evidenceNote: "Evidence",
+      }),
+    /status: revoked/,
+  );
 
-  // Admin revokes verification -> role drops back to patient immediately
-  assert.equal(await testVerifyClinician("admin_user", vId, "revoked", "Licence expired"), true);
-  const revRows = await sql<{ role: string }>`select role from profiles where user_id = 'patient_user'`;
-  assert.equal(revRows[0].role, "patient");
+  await assert.rejects(
+    () =>
+      executeAddReview(sql, "approved_clinician", {
+        targetType: "finding_version",
+        targetId: "v_clin",
+        status: "verified",
+        note: "Post-revocation review",
+      }),
+    /status: revoked/,
+  );
 
-  // Guard: Cannot revoke the last administrator
+  await assert.rejects(
+    () =>
+      executeDecideCorrespondence(sql, "approved_clinician", {
+        correspondenceId: "c_clin",
+        decision: "accept",
+        note: "Post-revocation decision",
+      }),
+    /status: revoked/,
+  );
+
+  // Restore approved_clinician for subsequent tests
+  await executeVerifyClinician(sql, "admin_user", {
+    verificationId: "v_approved",
+    decision: "approved",
+    reason: "Restored for subsequent tests",
+  });
+});
+
+test("RBAC 7: Direct API bypass attempts on all clinician-restricted endpoints are blocked for patient, unverified, pending, rejected, suspended, and revoked accounts", async () => {
+  const { sql } = await makeDb();
+
+  const unauthorizedUsers = [
+    "patient_user",
+    "unverified_clinician",
+    "pending_clinician",
+    "rejected_clinician",
+    "suspended_clinician",
+    "revoked_clinician",
+  ];
+
+  for (const uid of unauthorizedUsers) {
+    // Role escalation attempt via setRole
+    await assert.rejects(
+      () => executeSetRole(sql, uid, "clinician"),
+      /Unauthorized/,
+    );
+    await assert.rejects(
+      () => executeSetRole(sql, uid, "admin"),
+      /Unauthorized/,
+    );
+
+    // Direct API calls to clinician endpoints
+    await assert.rejects(
+      () =>
+        executeCorrectVersion(sql, uid, {
+          versionId: "v_clin",
+          axes: [30, 20, 15],
+          reason: "Bypass attempt",
+        }),
+      /Unauthorized/,
+    );
+
+    await assert.rejects(
+      () =>
+        executeSaveLabMeasurement(sql, uid, {
+          findingId: "f_clin",
+          axes: [30, 20, 15],
+          longest: 30,
+          sliceIndex: 1,
+          reason: "Bypass attempt",
+          evidenceNote: "Bypass",
+        }),
+      /Unauthorized/,
+    );
+
+    await assert.rejects(
+      () =>
+        executeAddReview(sql, uid, {
+          targetType: "finding_version",
+          targetId: "v_clin",
+          status: "verified",
+          note: "Bypass attempt",
+        }),
+      /Unauthorized/,
+    );
+
+    await assert.rejects(
+      () =>
+        executeDecideCorrespondence(sql, uid, {
+          correspondenceId: "c_clin",
+          decision: "accept",
+          note: "Bypass attempt",
+        }),
+      /Unauthorized/,
+    );
+
+    await assert.rejects(
+      () =>
+        executeSaveVolumeRegistration(sql, uid, {
+          patientId: "p_clin",
+          fixedSeriesId: "ser_clin_1",
+          movingSeriesId: "ser_clin_2",
+          matrix: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+          nccScore: 0.9,
+          residualMm: 1.2,
+          status: "verified",
+        }),
+      /Unauthorized/,
+    );
+
+    await assert.rejects(
+      () =>
+        executeUploadReport(sql, uid, {
+          patientId: "p_clin",
+          studyId: "s_clin",
+          newStudy: null,
+          fileName: "bypass.txt",
+          fileKind: "txt",
+          sha256: "b".repeat(64),
+          text: "Bypass report text over twenty chars.",
+          warnings: [],
+        }),
+      /Unauthorized/,
+    );
+
+    await assert.rejects(
+      () =>
+        executeSaveEndometriosisRecord(sql, uid, {
+          patientId: "p_clin",
+          lesionSites: ["Uterosacral"],
+          surgicalHistory: "None",
+          stagingRASRM: "Stage I",
+          imagingNote: "Note",
+        }),
+      /Unauthorized/,
+    );
+
+    await assert.rejects(
+      () =>
+        executeSaveOvarianCystRecord(sql, uid, {
+          patientId: "p_clin",
+          laterality: "left",
+          maxDiameterMm: 25,
+          featuresText: "Simple",
+          clinicalNote: "Note",
+        }),
+      /Unauthorized/,
+    );
+
+    await assert.rejects(
+      () =>
+        executeSavePcosAssessment(sql, uid, {
+          patientId: "p_clin",
+          cycleIrregularity: true,
+          hyperandrogenismClinical: true,
+          hyperandrogenismBiochemical: false,
+          ultrasoundOrAmhFeatures: false,
+          notes: "Note",
+        }),
+      /Unauthorized/,
+    );
+  }
+});
+
+test("RBAC 8: Patients cannot access or modify another patient's records on the backend or database", async () => {
+  const { sql, pg } = await makeDb();
+
+  // Add findings and clinical records on both p_pat_self and p_pat_other under patient_user
+  await pg.exec(`
+    insert into findings (id, user_id, patient_id, code, structure, organ, pathway)
+      values ('f_self', 'patient_user', 'p_pat_self', 'FS1', 'fibroid', 'uterus', 'fibroids');
+    insert into findings (id, user_id, patient_id, code, structure, organ, pathway)
+      values ('f_other', 'patient_user', 'p_pat_other', 'FO1', 'fibroid', 'uterus', 'fibroids');
+    insert into symptoms (id, user_id, patient_id, recorded_on, region, intensity, description, source)
+      values ('sym_self', 'patient_user', 'p_pat_self', '2026-01-01', 'Deep pelvis', 4, 'Self symptom', 'patient_reported');
+    insert into symptoms (id, user_id, patient_id, recorded_on, region, intensity, description, source)
+      values ('sym_other', 'patient_user', 'p_pat_other', '2026-01-01', 'Deep pelvis', 8, 'Other patient confidential symptom', 'patient_reported');
+  `);
+
+  // 1. executeGetWorkspace for patient_user must ONLY return p_pat_self and its records, never p_pat_other
+  const ws = await executeGetWorkspace(sql, "patient_user");
+  assert.equal(ws.patients.length, 1);
+  assert.equal(ws.patients[0].id, "p_pat_self");
+  assert.equal(ws.findings.length, 1);
+  assert.equal(ws.findings[0].id, "f_self");
+  assert.equal(ws.symptoms.length, 1);
+  assert.equal(ws.symptoms[0].id, "sym_self");
+  assert.ok(ws.verifications.every((v) => v.user_id === "patient_user"));
+
+  // 2. Patient can modify their own record (p_pat_self)
+  await executeSetActivePatient(sql, "patient_user", "p_pat_self");
+  await executeAddSymptom(sql, "patient_user", {
+    patientId: "p_pat_self",
+    region: "Low back",
+    intensity: 3,
+    cycleDay: 5,
+    description: "Mild ache",
+    recordedOn: "2026-02-01",
+  });
+  await executeAddCycle(sql, "patient_user", {
+    patientId: "p_pat_self",
+    startDate: "2026-02-01",
+    lengthDays: 29,
+    flow: "moderate",
+    note: "Regular",
+  });
+  await executeAddLab(sql, "patient_user", {
+    patientId: "p_pat_self",
+    observedOn: "2026-02-01",
+    analyte: "Hb",
+    valueText: "12.5",
+    unit: "g/dL",
+    referenceText: "12-16",
+  });
+  await executeSetMenarcheYear(sql, "patient_user", {
+    patientId: "p_pat_self",
+    menarcheYear: 2005,
+    reason: "Self-reported menarche year",
+  });
+  const selfExport = await executeExportRecord(sql, "patient_user", "p_pat_self");
+  assert.equal((selfExport.patient as { id: string }).id, "p_pat_self");
+
+  // 3. Patient CANNOT access or modify p_pat_other (non-self record in same workspace) or p_clin (other user's record)
+  for (const forbiddenPid of ["p_pat_other", "p_clin"]) {
+    await assert.rejects(
+      () => requirePatientRecordAccess(sql, "patient_user", forbiddenPid, "read"),
+      /Unauthorized|Record not found/,
+    );
+    await assert.rejects(
+      () => executeSetActivePatient(sql, "patient_user", forbiddenPid),
+      /Unauthorized|Record not found/,
+    );
+    await assert.rejects(
+      () =>
+        executeAddSymptom(sql, "patient_user", {
+          patientId: forbiddenPid,
+          region: "Low back",
+          intensity: 5,
+          cycleDay: null,
+          description: "Unauthorized write",
+          recordedOn: "2026-02-01",
+        }),
+      /Unauthorized|Record not found/,
+    );
+    await assert.rejects(
+      () =>
+        executeAddCycle(sql, "patient_user", {
+          patientId: forbiddenPid,
+          startDate: "2026-02-01",
+          lengthDays: 28,
+          flow: "heavy",
+          note: "Unauthorized write",
+        }),
+      /Unauthorized|Record not found/,
+    );
+    await assert.rejects(
+      () =>
+        executeAddLab(sql, "patient_user", {
+          patientId: forbiddenPid,
+          observedOn: "2026-02-01",
+          analyte: "FSH",
+          valueText: "6.1",
+          unit: "IU/L",
+          referenceText: "3-10",
+        }),
+      /Unauthorized|Record not found/,
+    );
+    await assert.rejects(
+      () =>
+        executeSetMenarcheYear(sql, "patient_user", {
+          patientId: forbiddenPid,
+          menarcheYear: 2000,
+          reason: "Unauthorized menarche update",
+        }),
+      /Unauthorized|Record not found/,
+    );
+    await assert.rejects(
+      () =>
+        updateMenarcheYear(sql, "patient_user", {
+          patientId: forbiddenPid,
+          menarcheYear: 2000,
+          reason: "Direct DB helper bypass attempt",
+        }),
+      /Unauthorized|Record not found/,
+    );
+    await assert.rejects(
+      () => executeExportRecord(sql, "patient_user", forbiddenPid),
+      /Unauthorized|Record not found/,
+    );
+    await assert.rejects(
+      () =>
+        executeSaveDicomMeta(sql, "patient_user", {
+          patientId: forbiddenPid,
+          fileName: "scan.dcm",
+          transferSyntax: "1.2.840.10008.1.2.1",
+          metadata: { Modality: "MR" },
+          warnings: [],
+        }),
+      /Unauthorized|Record not found/,
+    );
+    await assert.rejects(
+      () => executeGetEndometriosisRecords(sql, "patient_user", forbiddenPid),
+      /Unauthorized|Record not found/,
+    );
+    await assert.rejects(
+      () => executeGetOvarianCystRecords(sql, "patient_user", forbiddenPid),
+      /Unauthorized|Record not found/,
+    );
+    await assert.rejects(
+      () => executeGetPcosAssessments(sql, "patient_user", forbiddenPid),
+      /Unauthorized|Record not found/,
+    );
+  }
+});
+
+test("RBAC 9: Imaging storage and report store enforce clinician verification and patient isolation", async () => {
+  const { sql } = await makeDb();
+
+  // Patient or unverified clinician cannot store imaging artifacts
+  await assert.rejects(
+    () =>
+      storeImagingArtifact(sql, {
+        userId: "patient_user",
+        patientId: "p_pat_self",
+        kind: "mask",
+        mimeType: "application/octet-stream",
+        filename: "mask.bin",
+        data: new Uint8Array([1, 2, 3, 4]),
+      }),
+    /Unauthorized/,
+  );
+
   await sql`
-    insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status)
-    values ('verif_admin', 'admin_user', 'ADMIN-01', 'REG', 'Admin credentials', 'verified')
+    insert into patients (id, user_id, code, display_name, year_of_birth, pathway, synopsis, is_self)
+      values ('p_unver_img', 'unverified_clinician', 'PUI', 'Unverified Img Pat', 1990, 'fibroids', 'Test', false)
   `;
   await assert.rejects(
-    () => testVerifyClinician("admin_user", "verif_admin", "revoked", "Demote sole admin"),
-    /Cannot revoke or demote the last remaining administrator/
+    () =>
+      storeImagingArtifact(sql, {
+        userId: "unverified_clinician",
+        patientId: "p_unver_img",
+        kind: "mask",
+        mimeType: "application/octet-stream",
+        filename: "mask.bin",
+        data: new Uint8Array([1, 2, 3, 4]),
+      }),
+    /Unauthorized/,
   );
+
+  // Approved clinician can store and retrieve imaging artifact on their patient
+  const stored = await storeImagingArtifact(sql, {
+    userId: "approved_clinician",
+    patientId: "p_clin",
+    studyId: "s_clin",
+    seriesId: "ser_clin_1",
+    kind: "mask",
+    mimeType: "application/octet-stream",
+    filename: "mask.bin",
+    data: new Uint8Array([10, 20, 30, 40]),
+  });
+  assert.ok(stored.id);
+
+  const fetched = await getImagingArtifact(sql, "approved_clinician", stored.id);
+  assert.ok(fetched);
+  assert.equal(fetched.data.byteLength, 4);
+
+  // Patient cannot list or fetch clinician's artifact or non-self patient artifacts
+  await assert.rejects(
+    () => listImagingArtifacts(sql, "patient_user", "p_pat_other"),
+    /Unauthorized/,
+  );
+
+  // Approved clinician can ingest and link report
+  const bodyText = "Pelvic MRI reveals a FIGO 4 intramural fibroid measuring 30 mm in the anterior wall.";
+  const rep = await ingestReport(sql, "approved_clinician", {
+    patientId: "p_clin",
+    studyId: "s_clin",
+    newStudy: null,
+    fileName: "mri-report.txt",
+    fileKind: "txt",
+    sha256: "c".repeat(64),
+    text: bodyText,
+    warnings: [],
+  });
+  assert.ok(rep.reportId);
+
+  const quote = "FIGO 4 intramural fibroid measuring 30 mm";
+  const start = bodyText.indexOf(quote);
+  const linkId = await linkReportQuote(sql, "approved_clinician", {
+    reportId: rep.reportId,
+    findingVersionId: "v_clin",
+    start,
+    end: start + quote.length,
+    quote,
+    note: "Verified quote link",
+  });
+  assert.ok(linkId);
+});
+
+test("RBAC 10: Imaging proxy and plain-language endpoints enforce identical clinician verification rules", async () => {
+  const { sql } = await makeDb();
+
+  // Unauthenticated
+  await assert.rejects(
+    () => requireProxyClinicianOrAdmin("" as string, sql),
+    /Unauthorized/,
+  );
+
+  // Patient, unverified, pending, rejected, suspended, and revoked accounts are blocked on both imaging proxy and explainPlain
+  for (const uid of [
+    "patient_user",
+    "unverified_clinician",
+    "pending_clinician",
+    "rejected_clinician",
+    "suspended_clinician",
+    "revoked_clinician",
+  ]) {
+    await assert.rejects(
+      () => requireProxyClinicianOrAdmin(uid, sql),
+      /Unauthorized/,
+    );
+    await assert.rejects(
+      () =>
+        executeExplainPlain(sql, uid, {
+          structure: "fibroid",
+          location: "FIGO 4",
+          quote: "",
+          measurement: "30 mm",
+          basis: "three-axis",
+          verified: true,
+        }),
+      /Unauthorized/,
+    );
+  }
+
+  // Approved clinician and administrator are permitted
+  assert.equal(await requireProxyClinicianOrAdmin("approved_clinician", sql), "clinician");
+  assert.equal(await requireProxyClinicianOrAdmin("admin_user", sql), "admin");
+
+  const plainRes = await executeExplainPlain(sql, "approved_clinician", {
+    structure: "fibroid",
+    location: "FIGO 4",
+    quote: "",
+    measurement: "30 mm",
+    basis: "three-axis",
+    verified: true,
+  });
+  assert.equal(plainRes.available, true);
 });

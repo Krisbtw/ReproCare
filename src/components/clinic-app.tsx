@@ -214,7 +214,15 @@ export function ClinicApp() {
 
   const patients = data.patients as Bag[];
   const role = data.profile?.role ?? "clinician";
-  const visiblePatients = role === "patient" ? patients.filter((p) => p.is_self === true) : patients;
+  const isVerifiedClinician =
+    role === "admin" ||
+    (role === "clinician" &&
+      (data.profile?.is_verified_clinician !== undefined
+        ? Boolean(data.profile.is_verified_clinician)
+        : (data.verifications ?? []).some(
+            (v) => v.user_id === data.profile?.user_id && (v.status === "verified" || v.status === "approved"),
+          )));
+  const visiblePatients = !isVerifiedClinician ? patients.filter((p) => p.is_self === true) : patients;
   const activeId = visiblePatients.some((p) => s(p, "id") === data.profile?.active_patient_id)
     ? data.profile?.active_patient_id
     : s(visiblePatients[0], "id");
@@ -227,7 +235,7 @@ export function ClinicApp() {
           <p className="font-serif text-2xl text-card">AnatomyBridge</p>
           <p className="text-xs text-line">Evidence-linked reproductive review</p>
         </div>
-        {NAV.filter((item) => !(item.id === "lab" && role === "patient")).map((item) => (
+        {NAV.filter((item) => !(item.id === "lab" && !isVerifiedClinician)).map((item) => (
           <button
             key={item.id}
             type="button"
@@ -278,8 +286,8 @@ export function ClinicApp() {
         <div className="space-y-6 p-4 lg:p-6">
           {view === "board" && <Board data={data} patients={visiblePatients} onOpen={(id) => { void run(() => setActivePatient({ data: id })); setView("studio"); }} />}
           {view === "people" && patient && <People data={data} patients={visiblePatients} active={patient} onOpen={(id) => { void run(() => setActivePatient({ data: id })); setView("studio"); }} />}
-          {view === "studio" && patient && <Studio data={data} patient={patient} clinician={role !== "patient"} busy={busy} run={run} />}
-          {labOpened && role !== "patient" && (
+          {view === "studio" && patient && <Studio data={data} patient={patient} clinician={isVerifiedClinician} busy={busy} run={run} />}
+          {labOpened && isVerifiedClinician && (
             <div hidden={view !== "lab"}>
               <VolumeLab
                 patientId={patient ? s(patient, "id") : undefined}
@@ -295,14 +303,14 @@ export function ClinicApp() {
               />
             </div>
           )}
-          {view === "lab" && role === "patient" && (
-            <p className="rounded-lg border border-line bg-card p-4 text-ink-soft">The volume lab is a clinician tool. Switch the lens to Clinician to use it.</p>
+          {view === "lab" && !isVerifiedClinician && (
+            <p className="rounded-lg border border-line bg-card p-4 text-ink-soft">The volume lab is a verified clinician tool. Submit and obtain administrator approval in Admin to use it.</p>
           )}
           {view === "reports" && patient && (
             <ReportsView
               data={data}
               patient={patient}
-              clinician={role !== "patient"}
+              clinician={isVerifiedClinician}
               busy={busy}
               run={run}
               upload={(input) => uploadReport({ data: input })}
@@ -310,8 +318,8 @@ export function ClinicApp() {
             />
           )}
           {view === "course" && patient && <CourseView data={data} patient={patient} onStudio={() => setView("studio")} />}
-          {view === "trace" && patient && <Trace data={data} patient={patient} clinician={role !== "patient"} busy={busy} run={run} />}
-          {view === "context" && patient && <Context data={data} patient={patient} clinician={role !== "patient"} busy={busy} run={run} />}
+          {view === "trace" && patient && <Trace data={data} patient={patient} clinician={isVerifiedClinician} busy={busy} run={run} />}
+          {view === "context" && patient && <Context data={data} patient={patient} clinician={isVerifiedClinician} busy={busy} run={run} />}
           {view === "methods" && <ResearchView />}
           {view === "admin" && <Admin data={data} role={role} busy={busy} run={run} patientId={s(patient, "id")} />}
         </div>
@@ -874,7 +882,12 @@ function Trace({
               </div>
               <p className="text-sm text-ink">{label(s(row, "from_version_id"))} → {label(s(row, "to_version_id"))}</p>
               <p className="text-sm text-ink-soft">{s(row, "rationale")}</p>
-              <p className="text-xs tabular-nums text-muted">Score {num(row, "score") ?? "—"} · {s(row, "engine_version")}</p>
+              <p className="text-xs tabular-nums text-muted">
+                Score {num(row, "score") ?? "—"} · {s(row, "engine_version")}
+                {s(row, "registration_status") ? ` · Reg: ${s(row, "registration_status")}` : ""}
+                {num(row, "registration_ncc") != null ? ` (NCC ${Number(num(row, "registration_ncc")).toFixed(2)})` : ""}
+                {num(row, "registration_residual_mm") != null ? ` · Residual ${Number(num(row, "registration_residual_mm")).toFixed(1)} mm` : ""}
+              </p>
               {clinician && (
                 <div className="flex flex-wrap gap-2">
                   <Button disabled={busy} onClick={() => run(() => decideCorrespondence({ data: { correspondenceId: s(row, "id"), decision: "accept", note: "Clinician agrees the observations correspond. Rows were not merged." } }))}>Accept link</Button>
@@ -1117,7 +1130,7 @@ function Admin({
                     <span className="font-semibold text-ink">
                       {v.display_name || v.user_id} · <span className="font-normal text-ink-soft">Licence: {v.licence_no} ({v.registry})</span>
                     </span>
-                    <Chip tone={v.status === "verified" ? "pine" : v.status === "pending" ? "clay" : "ink"}>
+                    <Chip tone={v.status === "verified" || v.status === "approved" ? "pine" : v.status === "pending" ? "clay" : "ink"}>
                       {v.status}
                     </Chip>
                   </div>
@@ -1125,7 +1138,7 @@ function Admin({
                   {v.reason && <p className="text-xs text-muted">Decision note: {v.reason}</p>}
                   <p className="text-xs text-muted">Requested: {new Date(v.requested_at).toLocaleString()}</p>
                   {v.status === "pending" && (
-                    <div className="flex gap-2 pt-1">
+                    <div className="flex flex-wrap gap-2 pt-1">
                       <Button
                         tone="pine"
                         disabled={busy}
@@ -1142,23 +1155,63 @@ function Admin({
                         tone="clay"
                         disabled={busy}
                         onClick={() => {
-                          const reason = window.prompt("Reason for rejecting/revoking:", "Credential requirements not met");
+                          const reason = window.prompt("Reason for rejecting verification:", "Credential requirements not met");
                           if (reason) {
-                            void run(() => verifyClinician({ data: { verificationId: v.id, decision: "revoked", reason } }));
+                            void run(() => verifyClinician({ data: { verificationId: v.id, decision: "rejected", reason } }));
                           }
                         }}
                       >
-                        Reject / Revoke
+                        Reject
                       </Button>
                     </div>
                   )}
-                  {v.status === "verified" && (
-                    <div className="pt-1">
+                  {(v.status === "verified" || v.status === "approved") && (
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      <Button
+                        tone="ghost"
+                        disabled={busy}
+                        onClick={() => {
+                          const reason = window.prompt("Reason for suspending clinician verification:", "Pending credential re-verification");
+                          if (reason) {
+                            void run(() => verifyClinician({ data: { verificationId: v.id, decision: "suspended", reason } }));
+                          }
+                        }}
+                      >
+                        Suspend
+                      </Button>
                       <Button
                         tone="clay"
                         disabled={busy}
                         onClick={() => {
                           const reason = window.prompt("Reason for revoking clinician verification:", "Annual audit / credential expiration");
+                          if (reason) {
+                            void run(() => verifyClinician({ data: { verificationId: v.id, decision: "revoked", reason } }));
+                          }
+                        }}
+                      >
+                        Revoke credentials
+                      </Button>
+                    </div>
+                  )}
+                  {v.status === "suspended" && (
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      <Button
+                        tone="pine"
+                        disabled={busy}
+                        onClick={() => {
+                          const reason = window.prompt("Reason for reinstating clinician verification:", "Credentials re-verified");
+                          if (reason) {
+                            void run(() => verifyClinician({ data: { verificationId: v.id, decision: "verified", reason } }));
+                          }
+                        }}
+                      >
+                        Approve verification
+                      </Button>
+                      <Button
+                        tone="clay"
+                        disabled={busy}
+                        onClick={() => {
+                          const reason = window.prompt("Reason for revoking clinician verification:", "Credential revocation confirmed");
                           if (reason) {
                             void run(() => verifyClinician({ data: { verificationId: v.id, decision: "revoked", reason } }));
                           }
@@ -1234,7 +1287,7 @@ function ClinicianVerificationForm({
         <div className="rounded-md bg-paper p-3 text-sm">
           <div className="flex items-center justify-between">
             <span className="font-medium text-ink">Credential status: {s(latest, "status").toUpperCase()}</span>
-            <Chip tone={s(latest, "status") === "verified" ? "pine" : s(latest, "status") === "pending" ? "clay" : "ink"}>
+            <Chip tone={s(latest, "status") === "verified" || s(latest, "status") === "approved" ? "pine" : s(latest, "status") === "pending" ? "clay" : "ink"}>
               {s(latest, "status")}
             </Chip>
           </div>
@@ -1244,7 +1297,7 @@ function ClinicianVerificationForm({
           {s(latest, "reason") && <p className="text-xs text-ink-soft mt-1">Review note: {s(latest, "reason")}</p>}
         </div>
       )}
-      {(!latest || s(latest, "status") === "revoked") && (
+      {(!latest || ["revoked", "rejected", "suspended"].includes(s(latest, "status"))) && (
         <form
           className="grid gap-2"
           onSubmit={(e) => {

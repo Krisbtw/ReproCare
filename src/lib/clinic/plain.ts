@@ -1,5 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
-import { authMiddleware } from "@/lib/auth/middleware";
+import { authMiddleware } from "../auth/middleware.ts";
+import { getSql, type Sql } from "../db.ts";
+import { requireVerifiedClinicianOrAdmin } from "./server.ts";
 
 export type PlainResult = {
   available: boolean;
@@ -35,7 +37,9 @@ export const explainPlain = createServerFn({ method: "POST" })
       verified: Boolean(input.verified),
     }),
   )
-  .handler(async ({ data }): Promise<PlainResult> => {
+  .handler(async ({ data, context }): Promise<PlainResult> => {
+    const sql = await getSql();
+    await requireVerifiedClinicianOrAdmin(sql, context.userId, "rewriting clinical excerpts");
     if (!data.quote) {
       return {
         available: true,
@@ -89,3 +93,30 @@ export const explainPlain = createServerFn({ method: "POST" })
       note: "Rewrite from the stored excerpt only. Not a diagnosis, and not a substitute for the report.",
     };
   });
+
+export async function executeExplainPlain(
+  sql: Sql,
+  userId: string,
+  data: {
+    structure: string;
+    location: string;
+    quote: string;
+    measurement: string;
+    basis: string;
+    verified: boolean;
+  },
+): Promise<PlainResult> {
+  await requireVerifiedClinicianOrAdmin(sql, userId, "rewriting clinical excerpts");
+  if (!data.quote || !data.quote.trim()) {
+    return {
+      available: true,
+      text: null,
+      note: "The stored report excerpt is empty, so no rewrite was requested.",
+    };
+  }
+  return {
+    available: false,
+    text: null,
+    note: "A language model is not configured here. The stored excerpt above is the explanation.",
+  };
+}

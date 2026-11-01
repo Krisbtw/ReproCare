@@ -11,13 +11,16 @@
  * to the Python service with the server-held token.
  *
  * SECURITY:
- *   - Only authenticated users with role 'clinician' or 'admin' may invoke inspection or segmentation.
+ *   - Only authenticated users with verified clinician credentials (approved verification status)
+ *     or administrator privileges may invoke imaging proxy endpoints.
+ *   - A role string alone ('clinician') without an approved verification status is rejected.
  *   - Requests are size-limited (max 1000 files, max 64MB total).
  *   - Every invocation is recorded in audit_events.
  */
 import { createServerFn } from "@tanstack/react-start";
-import { authMiddleware } from "@/lib/auth/middleware";
-import { getSql } from "@/lib/db";
+import { authMiddleware } from "../../lib/auth/middleware.ts";
+import { getSql, type Sql } from "../../lib/db.ts";
+import { requireVerifiedClinicianOrAdmin } from "../../lib/clinic/server.ts";
 
 const PROXY_TIMEOUT_MS = 90_000;
 const MAX_PROXY_FILES = 1000;
@@ -47,14 +50,13 @@ function serviceHeaders(): Record<string, string> {
   return h;
 }
 
-async function requireClinicianOrAdmin(userId: string): Promise<string> {
-  const sql = await getSql();
-  const rows = await sql<{ role: string }>`select role from profiles where user_id = ${userId}`;
-  const role = rows[0]?.role ?? "patient";
-  if (role !== "clinician" && role !== "admin") {
-    throw new Error("Forbidden: Imaging inspection and AI segmentation require verified clinician or administrator credentials.");
-  }
-  return role;
+/**
+ * Enforces the unified clinician verification & administrator authorization rules for all imaging proxy operations.
+ */
+export async function requireClinicianOrAdmin(userId: string, sqlOverride?: Sql): Promise<string> {
+  const sql = sqlOverride ?? (await getSql());
+  const auth = await requireVerifiedClinicianOrAdmin(sql, userId, "imaging inspection and AI segmentation");
+  return auth.effectiveRole;
 }
 
 async function auditProxyAction(userId: string, action: string, detail: string) {
@@ -94,10 +96,11 @@ export type ProxyModelStatus = {
   is_learned_model: boolean;
 };
 
-/** List available segmentation models. Allowed for authenticated users. */
+/** List available segmentation models. Requires verified clinician or administrator credentials. */
 export const proxyListModels = createServerFn({ method: "GET" })
   .middleware([authMiddleware])
-  .handler(async () => {
+  .handler(async ({ context }) => {
+    await requireClinicianOrAdmin(context.userId);
     let res: Response;
     try {
       res = await proxyFetch("/models", { method: "GET", headers: serviceHeaders() });
@@ -115,7 +118,7 @@ export const proxyListModels = createServerFn({ method: "GET" })
 /** Proxy type for inspect — accepts serialized FormData entries. */
 export type ProxyFile = { name: string; base64: string };
 
-/** Forward a DICOM series to the Python /series/inspect endpoint. Requires clinician/admin. */
+/** Forward a DICOM series to the Python /series/inspect endpoint. Requires verified clinician/admin. */
 export const proxyInspectSeries = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .validator((input: unknown) => {
@@ -164,7 +167,7 @@ export const proxyInspectSeries = createServerFn({ method: "POST" })
     return text;
   });
 
-/** Forward a DICOM series to the Python /segment/{modelId} endpoint. Requires clinician/admin. */
+/** Forward a DICOM series to the Python /segment/{modelId} endpoint. Requires verified clinician/admin. */
 export const proxySegment = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .validator((input: unknown) => {
@@ -224,7 +227,7 @@ export const proxySegment = createServerFn({ method: "POST" })
     return text;
   });
 
-/** Forward trend calculation request to the Python /trends/calculate endpoint. Requires clinician/admin. */
+/** Forward trend calculation request to the Python /trends/calculate endpoint. Requires verified clinician/admin. */
 export const proxyCalculateTrends = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .validator((input: unknown) => {

@@ -7,7 +7,7 @@ create table if not exists clinician_verifications (
   licence_no text not null default '',
   registry text not null default '',
   evidence_note text not null default '',
-  status text not null default 'pending' check (status in ('pending', 'verified', 'revoked')),
+  status text not null default 'pending' check (status in ('pending', 'verified', 'approved', 'rejected', 'suspended', 'revoked')),
   decided_by text references profiles (user_id) on delete set null,
   decided_at timestamptz,
   reason text not null default '',
@@ -16,4 +16,3 @@ create table if not exists clinician_verifications (
 
 create index if not exists clinician_verifications_status_idx on clinician_verifications (status);
 create index if not exists clinician_verifications_user_idx on clinician_verifications (user_id);
-
