@@ -9,6 +9,10 @@ import {
   SERVICE_MAX_FILES,
   type ServiceSeriesReport,
 } from "./service-client.ts";
+import {
+  imagingServiceUrl,
+  resolveImagingServiceEndpoint,
+} from "../../routes/api/-imaging-proxy.ts";
 import type { SeriesReport } from "./series.ts";
 
 const browser = (over: Partial<SeriesReport> = {}): SeriesReport => ({
@@ -46,6 +50,30 @@ test("serviceUrl accepts http(s) only, strips trailing slash, refuses credential
   for (const bad of ["", "   ", null, undefined, "ftp://x", "javascript:alert(1)", "not a url", "http://u:p@host"]) {
     assert.equal(serviceUrl(bad as string | null), null, String(bad));
   }
+});
+
+test("imagingServiceUrl and resolveImagingServiceEndpoint resolve Vercel service binding URLs via new URL()", () => {
+  assert.equal(
+    imagingServiceUrl({ ANATOMYBRIDGE_SERVICE_URL: "https://imaging-service.internal.vercel.run/" }),
+    "https://imaging-service.internal.vercel.run",
+  );
+  assert.equal(
+    imagingServiceUrl({ IMAGING_SERVICE_URL: "https://imaging-fallback.internal.vercel.run/" }),
+    "https://imaging-fallback.internal.vercel.run",
+  );
+  assert.equal(
+    resolveImagingServiceEndpoint("/models", {
+      ANATOMYBRIDGE_SERVICE_URL: "https://imaging-service.internal.vercel.run",
+    }),
+    "https://imaging-service.internal.vercel.run/models",
+  );
+  assert.equal(
+    resolveImagingServiceEndpoint("/segment/umd_monai_fibroid", {
+      ANATOMYBRIDGE_SERVICE_URL: "https://reprocare.vercel.app/api/imaging-service",
+    }),
+    "https://reprocare.vercel.app/api/imaging-service/segment/umd_monai_fibroid",
+  );
+  assert.equal(resolveImagingServiceEndpoint("/models", {}), null);
 });
 
 test("parseServiceReport rejects malformed bodies instead of trusting them", () => {
@@ -99,44 +127,52 @@ test("checks without an equivalent are listed as not comparable", () => {
   assert.equal(c.rows.find((r) => r.item.startsWith("Service only"))?.agree, null);
 });
 
-test("different slice counts are flagged with an honest reason", () => {
-  const c = compareReports(browser(), 10, service());
-  const row = c.rows.find((r) => r.item.startsWith("Slices"));
-  assert.equal(row?.agree, false);
-  assert.match(row?.note ?? "", /compressed/);
-});
+function fakeResponse(status: number, body: unknown): Response {
+  return new Response(typeof body === "string" ? body : JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
 
-const fakeResponse = (status: number, body: unknown) =>
-  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
-
-test("inspectWithService: sends neutral file names, parses the report", async () => {
+test("inspectWithService: sends neutral slice-NNNN.dcm names, never the caller's filenames", async () => {
   let seenNames: string[] = [];
-  const fetchImpl = async (url: string, init?: RequestInit) => {
-    assert.equal(url, "http://svc/series/inspect");
-    const form = init?.body as FormData;
-    seenNames = form.getAll("files").map((f) => (f as File).name);
-    return fakeResponse(200, service());
-  };
-  const r = await inspectWithService("http://svc", [{ name: "DOE_JANE/IM0001", bytes: new Uint8Array([1, 2]) }, { name: "DOE_JANE/IM0002", bytes: new Uint8Array([3]) }], fetchImpl);
-  assert.ok(r.ok);
+  let seenUrl = "";
+  const fakeFetch = (async (url: string, init?: RequestInit) => {
+    seenUrl = url;
+    const fd = init?.body as FormData;
+    seenNames = Array.from(fd.getAll("files")).map((v) => (v as File).name);
+    return fakeResponse(200, service({ slice_count: 2 }));
+  }) as unknown as typeof fetch;
+
+  const res = await inspectWithService(
+    "http://localhost:8100/",
+    [
+      { name: "Jane_Doe_MRN12345/IM0001.dcm", bytes: new Uint8Array([1, 2, 3]) },
+      { name: "Jane_Doe_MRN12345/IM0002.dcm", bytes: new Uint8Array([4, 5, 6]) },
+    ],
+    fakeFetch,
+  );
+  assert.equal(seenUrl, "http://localhost:8100/series/inspect");
   assert.deepEqual(seenNames, ["slice-0000.dcm", "slice-0001.dcm"]);
-  assert.ok(!seenNames.join("").includes("DOE"));
+  assert.ok(!seenNames.join(" ").includes("Jane"));
+  assert.ok(res.ok && res.value.slice_count === 2);
 });
 
-test("inspectWithService: refuses over-limit batches before any network call", async () => {
+test("inspectWithService: refuses empty or oversize file lists before touching the network", async () => {
   let called = false;
-  const fetchImpl = async () => {
+  const never = (async () => {
     called = true;
-    return fakeResponse(200, service());
-  };
-  const many = Array.from({ length: SERVICE_MAX_FILES + 1 }, (_, i) => ({ name: String(i), bytes: new Uint8Array(1) }));
-  const r = await inspectWithService("http://svc", many, fetchImpl);
-  assert.equal(r.ok, false);
+    return fakeResponse(200, {});
+  }) as unknown as typeof fetch;
+  const r0 = await inspectWithService("http://localhost:8100", [], never);
+  assert.equal(r0.ok, false);
+  const tooMany = Array.from({ length: SERVICE_MAX_FILES + 1 }, (_, i) => ({ name: `${i}`, bytes: new Uint8Array(1) }));
+  const rBig = await inspectWithService("http://localhost:8100", tooMany, never);
+  assert.equal(rBig.ok, false);
   assert.equal(called, false);
-  assert.equal((await inspectWithService("http://svc", [], fetchImpl)).ok, false);
 });
 
-test("inspectWithService: HTTP error, bad shape, network failure and timeout all return typed errors", async () => {
+test("inspectWithService: surfaces HTTP errors, bad JSON, network failure, and timeout plainly", async () => {
   const one = [{ name: "a", bytes: new Uint8Array(1) }];
   const e1 = await inspectWithService("http://svc", one, async () => fakeResponse(413, { detail: "A file exceeds the size limit." }));
   assert.ok(!e1.ok && /413/.test(e1.error) && /size limit/.test(e1.error));

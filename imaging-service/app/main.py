@@ -69,9 +69,25 @@ if _ORIGINS:
         max_age=86400,
     )
 
+# Optional Vercel Services path-rewrite prefix normalization:
+# When `imaging-service` is invoked via an internal Vercel Service Binding, requests arrive at root paths
+# (`/health`, `/models`, `/series/inspect`, `/segment/{model_id}`). If a top-level Vercel rewrite prefix
+# such as `/api/imaging-service/(.*)` is configured, Vercel passes the full matched path through as-is;
+# stripping the prefix here allows both internal binding calls and prefixed rewrite calls to hit the same routes.
+_SERVICE_REWRITE_PREFIX = os.environ.get(
+    "ANATOMYBRIDGE_ROUTE_PREFIX", "/api/imaging-service"
+).rstrip("/")
+
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
+    path = request.scope.get("path", "")
+    if _SERVICE_REWRITE_PREFIX and (
+        path == _SERVICE_REWRITE_PREFIX or path.startswith(_SERVICE_REWRITE_PREFIX + "/")
+    ):
+        stripped = path[len(_SERVICE_REWRITE_PREFIX) :] or "/"
+        request.scope["root_path"] = request.scope.get("root_path", "") + _SERVICE_REWRITE_PREFIX
+        request.scope["path"] = stripped
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"

@@ -1,3 +1,32 @@
 {
-  "installCommand": "npm install --omit=dev --no-audit --no-fund"
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "app": {
+      "root": ".",
+      "framework": "nitro",
+      "installCommand": "npm ci",
+      "buildCommand": "npm run build",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "imaging-service",
+          "format": "url",
+          "env": "ANATOMYBRIDGE_SERVICE_URL"
+        }
+      ]
+    },
+    "imaging-service": {
+      "root": "imaging-service",
+      "framework": "fastapi",
+      "entrypoint": "app/main.py"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "app"
+      }
+    }
+  ]
 }

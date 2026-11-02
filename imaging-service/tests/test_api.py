@@ -94,3 +94,18 @@ def test_openapi_lists_the_routes():
     paths = client.get("/openapi.json").json()["paths"]
     for p in ("/health", "/models", "/series/inspect", "/metrics/score", "/segment/{model_id}"):
         assert p in paths
+
+
+def test_vercel_rewrite_prefix_routes_match_identically():
+    r_health = client.get("/api/imaging-service/health")
+    assert r_health.status_code == 200
+    assert r_health.json()["service"] == "anatomybridge-imaging"
+
+    r_models = client.get("/api/imaging-service/models")
+    assert r_models.status_code == 200
+    assert isinstance(r_models.json(), list)
+    assert any(m["id"] == "umd_monai_fibroid" for m in r_models.json())
+
+    r_inspect = client.post("/api/imaging-service/series/inspect", files=files(make_series(n=4)))
+    assert r_inspect.status_code == 200
+    assert r_inspect.json()["volume_ready"] is True
