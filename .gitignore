@@ -17,3 +17,6 @@ __pycache__/
 .pytest_cache/
 
 .venv/
+
+# Local test imaging cache and temporary test data
+.data/

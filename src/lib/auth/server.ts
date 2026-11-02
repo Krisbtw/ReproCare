@@ -33,7 +33,7 @@ import { betterAuth } from "better-auth";
 import { bearer, genericOAuth } from "better-auth/plugins";
 import { tanstackStartCookies } from "better-auth/tanstack-start";
 import { getCookie } from "@tanstack/react-start/server";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { Pool } from "pg";
 import { ensureDbReady, getPglite } from "../db";
 import { emailAndPasswordEnabled } from "./email-password";
@@ -60,6 +60,14 @@ const globalAuthRef = globalThis as typeof globalThis & {
   __grokAuthPreviewSecret__?: string;
 };
 function previewAuthSecret(): string {
+  if (process.env.BETTER_AUTH_SECRET) return process.env.BETTER_AUTH_SECRET.trim();
+  const fallbackSeed =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.DATABASE_URL ||
+    process.env.ANATOMYBRIDGE_SERVICE_API_KEY;
+  if (fallbackSeed) {
+    return createHash("sha256").update(`better-auth-secret-seed:${fallbackSeed}`).digest("hex");
+  }
   globalAuthRef.__grokAuthPreviewSecret__ ??= randomBytes(32).toString("hex");
   return globalAuthRef.__grokAuthPreviewSecret__;
 }
@@ -92,38 +100,64 @@ export const authConfigured =
 // preview allowlist, which makes the OAuth `redirect_uri` the concrete preview URL
 // the broker's preview client accepts.
 const explicitBaseURL = env("BETTER_AUTH_URL");
+const vercelHost = env("VERCEL_URL") || env("VERCEL_PROJECT_PRODUCTION_URL");
+const vercelOrigin = vercelHost
+  ? (vercelHost.startsWith("http://") || vercelHost.startsWith("https://")
+      ? vercelHost
+      : `https://${vercelHost}`)
+  : undefined;
+
 // Explicit `string[]` (not a readonly tuple) — Better Auth's DynamicBaseURLConfig
 // requires a mutable `allowedHosts: string[]`.
 const previewAllowedHosts: string[] = [...PREVIEW_ALLOWED_HOSTS];
-// Local `npm run dev` (port 8080 contract). Browsers may send Origin as any of
+
+// Local `npm run dev` and preview ports. Browsers may send Origin as any of
 // these for the same server — trusting only `localhost` rejects `127.0.0.1` and
 // breaks email/password with "Invalid origin".
 const LOCAL_DEV_ORIGINS: string[] = [
   "http://localhost:8080",
   "http://127.0.0.1:8080",
   "http://[::1]:8080",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:*",
+  "http://127.0.0.1:*",
 ];
+
+const extraCorsOrigins = (env("ANATOMYBRIDGE_CORS_ORIGINS") || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter((s) => Boolean(s) && s !== "*");
+
+const ALL_ALLOWED_HOSTS: string[] = [
+  ...previewAllowedHosts,
+  "*.vercel.app",
+  "localhost",
+  "127.0.0.1",
+  "[::1]",
+  ...(vercelHost ? [vercelHost.replace(/^https?:\/\//, "")] : []),
+];
+
 const baseURL = explicitBaseURL ?? {
-  // Include loopback hosts so dynamic baseURL resolves for local email/password
-  // (not only the preview wildcard).
-  allowedHosts: [...previewAllowedHosts, "localhost", "127.0.0.1", "[::1]"],
-  // `auto` → trust both http:// and https:// expansions of allowedHosts
-  // (preview is https; local dev is http).
+  allowedHosts: ALL_ALLOWED_HOSTS,
   protocol: "auto" as const,
-  fallback: "http://localhost:8080",
+  fallback: vercelOrigin ?? "http://localhost:8080",
 };
 
 // Origins Better Auth accepts on credentialed POSTs (sign-up/sign-in, etc.).
 // Missing entries here surface as FORBIDDEN "Invalid origin".
-const trustedOrigins: string[] = explicitBaseURL
-  ? [explicitBaseURL, ...LOCAL_DEV_ORIGINS]
-  : [
-      // Host wildcards (matched against Origin's host)
-      ...previewAllowedHosts,
-      // Full-origin wildcards (matched against Origin)
-      ...previewAllowedHosts.flatMap((host) => [`https://${host}`, `http://${host}`]),
-      ...LOCAL_DEV_ORIGINS,
-    ];
+const trustedOrigins: string[] = [
+  ...(explicitBaseURL ? [explicitBaseURL] : []),
+  ...(vercelOrigin ? [vercelOrigin] : []),
+  "*.vercel.app",
+  "https://*.vercel.app",
+  ...previewAllowedHosts,
+  ...previewAllowedHosts.flatMap((host) => [`https://${host}`, `http://${host}`]),
+  ...LOCAL_DEV_ORIGINS,
+  ...extraCorsOrigins,
+];
 
 const databaseUrl = env("DATABASE_URL");
 
