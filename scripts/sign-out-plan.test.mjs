@@ -82,7 +82,7 @@ test("preview: a sign-out that throws synchronously still clears and redirects",
 });
 
 test("preview: a sign-out that never settles clears and redirects once the wait expires", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try { t.mock.timers.enable({ apis: ["setTimeout"] }); } catch { t.mock.timers.enable(["setTimeout"]); }
   const h = preview({ requestSignOut: hangs });
   const done = h.run();
 
@@ -144,7 +144,7 @@ test("settleWithin reports the outcome and never rejects", async () => {
 });
 
 test("settleWithin waits its full window, then gives up rather than hanging", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try { t.mock.timers.enable({ apis: ["setTimeout"] }); } catch { t.mock.timers.enable(["setTimeout"]); }
   let outcome = null;
   const done = settleWithin(hangs, TEST_TIMEOUT_MS).then((o) => (outcome = o));
 
@@ -180,7 +180,7 @@ function preSignIn(livePreview, overrides = {}) {
 }
 
 test("pre-sign-in: the preview clear gives up at the preview bound", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try { t.mock.timers.enable({ apis: ["setTimeout"] }); } catch { t.mock.timers.enable(["setTimeout"]); }
   const h = preSignIn(true);
 
   t.mock.timers.tick(PREVIEW_SIGN_OUT_TIMEOUT_MS - 1);
@@ -193,7 +193,7 @@ test("pre-sign-in: the preview clear gives up at the preview bound", async (t) =
 });
 
 test("pre-sign-in: a deployed session gets the deployed window, not the preview one", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try { t.mock.timers.enable({ apis: ["setTimeout"] }); } catch { t.mock.timers.enable(["setTimeout"]); }
   const h = preSignIn(false);
 
   t.mock.timers.tick(PREVIEW_SIGN_OUT_TIMEOUT_MS);
@@ -239,7 +239,7 @@ test("the defaults are bounded, and deployed waits longer than preview", async (
   assert.ok(DEPLOYED_SIGN_OUT_TIMEOUT_MS > PREVIEW_SIGN_OUT_TIMEOUT_MS);
   assert.ok(DEPLOYED_SIGN_OUT_TIMEOUT_MS <= 30_000);
 
-  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try { t.mock.timers.enable({ apis: ["setTimeout"] }); } catch { t.mock.timers.enable(["setTimeout"]); }
   const h = preview({ requestSignOut: hangs, timeoutMs: undefined });
   const done = h.run();
   t.mock.timers.tick(PREVIEW_SIGN_OUT_TIMEOUT_MS);

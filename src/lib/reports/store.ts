@@ -390,7 +390,7 @@ export async function ingestReport(
           : "text/plain";
     try {
       const storedObj = await storeImagingArtifact(sql, {
-        userId: patientOwnerUserId,
+        userId,
         patientId: input.patientId,
         studyId,
         kind: "report",

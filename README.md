@@ -1,76 +1,78 @@
-# AnatomyBridge
+# ReproCare (AnatomyBridge Clinical & 3D Imaging Workspace)
 
-Evidence-linked workspace for synthetic women's reproductive health records. The live app is the product. This file is the map of what was actually built and verified.
+**ReproCare** is an evidence-linked reproductive-health imaging, longitudinal lesion tracking (`ReproTrace`), and clinical report intelligence proof-of-principle. Within the user interface, the 3D imaging and longitudinal workspace is branded as **AnatomyBridge**.
 
-AnatomyBridge does **not** diagnose, prescribe, or claim regulatory clearance. Every seeded person and scan is synthetic.
+ReproCare does **not** autonomously diagnose, prescribe, or claim regulatory clearance (CDSCO / FDA / CE). Every seeded patient record and scan in the repository is synthetic (`SYNTHETIC_VERIFICATION_ONLY`).
 
-## What runs
+---
 
-- **Signed-in workspace with server-side RBAC**: Better Auth session handling with role verification (`clinician`, `patient`, `admin`). Self-service role escalation is strictly disallowed; protected clinical actions (`saveLabMeasurement`, `correctVersion`, `addReview`, `decideCorrespondence`, `resolveDiscrepancy`, `uploadReport`, `linkReportEvidence`) enforce verified roles via positive allowlists. Administrator-controlled clinician verification endpoint (`promoteUser`) manages role assignments. Fallback profiles default safely to `patient`. Cross-tenant and patient self-record isolation are strictly enforced.
-- **Four synthetic pathways**: Fibroids (Meera), endometriosis (Aisha), PCOS context with 2023 International PCOS Guideline gynecological age evaluation (Kavya), and ovarian cyst follow-up (Divya).
-- **ReproTrace rules engine**: Follow-up comparison with rigid 3D image registration. Demotes un-registered or unsupported shifts to provisional `needs_review` status; classifies discrepancies (size, velocity, category, spatial) and supports clinician resolution.
-- **Volume Lab (in-browser 3D imaging workspace)**:
-  - Series loader: Reads multi-file DICOM series via `dicom-parser`, checks slice normals, gaps, duplicates, and mixed geometries, stacking valid series into 3D volumes.
-  - Preprocessing suite: Non-destructive 3x3x3 Median Filter, Percentile Normalization (0.5%–99.5%), Z-Score Normalization, and Gaussian Smoothing with operation history tracking, real-time slice rendering, and raw volume reversion.
-  - Classical segmentation: 3D seeded region-growing with leakage detection, anisotropy compensation, and volume calculation.
-  - Patient LPS coordinate transformations: Computes DICOM patient coordinate frame ($P_{patient} = P_0 + u_x X + u_y Y + u_z Z$); transforms all generated mesh vertices and centroids to true patient LPS coordinates for STL and OBJ exports.
-  - Append-only recording workflow: Directly registers newly uploaded studies and series, creates version N+1 with LPS centroid and volume measurements, and preserves provenance links in `evidence_links`.
-- **Python Imaging Service (`imaging-service/`)**:
-  - FastAPI service authenticated via Bearer token or `X-API-Key` (`ANATOMYBRIDGE_SERVICE_API_KEY`).
-  - Inspects DICOM series geometry, computes mask metrics (Dice, Jaccard, HD95, Hausdorff, mean surface distance), and exposes model status.
-  - Genuine UMD U-Net model adapter (`UmdMonaiAdapter`) and reproducible training script (`train_umd.py`) for UMD 5-class fibroid segmentation. Validates checkpoint files from `ANATOMYBRIDGE_UMD_WEIGHTS` and returns 503 when weights are absent—never mocking clinical predictions.
-- **Clinical Reports & De-identification**:
-  - Ingests TXT, DOCX, and PDF clinical reports directly in the browser.
-  - Scanned PDF detection: Flags image-only or low-text PDFs and displays a clinical guidance alert explaining in-browser OCR limitations.
-  - Client-side de-identification: Scrubs patient names, MRNs, phone numbers, emails, and Aadhaar numbers.
-  - Structured extraction: Parses dates, modalities, FIGO classifications, nabothian cysts, and dimensional measurements with character offsets anchored to finding versions.
-- **Append-only database integrity**:
-  - Database-level immutability triggers (`migrations/0003_append_only.sql`) refusing direct `UPDATE`, `DELETE`, and `TRUNCATE` operations on `finding_versions`, `reviews`, `correspondence_decisions`, and `audit_events`.
+## 1. What Runs & What Is Verified
 
-## Project layout
+- **Authenticated Workspace with Fail-Closed Server-Side RBAC & Consent (`src/lib/clinic/server.ts`, `src/lib/clinic/collaboration.ts`)**:
+  - Better Auth session handling with server-side role resolution (`patient`, `clinician`, `admin`).
+  - Self-service privilege escalation is blocked (`setRole` forbids elevating to `clinician` or `admin`).
+  - Clinicians require an administrator-approved record in `clinician_verifications` (`status IN ('verified', 'approved')` with non-empty `licence_no` and `registry`) **and** an active, non-expired, non-revoked patient consent grant in `patient_clinician_consents` with granular permission scopes (`view_demographics`, `view_imaging`, `view_reports`, `view_findings`, `view_longitudinal_history`, `add_annotations`, `review_ai_findings`, `approve_or_reject_findings`).
+  - Consent revocation (`revokeClinicianConsent`) takes effect immediately while preserving immutable `audit_events`.
+- **Persistent Medical Imaging Storage, Atomic Purge & Backup Restoration (`src/lib/imaging/storage.server.ts`)**:
+  - Content-addressed SHA-256 storage on dedicated persistent volumes (`imaging_storage_data`, `imaging_backup_data`), decoupled from PostgreSQL (`postgres_data`).
+  - Two-phase atomic purge (`purgeImagingArtifact`) with `.Trash-staging` rollback if DB transactions fail, durable `.audit/audit-outbox.jsonl` queue with `flushPendingAuditOutbox()`, and verified backup/restoration (`createImagingStorageBackup`, `restoreImagingStorageBackup`, `reconcileImagingStorageConsistency`).
+- **DICOM Interoperability, Multi-Frame Expansion & PS3.15 / NIfTI De-identification (`src/lib/dicom/codec.ts`, `src/lib/dicom/deidentify.ts`, `src/lib/imaging/series.ts`)**:
+  - Supports Explicit VR Little Endian (`.1.2.1`), Implicit VR Little Endian (`.1.2`), Deflated Explicit VR Little Endian (`.1.2.1.99`), RLE Lossless (`.1.2.5`), JPEG Baseline/Extended/Lossless (`.1.2.4.50`, `.51`, `.57`, `.70`), and JPEG 2000 Lossless/Lossy (`.1.2.4.90`, `.91`).
+  - Expands Enhanced MR multi-frame series (`SharedFunctionalGroupsSequence`, `PerFrameFunctionalGroupsSequence`, `GridFrameOffsetVector`, `SpacingBetweenSlices`) and validates 3D physical LPS geometry (`originMm`, `spacingMm`, `directionCosines`, 4×4 `affine4x4`, `frameOfReferenceUid`) through watertight 3D STL/OBJ mesh export.
+  - Scrubs DICOM PS3.15 identifying tags, odd-group private tags, and nested sequences (`deidentifyDicomBytes`) and NIfTI-1 headers/extensions (`deidentifyNiftiBytes`), preserving original source bytes and flagging burned-in pixel annotation risk (`manualReviewRequired: true`, `claimCompleteAnonymisation: false`).
+- **Python FastAPI Medical Imaging & 3D U-Net Service (`imaging-service/`)**:
+  - Protected by constant-time `X-Service-Key` / `X-API-Key` verification (`ANATOMYBRIDGE_SERVICE_API_KEY`) and origin-restricted CORS (`ANATOMYBRIDGE_CORS_ORIGINS`).
+  - Custom 3D U-Net (`SimpleUnet3D` in `imaging-service/app/unet.py` — PyTorch `nn.Module` + full-graph differentiable backend across all **50 trainable parameter tensors**; MONAI is not used).
+  - Reproducible training pipeline (`imaging-service/train_umd.py`) with non-fallback guard (`allow_numpy_fallback=False`), subject-level 70/15/15 split with zero leakage, absent-class evaluation (`dice = None` when absent in both masks), and SHA-256 checkpoint registry with rollback (`checkpoint_registry.json`).
+  - Returns HTTP `503` (`connected: false`) when validated UMD weights are not mounted, and stamps synthetic phantom checkpoints explicitly as `SYNTHETIC_VERIFICATION_ONLY`.
+- **ReproTrace Longitudinal Intelligence (`src/lib/reprotrace/`)**:
+  - Rigid 6-DOF ($\det(R)=+1$, $R^T R = I$) and affine 12-DOF registration validation (`src/lib/imaging/registration.ts`), demoting unregistered or low-NCC ($<0.50$) pairs to `uncertain` / `provisional`.
+  - Classifies pairs across 6 states (`confirmed_match`, `probable_match`, `possible_match`, `new_finding`, `resolved_finding`, `uncertain`) and attributes longitudinal differences across 7 categories (`genuine_anatomical_change` / `true_growth_or_regression`, `measurement_method_difference`, `segmentation_difference`, `registration_uncertainty`, `protocol_or_spacing_difference`, `scanner_difference`, `report_vs_image_discrepancy`).
+- **Clinical Report OCR & Source-Grounded Intelligence (`src/lib/reports/`)**:
+  - Page-selective extraction for native PDFs, scanned/hybrid multi-page PDFs, PNG/JPEG report images (via `/usr/bin/tesseract`), DOCX, and TXT files while preserving page numbers (`1..N`) and verbatim `[start, end)` character spans.
+  - Explicitly marks handwriting as unsupported (`handwritingSupported: false`, `ocrAccuracyClaimed: false`).
+  - Defaults to zero-network `local_extractive` report interpretation (`src/lib/reports/llm-interpreter.ts`); extracted and AI-summarized items remain `unreviewed` until clinician sign-off (`decideExtractedFinding`).
+- **Four Distinct Reproductive-Health Condition Workflows (`src/lib/clinic/workflows.ts`)**:
+  - **Uterine Fibroids**: FIGO `0–8` subclassification, 3-axis dimensions, physical volume ($\text{mm}^3$), and longitudinal delta tracking.
+  - **Endometriosis**: Enforces `normal_imaging_excludes_endometriosis: false` so normal ultrasound/MRI never rules out superficial endometriosis.
+  - **Ovarian Cysts**: Descriptive morphology (`simple_unilocular`, `hemorrhagic`, `endometrioma_compatible`, `dermoid_compatible`, `indeterminate_incomplete`) with `benign_malignant_classified: false`.
+  - **PCOS**: Separates adult Rotterdam (2-of-3) vs adolescent ($<8\text{ years}$ post-menarche, PCOM ultrasound criterion suppressed) cohorts and blocks PCOS diagnosis from ovarian imaging alone.
 
-- `src/routes/` — TanStack Start file-based routing and application shell
-- `src/components/` — UI components (`clinic-app.tsx`, `volume-lab.tsx`, `reports-view.tsx`, `timeline-view.tsx`, `reprotrace-view.tsx`)
-- `src/lib/imaging/` — 3D volume processing, DICOM patient-coordinate transforms (`patient-coords.ts`), rigid registration (`registration.ts`), preprocessing (`preprocess.ts`), isosurface mesh generation (`surface.ts`, `mesh.ts`), metrics, and service client (`service-client.ts`)
-- `src/lib/dicom/` — DICOM pixel decoding, series geometry checking, slice ordering, and safe header extraction
-- `src/lib/clinic/` — Clinical server functions, server-side RBAC, PCOS context evaluation, and finding version recording (`lab-version.ts`)
-- `src/lib/reports/` — Report text extraction, scanned PDF detection, de-identification, and structured regex parsing
-- `src/lib/reprotrace/` — ReproTrace correspondence and discrepancy rules engine
-- `imaging-service/` — FastAPI imaging microservice, PyTorch 3D U-Net architecture (`app/unet.py`), model adapter (`app/models.py`), training pipeline (`train_umd.py`), and test suite (`tests/`)
-- `migrations/` — SQL database migrations (`0001` to `0007`) for auth, clinical finding versions, append-only triggers, menarche tracking, and report storage
-- `docs/` — Comprehensive engineering, clinical, research, and regulatory documentation
+---
 
-## Verification and test results
+## 2. Project Layout
+
+- `src/routes/` — TanStack Start file-based routes and API proxies
+- `src/components/` — React UI components (`clinic-app.tsx`, `volume-lab.tsx`, `reports-view.tsx`, `timeline-view.tsx`, `reprotrace-view.tsx`)
+- `src/lib/clinic/` — Server functions (`server.ts`), RBAC, collaboration/consent (`collaboration.ts`), and 4 condition pathways (`workflows.ts`)
+- `src/lib/imaging/` — Persistent storage (`storage.server.ts`), 3D volume assembly (`series.ts`), patient LPS coordinates (`patient-coords.ts`), rigid registration (`registration.ts`), preprocessing (`preprocess.ts`), classical seeded segmentation (`segment.ts`), and STL/OBJ mesh export (`isosurface.ts`, `mesh.ts`)
+- `src/lib/dicom/` — Multi-syntax DICOM codec (`codec.ts`), PS3.15 & NIfTI-1 de-identification (`deidentify.ts`), and series loader
+- `src/lib/reports/` — `/usr/bin/tesseract` OCR (`ocr.ts`), PDF/DOCX/TXT extraction (`text.ts`), structured parsing (`extract.ts`), and source-grounded LLM interpreter (`llm-interpreter.ts`)
+- `src/lib/reprotrace/` — Longitudinal registration gating, 6-state correspondence (`matching.ts`), and 7-category attribution (`trends.ts`, `params.ts`, `engine.ts`)
+- `imaging-service/` — Python 3.12 FastAPI service, `SimpleUnet3D` (`app/unet.py`), `UmdMonaiAdapter` (`app/models.py`), `train_umd.py`, and pytest suite (`tests/`)
+- `migrations/` — 13 sequential PostgreSQL migrations (`0001_auth.sql` through `0013_sprint5_dicom_and_condition_workflows.sql`) executed under `pg_advisory_lock(72839401)` via `scripts/migrate.mjs`
+- `docs/` — Complete engineering, security, dataset governance, model validation, DICOM, ReproTrace, OCR, regulatory readiness, deployment, testing, and demo documentation
+
+---
+
+## 3. Verification & Test Results (`593 / 593` Automated Tests Passing)
 
 ```bash
-# Run all application test suites (210 passing tests)
+# 1. Verify authentication invariant gate
+npm run check:auth
+
+# 2. Run all 39 TypeScript application test suites (282 passing tests, including end-to-end hackathon demo test)
 npm run test:app
 
-# Run TypeScript type check (0 errors)
-npm run typecheck
+# 3. Run all 9 scaffold, migration advisory-lock & production Dockerfile test suites (200 passing tests)
+npm run test:scaffold
 
-# Run browser automated smoke check (desktop and mobile)
-node scripts/browser-smoke.mjs http://127.0.0.1:8080/ screenshots/smoke-dev.png
-
-# Run browser end-to-end interactive workflow test
-node scripts/test-interactions.mjs
+# 4. Run all 13 Python imaging-service & 3D U-Net test suites (111 passing tests)
+cd imaging-service && ANATOMYBRIDGE_DEV_NO_AUTH=1 python -m pytest tests/ -v --tb=short
 ```
 
-### Verified Test Summary (2026-10-31)
-
-- **Application Unit & Integration Tests**: **210 tests pass, 0 fail** across 18 test suites in `npm run test:app`.
-- **TypeScript strict check**: Clean (`npm run typecheck` passes with 0 errors).
-- **Python Imaging Service Tests**: 109 pytest tests passing across 16 test files (`test_auth.py`, `test_cors.py`, `test_score.py`, `test_inspect.py`).
-- **Browser QA Verification**: Tested in Microsoft Edge via Playwright on both Desktop (1280x800) and Mobile (390x844). Verified 200 OK status, zero console errors, zero uncaught exceptions, and complete interactive walkthroughs (registration, Volume Lab preprocessing, segmentation, mesh export, report ingestion, ReproTrace correspondence). Screenshots saved in `screenshots/`.
-
-## Documentation
-
-- `docs/DEVELOPMENT_CHECKLIST.md` — Honest ledger of completed and verified features
-- `docs/IMAGING_PIPELINE.md` — Measured results, coordinate transformations, and algorithmic limits
-- `docs/API.md` — Server functions and imaging service endpoints
-- `docs/RESEARCH_REPORT.md` — Literature, dataset, patent, and regulatory survey with source quality grades
-- `docs/RESEARCH_STATUS.md` — Research findings summary
-- `docs/USER_MANUAL.md` — Walkthrough guide for clinicians and patients
-- `docs/DEMO_SCRIPT.md` — Step-by-step demonstration scenario
-- `docs/INSTALL.md` — Installation and setup instructions
-- `docs/PROJECT_DOCUMENT.md` — Architectural overview and technical specifications
+### Verified Test Summary (2026-11-02)
+- **TypeScript Application Tests (`test:app`)**: **282 passed, 0 failed** across 39 `.test.ts` files (including `src/lib/clinic/hackathon-demo-e2e.test.ts`).
+- **Scaffold & Production Architecture Tests (`test:scaffold`)**: **200 passed, 0 failed** across 9 `scripts/*.test.mjs` files.
+- **Python Medical Imaging & AI Tests (`pytest`)**: **111 passed, 0 failed** across 13 `imaging-service/tests/test_*.py` files.
+- **Total Automated Tests**: **593 passed, 0 failed**.

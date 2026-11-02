@@ -21,6 +21,7 @@ import {
   verifyImagingObjectIntegrity,
   purgeImagingArtifact,
   getHistoricalFindingImagingEvidence,
+  writeAuditEvent,
   type ImagingArtifactKind,
 } from "../imaging/storage.server.ts";
 import { insertLabVersion, type LabVersionInput } from "./lab-version.ts";
@@ -149,8 +150,7 @@ async function audit(
   entityId: string,
   detail: string,
 ) {
-  await sql`insert into audit_events (id, user_id, action, entity_type, entity_id, detail)
-    values (${crypto.randomUUID()}, ${userId}, ${action}, ${entityType}, ${entityId}, ${detail})`;
+  await writeAuditEvent(sql, userId, action, entityType, entityId, detail);
 }
 
 /**

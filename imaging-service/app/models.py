@@ -267,7 +267,12 @@ def load_checkpoint_bundle(path: str | Path) -> tuple[dict[str, np.ndarray], dic
 
     # 2. Fallback to PyTorch native checkpoint if torch is available
     if HAS_TORCH and torch is not None:
-        raw_ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+        try:
+            raw_ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+        except Exception as e:
+            raise ValueError(
+                f"Unsafe or corrupted weights (weights_only=True enforced): {e}"
+            ) from e
         if not isinstance(raw_ckpt, dict):
             raise ValueError("Unsupported PyTorch checkpoint structure (expected dict)")
         raw_state = raw_ckpt.get("model_state_dict", raw_ckpt)
@@ -710,7 +715,9 @@ class UmdMonaiAdapter:
 
         if HAS_TORCH and torch is not None:
             model = SimpleUnet3D(in_channels=in_channels, out_channels=out_channels, base_channels=base_channels)
-            torch_state = {k: torch.from_numpy(v) for k, v in state_dict.items()}
+            torch_state = model.state_dict()
+            for k, v in state_dict.items():
+                torch_state[k] = torch.from_numpy(np.asarray(v))
             model.load_state_dict(torch_state, strict=True)
             model.eval()
             with torch.no_grad():

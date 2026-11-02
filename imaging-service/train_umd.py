@@ -642,8 +642,9 @@ def run_training_pipeline(
     val_report = _evaluate_records(model_np, val_records, split_name="val", label_map=UMD_DEFAULT_LABEL_MAP)
     test_report = _evaluate_records(model_np, test_records, split_name="test", label_map=UMD_DEFAULT_LABEL_MAP)
 
-    training_mode = "synthetic_phantom_verification" if synthetic else "umd_research_dataset"
+    training_mode = "SYNTHETIC_VERIFICATION_ONLY" if synthetic else "umd_research_dataset"
     metadata = {
+        "checkpoint_classification": "SYNTHETIC_VERIFICATION_ONLY" if synthetic else "UMD_RESEARCH_CHECKPOINT",
         "model_name": "UMD Uterine Myoma (SimpleUnet3D Custom 3D U-Net)",
         "architecture": "SimpleUnet3D (custom 3D U-Net — PyTorch/NumPy, MONAI not used)",
         "model_version": model_version,
