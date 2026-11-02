@@ -508,3 +508,21 @@ test("Task 2E & 2G: Clinician review provenance and preservation of historical f
   assert.ok(provenance.discrepancies.length >= 1, "Discrepancy explanation is linked in provenance");
   assert.ok(provenance.auditHistory.length >= 1, "Audit history is linked in provenance");
 });
+
+test("Workstream 5D: attributeLongitudinalChange distinguishes scanner_difference (1.5T vs 3.0T or vendor mismatch) from genuine biological change", () => {
+  const scannerDiff = attributeLongitudinalChange({
+    priorVolumeMm3: 10000,
+    currentVolumeMm3: 13200,
+    priorSpacingMm: [1.0, 1.0, 3.0],
+    currentSpacingMm: [1.0, 1.0, 3.0],
+    priorMethod: "ai_3d_unet",
+    currentMethod: "ai_3d_unet",
+    priorScanner: "Siemens Avanto 1.5T",
+    currentScanner: "Philips Ingenia 3.0T",
+    priorFieldStrengthT: 1.5,
+    currentFieldStrengthT: 3.0,
+    elapsedDays: 90,
+  });
+  assert.equal(scannerDiff.category, "scanner_difference");
+  assert.ok(scannerDiff.factors.some((f) => f.includes("scanner_difference")));
+});

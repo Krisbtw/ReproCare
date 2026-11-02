@@ -256,3 +256,49 @@ def test_sprint6_real_pillow_jpeg_jpeg2000_rle_and_ps315_deidentification():
     assert rep["burned_in_annotation_risk"] == "high"
     assert rep["manual_review_required"] is True
     assert rep["claim_complete_anonymisation"] is False
+
+
+def test_workstream3e_nifti_header_and_extension_deidentification():
+    """Workstream 3E: Verify Python deidentify_nifti_bytes scrubs descrip/aux_file/intent_name and extension blocks while preserving qform/sform affine."""
+    import gzip
+    import struct
+    from app.dicom_deidentify import deidentify_nifti_bytes
+
+    ext_len = 48
+    vox_offset = 352 + ext_len
+    vox_count = 4 * 4 * 4
+    buf = bytearray(vox_offset + vox_count)
+    struct.pack_into("<i", buf, 0, 348)
+    buf[14:26] = b"DB_SECRET_01"
+    struct.pack_into("<4h", buf, 40, 3, 4, 4, 4)
+    struct.pack_into("<2h", buf, 70, 2, 8)
+    struct.pack_into("<3f", buf, 80, 1.5, 1.5, 3.0)
+    struct.pack_into("<f", buf, 108, float(vox_offset))
+    buf[148:180] = b"PATIENT: SHARMA ANYA DOB 199102".ljust(32, b" ")
+    buf[228:244] = b"AUX_MRN_99887766"
+    struct.pack_into("<2h", buf, 252, 1, 1)
+    struct.pack_into("<4f", buf, 280, 1.5, 0.0, 0.0, -15.0)
+    struct.pack_into("<4f", buf, 296, 0.0, 1.5, 0.0, 20.0)
+    struct.pack_into("<4f", buf, 312, 0.0, 0.0, 3.0, 30.0)
+    buf[328:340] = b"INTENT_SEC99"
+    buf[344:348] = b"n+1\x00"
+    buf[348] = 1
+    buf[352:vox_offset] = b"<XML>PatientID=PT-9988;Hospital=PuneClinic</XML>".ljust(ext_len, b" ")
+    for i in range(vox_count):
+        buf[vox_offset + i] = (i * 5 + 11) % 256
+
+    gz_bytes = gzip.compress(bytes(buf), mtime=0)
+    derived_gz, rep = deidentify_nifti_bytes(gz_bytes)
+    assert rep["was_gzipped"] is True
+    assert rep["original_preserved"] is True
+    assert rep["claim_complete_anonymisation"] is False
+    assert rep["extension_bytes_removed"] == 48
+    assert "descrip" in rep["fields_scrubbed"]
+    assert "nifti_extensions" in rep["fields_scrubbed"]
+    assert rep["geometry_preserved"]["pixdim_mm"] == [1.5, 1.5, 3.0]
+    assert rep["geometry_preserved"]["srow_x"] == [1.5, 0.0, 0.0, -15.0]
+
+    raw_after = gzip.decompress(derived_gz)
+    for secret in (b"SHARMA ANYA", b"AUX_MRN_99887766", b"INTENT_SEC99", b"DB_SECRET_01", b"PuneClinic"):
+        assert secret not in raw_after
+    assert raw_after[352:] == bytes(buf[vox_offset:])

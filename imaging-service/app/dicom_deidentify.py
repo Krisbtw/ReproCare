@@ -272,3 +272,79 @@ def deidentify_dataset(
         "profile_applied": "DICOM_PS3.15_Basic_Application_Level_Confidentiality_Profile",
     }
     return derived, report
+
+import gzip
+import struct
+
+
+def deidentify_nifti_bytes(
+    raw_bytes: bytes,
+    *,
+    replacement_descrip: str = "ANON_NIFTI",
+) -> tuple[bytes, dict[str, Any]]:
+    """Scrubs identifying NIfTI-1 header fields (db_name, descrip, aux_file, intent_name)
+    and strips embedded NIfTI extension blocks while preserving qform/sform affine geometry
+    and original buffer immutability."""
+    if not raw_bytes or len(raw_bytes) < 18:
+        raise ValueError("Invalid NIfTI buffer: smaller than 348-byte NIfTI-1 header.")
+
+    orig_sha = hashlib.sha256(raw_bytes).hexdigest()
+    is_gzip = raw_bytes[:2] == b"\x1f\x8b"
+    decompressed = bytearray(gzip.decompress(raw_bytes) if is_gzip else raw_bytes)
+    if len(decompressed) < 352:
+        raise ValueError("Decompressed NIfTI-1 stream is smaller than 352 bytes.")
+
+    sizeof_hdr_le = struct.unpack_from("<i", decompressed, 0)[0]
+    endian = "<" if sizeof_hdr_le == 348 else ">"
+    sizeof_hdr = struct.unpack_from(f"{endian}i", decompressed, 0)[0]
+    if sizeof_hdr != 348:
+        raise ValueError(f"Invalid NIfTI-1 sizeof_hdr={sizeof_hdr} (expected 348).")
+
+    fields_scrubbed: list[str] = []
+    for name, start, length in (
+        ("db_name", 14, 18),
+        ("descrip", 148, 80),
+        ("aux_file", 228, 24),
+        ("intent_name", 328, 16),
+    ):
+        txt = bytes(decompressed[start : start + length]).rstrip(b"\x00 ").decode("utf-8", errors="ignore")
+        if txt:
+            fields_scrubbed.append(name)
+        decompressed[start : start + length] = b"\x00" * length
+
+    rep = replacement_descrip.encode("ascii", errors="ignore")[:79]
+    decompressed[148 : 148 + len(rep)] = rep
+
+    orig_vox_offset = max(352, int(round(struct.unpack_from(f"{endian}f", decompressed, 108)[0])))
+    ext_removed = max(0, orig_vox_offset - 352)
+    if decompressed[348] != 0 or ext_removed > 0:
+        fields_scrubbed.append("nifti_extensions")
+
+    decompressed[348:352] = b"\x00\x00\x00\x00"
+    struct.pack_into(f"{endian}f", decompressed, 108, 352.0)
+
+    clean_nii = bytes(decompressed[:352]) + bytes(decompressed[orig_vox_offset:])
+    derived_bytes = gzip.compress(clean_nii, mtime=0) if is_gzip else clean_nii
+    derived_sha = hashlib.sha256(derived_bytes).hexdigest()
+
+    pixdim = struct.unpack_from(f"{endian}3f", clean_nii, 80)
+    srow_x = struct.unpack_from(f"{endian}4f", clean_nii, 280)
+    srow_y = struct.unpack_from(f"{endian}4f", clean_nii, 296)
+    srow_z = struct.unpack_from(f"{endian}4f", clean_nii, 312)
+
+    report: dict[str, Any] = {
+        "was_gzipped": is_gzip,
+        "original_sha256": orig_sha,
+        "derived_sha256": derived_sha,
+        "original_preserved": hashlib.sha256(raw_bytes).hexdigest() == orig_sha,
+        "fields_scrubbed": fields_scrubbed,
+        "extension_bytes_removed": ext_removed,
+        "geometry_preserved": {
+            "pixdim_mm": [round(float(x), 6) for x in pixdim],
+            "srow_x": [round(float(x), 6) for x in srow_x],
+            "srow_y": [round(float(x), 6) for x in srow_y],
+            "srow_z": [round(float(x), 6) for x in srow_z],
+        },
+        "claim_complete_anonymisation": False,
+    }
+    return derived_bytes, report
