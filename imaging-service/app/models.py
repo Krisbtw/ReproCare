@@ -67,6 +67,9 @@ class ModelStatus:
     is_clinical_grade: bool = False
     trained_at: str | None = None
     validation_metrics: dict[str, Any] | None = None
+    execution_backend: str = "numpy_cpu_fallback" if not HAS_TORCH else "pytorch_cpu"
+    trained_checkpoint_loaded: bool = False
+    weights_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -500,6 +503,8 @@ class NnUnetAdapter:
                 reason=problem,
                 is_learned_model=True,
                 architecture=self.architecture,
+                execution_backend="nnunet_cli",
+                trained_checkpoint_loaded=False,
             )
         return ModelStatus(
             id=self.id,
@@ -509,6 +514,8 @@ class NnUnetAdapter:
             label_map=labels,
             is_learned_model=True,
             architecture=self.architecture,
+            execution_backend="nnunet_cli",
+            trained_checkpoint_loaded=True,
         )
 
     def run(
@@ -666,7 +673,8 @@ class UmdMonaiAdapter:
         return weights_path, state_dict, labels, metadata, sha256_hex, None
 
     def status(self) -> ModelStatus:
-        _, _, labels, metadata, sha256_hex, problem = self._inspect_checkpoint()
+        weights_path, _, labels, metadata, sha256_hex, problem = self._inspect_checkpoint()
+        backend = "pytorch_cpu" if HAS_TORCH else "numpy_cpu"
         if problem is not None:
             return ModelStatus(
                 id=self.id,
@@ -675,6 +683,9 @@ class UmdMonaiAdapter:
                 reason=problem,
                 is_learned_model=True,
                 architecture=self.architecture,
+                execution_backend="numpy_cpu_fallback" if not HAS_TORCH else "pytorch_cpu",
+                trained_checkpoint_loaded=False,
+                weights_path=str(weights_path) if weights_path else None,
             )
         meta = metadata or {}
         return ModelStatus(
@@ -685,6 +696,9 @@ class UmdMonaiAdapter:
             label_map=labels,
             is_learned_model=True,
             architecture=self.architecture,
+            execution_backend=backend,
+            trained_checkpoint_loaded=True,
+            weights_path=str(weights_path) if weights_path else None,
             model_version=str(meta.get("model_version", "1.0.0-experimental")),
             dataset_version=str(meta.get("dataset_version", "UMD-v1")),
             checkpoint_sha256=sha256_hex,

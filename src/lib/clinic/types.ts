@@ -83,6 +83,10 @@ export type VersionRow = {
   report_longest_mm: number | null;
   change_reason: string;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type EvidenceRow = {
@@ -153,6 +157,10 @@ export type CorrespondenceRow = {
   engine_version: string;
   active: boolean;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type DecisionRow = {
@@ -162,6 +170,10 @@ export type DecisionRow = {
   decision: string;
   note: string;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type DiscrepancyRow = {
@@ -176,6 +188,10 @@ export type DiscrepancyRow = {
   engine_version: string;
   active: boolean;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type ReviewRow = {
@@ -186,6 +202,10 @@ export type ReviewRow = {
   status: string;
   note: string;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type ConsentRow = {
@@ -196,6 +216,10 @@ export type ConsentRow = {
   granted: boolean;
   note: string;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type UploadRow = {
@@ -233,6 +257,10 @@ export type ExtractionRow = {
   extraction: string;
   warnings: string;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type ModelRow = { id: string; name: string; status: string; note: string };
@@ -275,6 +303,10 @@ export type RegistrationRow = {
   quality_note?: string;
   matrix_valid?: boolean;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type FibroidAssessmentItem = {
@@ -301,6 +333,10 @@ export type FibroidAssessmentItem = {
   reviewed_at: string | null;
   review_note: string | null;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type EndometriosisRecordItem = {
@@ -311,6 +347,10 @@ export type EndometriosisRecordItem = {
   staging_rASRM: string | null;
   imaging_note: string;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type OvarianCystRecordItem = {
@@ -322,6 +362,10 @@ export type OvarianCystRecordItem = {
   follow_up_months: number | null;
   clinical_note: string;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type PcosAssessmentItem = {
@@ -334,6 +378,10 @@ export type PcosAssessmentItem = {
   rotterdam_criteria_met: boolean;
   notes: string;
   created_at: string;
+  review_status?: string;
+  extraction_method?: string;
+  version_no?: number;
+  report_object_id?: string | null;
 };
 
 export type Workspace = {

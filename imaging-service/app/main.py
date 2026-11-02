@@ -8,12 +8,18 @@ or fetched directly from private Supabase Storage buckets) and dropped after the
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 import hmac
 import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
 from typing import Any
+import urllib.request
 import zlib
 
+import fastapi
 import numpy as np
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
@@ -21,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from . import metrics, models, series, storage_client, trends
+from . import health as health_diagnostics, metrics, models, series, storage_client, trends
 
 MAX_FILES = 1000
 MAX_BYTES_EACH = 64 * 1024 * 1024
@@ -145,7 +151,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "success": False,
             "error": "Validation Error",
             "details": errors,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "request": request.url.path,
         },
     )
@@ -168,7 +174,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
             "success": False,
             "error": error_msg,
             "detail": detail,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "request": request.url.path,
         },
     )
@@ -183,7 +189,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
             "success": False,
             "error": "Internal Server Error",
             "message": "An unexpected error occurred. Please try again later.",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "request": request.url.path,
         },
     )
@@ -244,6 +250,21 @@ class StorageSegmentRequest(BaseModel):
     output_mask_object_path: str | None = Field(default=None, description="Optional object path in reprocare-derived to persist mask")
 
 
+@app.get("/health/live")
+def health_live() -> dict[str, Any]:
+    """Liveness probe. Verifies FastAPI is alive and operational with zero external dependencies."""
+    return health_diagnostics.liveness_probe()
+
+
+@app.get("/health/ready")
+def health_ready() -> JSONResponse:
+    """Readiness probe checking runtime, medical-imaging packages, model checkpoints, Supabase, and OCR.
+    Strictly categorizes dependencies as: available, unavailable, not_configured, not_applicable, degraded.
+    """
+    code, payload = health_diagnostics.readiness_probe()
+    return JSONResponse(status_code=code, content=payload)
+
+
 @app.get("/health")
 def health() -> dict:
     st = models.statuses()
@@ -252,6 +273,10 @@ def health() -> dict:
         "status": "ok",
         "service": "anatomybridge-imaging",
         "version": "0.2.0",
+        "endpoints": {
+            "live": "/health/live",
+            "ready": "/health/ready",
+        },
         "any_model_connected": any(m.connected for m in st),
         "connected_models": [m.id for m in st if m.connected],
         "models": [m.to_dict() for m in st],

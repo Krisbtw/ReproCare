@@ -54,7 +54,7 @@ const MIGRATION_FILES = [
 ];
 
 function wrap(pg: PGlite): Sql {
-  return async <T = Record<string, unknown>>(
+  const fn = async <T = Record<string, unknown>>(
     strings: TemplateStringsArray,
     ...values: unknown[]
   ): Promise<T[]> => {
@@ -65,6 +65,14 @@ function wrap(pg: PGlite): Sql {
     const res = await pg.query<T>(text, values);
     return res.rows;
   };
+  (fn as unknown as Sql).query = async <T = Record<string, unknown>>(
+    text: string,
+    params: unknown[] = [],
+  ) => {
+    const res = await pg.query<T>(text, params);
+    return res.rows;
+  };
+  return fn as unknown as Sql;
 }
 
 async function setupDb(): Promise<{ pg: PGlite; sql: Sql }> {

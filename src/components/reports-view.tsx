@@ -198,7 +198,7 @@ function ExtractionSummary({
         </p>
         {x.reportAuthorOrInstitution && (
           <p className="text-xs text-muted">
-            Institution/Author role: {x.reportAuthorOrInstitution.value}
+            Institution/Author role: {x.reportAuthorOrInstitution.roleOrDepartment ?? x.reportAuthorOrInstitution.note}
           </p>
         )}
         <p className="text-xs text-muted">Extractor {x.extractor} (deterministic rules)</p>
@@ -244,7 +244,7 @@ function ExtractionSummary({
               {f.figo && <Tag tone="pine">{`FIGO ${f.figo} (as written)`}</Tag>}
               {f.pageNumber && <Tag>{`p.${f.pageNumber}`}</Tag>}
               <ProvenanceBadge provenance={f.provenance} />
-              {f.reviewStatus && f.reviewStatus !== "pending" && (
+              {f.reviewStatus && f.reviewStatus !== "unreviewed" && (
                 <Tag tone={f.reviewStatus === "approved" || f.reviewStatus === "edited" ? "pine" : "clay"}>
                   {`clinician ${f.reviewStatus}`}
                 </Tag>
@@ -451,7 +451,7 @@ export function ReportsView({
 
   async function sample(kind: "pdf" | "scanned_pdf" | "multipage_pdf" | "docx" | "txt") {
     if (kind === "scanned_pdf") {
-      const bytes = await buildScannedPdf([SAMPLE_REPORT_LINES], false);
+      const bytes = await buildScannedPdf([SAMPLE_REPORT_LINES]);
       await readFile("synthetic-scanned-report.pdf", bytes);
       return;
     }

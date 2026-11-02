@@ -66,6 +66,57 @@ def supabase_storage_status(env: dict[str, str] | None = None) -> dict[str, obje
     }
 
 
+def probe_supabase_connectivity(
+    env: dict[str, str] | None = None,
+    client: SupabaseStorageClient | None = None,
+    timeout_sec: float = 5.0,
+) -> dict[str, object]:
+    """Inspects Supabase configuration and tests live REST connectivity."""
+    stat = supabase_storage_status(env)
+    if not stat.get("configured"):
+        return {
+            "status": "not_configured",
+            "configured": False,
+            "reachable": False,
+            "supabase_url": None,
+            "project_ref": None,
+            "buckets_found": [],
+            "reason": str(stat.get("reason", "Supabase Storage credentials not configured.")),
+        }
+
+    if client is not None:
+        c = client
+    else:
+        e = env if env is not None else os.environ
+        try:
+            c = SupabaseStorageClient(
+                supabase_url=e.get("SUPABASE_URL"),
+                service_role_key=e.get("SUPABASE_SERVICE_ROLE_KEY"),
+            )
+        except Exception as err:
+            return {
+                "status": "unavailable",
+                "configured": True,
+                "reachable": False,
+                "supabase_url": stat.get("supabase_url"),
+                "project_ref": stat.get("project_ref"),
+                "buckets_found": [],
+                "reason": redact_secrets(str(err)),
+            }
+
+    probe = c.probe_connectivity(timeout_sec=timeout_sec)
+    return {
+        "status": probe["status"],
+        "configured": True,
+        "reachable": probe["reachable"],
+        "http_status": probe.get("http_status"),
+        "supabase_url": stat.get("supabase_url"),
+        "project_ref": stat.get("project_ref"),
+        "buckets_found": probe.get("buckets_found", []),
+        "reason": probe["reason"],
+    }
+
+
 def _validate_bucket_and_path(bucket: str, object_path: str) -> tuple[str, str]:
     clean_bucket = (bucket or "").strip()
     if clean_bucket not in ALLOWED_BUCKETS:
@@ -98,6 +149,42 @@ class SupabaseStorageClient:
             raise RuntimeError(
                 "Supabase Storage configuration contains an unreplaced credential placeholder."
             )
+
+    def probe_connectivity(self, timeout_sec: float = 5.0) -> dict[str, object]:
+        """Probes Supabase Storage connectivity by querying bucket metadata."""
+        url = f"{self.supabase_url}/storage/v1/bucket"
+        try:
+            with httpx.Client(transport=self.transport, timeout=timeout_sec) as client:
+                res = client.get(url, headers=self._headers())
+            if res.status_code == 200:
+                raw_buckets = res.json()
+                found = [
+                    b.get("name") or b.get("id")
+                    for b in raw_buckets
+                    if isinstance(b, dict) and (b.get("name") or b.get("id"))
+                ]
+                return {
+                    "status": "available",
+                    "reachable": True,
+                    "http_status": 200,
+                    "buckets_found": sorted(found),
+                    "reason": "Supabase Storage REST API reachable and verified.",
+                }
+            return {
+                "status": "degraded",
+                "reachable": False,
+                "http_status": res.status_code,
+                "buckets_found": [],
+                "reason": f"Supabase Storage returned HTTP {res.status_code}.",
+            }
+        except Exception as e:
+            return {
+                "status": "unavailable",
+                "reachable": False,
+                "http_status": None,
+                "buckets_found": [],
+                "reason": redact_secrets(str(e)),
+            }
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         h = {

@@ -22,6 +22,7 @@ export const MIGRATION_ADVISORY_LOCK_ID = 72839401;
 const PLACEHOLDER_RE =
   /\[YOUR-PASSWORD\]|<YOUR-PASSWORD>|\[PASSWORD\]|<PASSWORD>|YOUR_PASSWORD_HERE/i;
 
+/** @param {string | null | undefined} input */
 export function redactMigrationUrl(input) {
   if (!input) return "";
   return String(input)

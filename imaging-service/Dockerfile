@@ -10,6 +10,6 @@ RUN useradd -m -u 1000 appuser \
 USER appuser
 EXPOSE 8100
 HEALTHCHECK --interval=15s --timeout=5s --start-period=5s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')" || exit 1
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/health/live')" || exit 1
 # No weights are bundled. Mount a validated checkpoint to /var/lib/reprocare/models and set ANATOMYBRIDGE_UMD_WEIGHTS.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8100"]

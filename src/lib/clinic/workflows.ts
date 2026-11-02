@@ -164,6 +164,7 @@ export interface OvarianCystPathwayRecord {
 
 export interface PcosHormoneLabs {
   totalTestosteroneNgDl?: number | null;
+  freeTestosteronePgMl?: number | null;
   freeAndrogenIndex?: number | null;
   shbgNmolL?: number | null;
   amhNgMl?: number | null;
@@ -316,6 +317,10 @@ export async function recordFibroidPathwayAssessment(
     associatedSymptoms?: string[];
     longitudinalComparisonNote?: string | null;
     evidenceTier?: ConditionEvidenceTier;
+    bleedingSeverity?: string | null;
+    bulkSymptoms?: string[];
+    clinicalNotes?: string | null;
+    confirmAssessment?: boolean;
   },
 ): Promise<FibroidPathwayRecord> {
   const location = String(input.anatomicalLocation ?? "").trim();

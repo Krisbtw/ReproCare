@@ -14,6 +14,7 @@
 
 export const EXTRACTOR_ID = "anatomybridge-report-rules-1";
 
+export type ExtractionProvenance = ExtractionProvenanceTier;
 export type ExtractionProvenanceTier =
   | "explicitly_stated"
   | "parser_inferred"
@@ -130,6 +131,9 @@ export type Extraction = {
   ocrUsed?: boolean;
   reviewStatus?: "unreviewed" | "reviewed" | "corrected" | "rejected";
   notes: string[];
+  anatomicalRegion?: string;
+  extractionMethod?: string;
+  pageCount?: number;
 };
 
 type Term = { re: RegExp; structure: string; organ: string; pathway: ExtractedFinding["pathway"] };
@@ -333,7 +337,7 @@ const UNCERTAINTY =
 
 export function extractReport(
   text: string,
-  options?: { ocrUsed?: boolean },
+  options?: { ocrUsed?: boolean; rawTextForMetadata?: string; pages?: any[]; pageCount?: number },
 ): Extraction {
   const notes: string[] = [];
   const sents = sentences(text);

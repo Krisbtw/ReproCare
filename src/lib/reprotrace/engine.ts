@@ -998,7 +998,7 @@ export function sameMethodChange(a: Measure, b: Measure): Discrepancy | null {
     };
   }
 
-  if (earlier.quality === "limited" || later.quality === "limited") {
+  if ((earlier.quality === "limited" || later.quality === "limited") && earlier.longestMm != null && later.longestMm != null && earlier.longestMm > 0 && later.longestMm > 0) {
     const relQ =
       Math.abs(earlier.longestMm - later.longestMm) /
       Math.min(earlier.longestMm, later.longestMm);
@@ -1053,6 +1053,7 @@ export function sameMethodChange(a: Measure, b: Measure): Discrepancy | null {
     (v2 != null ? computeVoxelBoundaryUncertainty(v2, later.spacingMm ?? undefined) : 0);
   const combinedUncertaintyMm3 = Number(Math.hypot(u1, u2).toFixed(1));
 
+  if (earlier.longestMm == null || later.longestMm == null || earlier.longestMm <= 0 || later.longestMm <= 0) return null;
   const rel =
     Math.abs(earlier.longestMm - later.longestMm) /
     Math.min(earlier.longestMm, later.longestMm);

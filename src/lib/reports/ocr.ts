@@ -137,6 +137,7 @@ export interface PdfPageExtraction {
   ocrFailed: boolean;
   confidence: number | null;
   warnings: string[];
+  method?: string;
 }
 
 export interface PdfDocumentExtractionResult {
@@ -149,6 +150,7 @@ export interface PdfDocumentExtractionResult {
   ocrAccuracyClaimed: false;
   requiresClinicianReview: boolean;
   warnings: string[];
+  method?: string;
 }
 
 export type OcrPageRecognizer = (input: {

@@ -124,7 +124,7 @@ export type ProxyModelStatus = {
   training_mode?: string | null;
   is_clinical_grade?: boolean;
   trained_at?: string | null;
-  validation_metrics?: Record<string, unknown> | null;
+  validation_metrics?: Record<string, any> | null;
 };
 
 /** List available segmentation models. Requires verified clinician or administrator credentials. */

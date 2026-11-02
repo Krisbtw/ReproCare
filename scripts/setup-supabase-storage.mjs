@@ -86,7 +86,8 @@ export async function provisionSupabaseBuckets(env = process.env, fetchImpl = fe
   }
 
   const existing = await listRes.json();
-  const existingMap = new Map(existing.map((b) => [b.id || b.name, b]));
+  const existingMap = new Map((/** @type {any[]} */ (existing)).map((/** @type {any} */ b) => [b.id || b.name, b]));
+  /** @type {{ created: string[], updated: string[], verifiedPrivate: string[] }} */
   const summary = { created: [], updated: [], verifiedPrivate: [] };
 
   for (const spec of PRIVATE_BUCKET_SPECS) {

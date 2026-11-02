@@ -106,7 +106,7 @@ export function ModelStatusPanel({
       setLoading(true);
       setServiceError(null);
       try {
-        const list = await proxyListModels();
+        const list = (await proxyListModels()) as ProxyModelStatus[];
         if (active) {
           setModels(list);
           if (list.length > 0 && !selectedModelId) {
