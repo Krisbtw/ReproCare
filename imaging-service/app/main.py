@@ -2,7 +2,8 @@
 
 Start:  uvicorn app.main:app --port 8100
 Docs:   /docs  and  /openapi.json
-Nothing here stores uploads. Files are read in memory and dropped after the response.
+Nothing here stores uploads locally. Files are read in memory (either from multipart upload
+or fetched directly from private Supabase Storage buckets) and dropped after the response.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from . import metrics, models, series, trends
+from . import metrics, models, series, storage_client, trends
 
 MAX_FILES = 1000
 MAX_BYTES_EACH = 64 * 1024 * 1024
@@ -69,9 +70,21 @@ if _ORIGINS:
         max_age=86400,
     )
 
+# Optional Vercel Services path-rewrite prefix normalization:
+_SERVICE_REWRITE_PREFIX = os.environ.get(
+    "ANATOMYBRIDGE_ROUTE_PREFIX", "/api/imaging-service"
+).rstrip("/")
+
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
+    path = request.scope.get("path", "")
+    if _SERVICE_REWRITE_PREFIX and (
+        path == _SERVICE_REWRITE_PREFIX or path.startswith(_SERVICE_REWRITE_PREFIX + "/")
+    ):
+        stripped = path[len(_SERVICE_REWRITE_PREFIX) :] or "/"
+        request.scope["root_path"] = request.scope.get("root_path", "") + _SERVICE_REWRITE_PREFIX
+        request.scope["path"] = stripped
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -93,6 +106,7 @@ def redact_sensitive_data(data: Any) -> Any:
                 "medical_history",
                 "referring_physician",
                 "clinician_notes",
+                "service_role_key",
             ]:
                 continue
             elif key in ["email", "phone"]:
@@ -207,9 +221,26 @@ class MaskScoreRequest(BaseModel):
     reference: list[list[list[int]]]
 
 
+class StorageObjectRef(BaseModel):
+    bucket: str = Field(default="reprocare-imaging", description="Private Supabase Storage bucket name")
+    object_path: str = Field(description="Object path inside the private bucket")
+    sha256: str | None = Field(default=None, description="Optional expected SHA-256 hex digest")
+
+
+class StorageSeriesInspectRequest(BaseModel):
+    objects: list[StorageObjectRef] = Field(description="Ordered or unordered DICOM objects in Supabase Storage")
+
+
+class StorageSegmentRequest(BaseModel):
+    objects: list[StorageObjectRef] = Field(description="DICOM series objects in Supabase Storage")
+    output_mask_bucket: str | None = Field(default=None, description="Optional target bucket (reprocare-derived) to persist mask")
+    output_mask_object_path: str | None = Field(default=None, description="Optional object path in reprocare-derived to persist mask")
+
+
 @app.get("/health")
 def health() -> dict:
     st = models.statuses()
+    supa = storage_client.supabase_storage_status()
     return {
         "status": "ok",
         "service": "anatomybridge-imaging",
@@ -217,6 +248,7 @@ def health() -> dict:
         "any_model_connected": any(m.connected for m in st),
         "connected_models": [m.id for m in st if m.connected],
         "models": [m.to_dict() for m in st],
+        "supabase_storage": supa,
     }
 
 
@@ -257,6 +289,30 @@ async def _read_files(files: list[UploadFile]) -> list[bytes]:
     return blobs
 
 
+def _download_storage_objects(refs: list[StorageObjectRef]) -> list[bytes]:
+    if not refs:
+        raise HTTPException(400, "No storage objects provided.")
+    if len(refs) > MAX_FILES:
+        raise HTTPException(413, f"At most {MAX_FILES} objects per request.")
+    try:
+        client = storage_client.SupabaseStorageClient()
+    except Exception as e:
+        raise HTTPException(503, detail={"error": "supabase_storage_not_configured", "reason": str(e)}) from e
+
+    blobs: list[bytes] = []
+    for ref in refs:
+        try:
+            blob = client.download_object(ref.bucket, ref.object_path, expected_sha256=ref.sha256)
+            blobs.append(blob)
+        except FileNotFoundError as e:
+            raise HTTPException(404, detail={"error": "storage_object_not_found", "reason": str(e)}) from e
+        except ValueError as e:
+            raise HTTPException(422, detail={"error": "storage_object_invalid", "reason": str(e)}) from e
+        except Exception as e:
+            raise HTTPException(502, detail={"error": "storage_download_failed", "reason": str(e)}) from e
+    return blobs
+
+
 @app.post("/series/inspect")
 async def inspect_series(
     files: list[UploadFile] = File(...),
@@ -264,6 +320,19 @@ async def inspect_series(
 ) -> dict:
     """Geometry report for one DICOM series. Patient tags are not returned."""
     report, _ = series.inspect(await _read_files(files))
+    return redact_sensitive_data(report.to_dict())
+
+
+@app.post("/storage/inspect")
+def inspect_storage_series(
+    req: StorageSeriesInspectRequest,
+    auth_ok: bool = Depends(verify_service_auth),
+) -> dict:
+    """Fetches a DICOM series directly from private Supabase Storage (`reprocare-imaging`),
+    verifies SHA-256 checksums, and returns the de-identified geometry report.
+    """
+    blobs = _download_storage_objects(req.objects)
+    report, _ = series.inspect(blobs)
     return redact_sensitive_data(report.to_dict())
 
 
@@ -279,12 +348,7 @@ def score_masks(
     return metrics.score(pred, ref, req.spacing_zyx_mm)
 
 
-@app.post("/segment/{model_id}")
-async def segment(
-    model_id: str,
-    files: list[UploadFile] = File(...),
-    auth_ok: bool = Depends(verify_service_auth),
-) -> dict:
+def _execute_segmentation(model_id: str, raw: list[bytes]) -> dict:
     adapter = models.ADAPTERS.get(model_id)
     if adapter is None:
         raise HTTPException(status_code=404, detail=f"Unknown model '{model_id}'.")
@@ -301,7 +365,6 @@ async def segment(
             },
         )
 
-    raw = await _read_files(files)
     try:
         vol, geometry, report = series.stack_volume_with_geometry(raw)
     except ValueError as e:
@@ -318,7 +381,8 @@ async def segment(
     except Exception as e:
         raise HTTPException(status_code=500, detail={"error": "inference_failed", "reason": str(e)}) from e
 
-    compressed = base64.b64encode(zlib.compress(np.ascontiguousarray(seg, dtype=np.uint8).tobytes())).decode("ascii")
+    compressed_bytes = zlib.compress(np.ascontiguousarray(seg, dtype=np.uint8).tobytes())
+    compressed = base64.b64encode(compressed_bytes).decode("ascii")
     str_labels = {str(k): str(v) for k, v in labels.items()}
     note_str = (
         f"Experimental learned model output ({st.architecture}, version {provenance.get('model_version', '1.0.0')}). "
@@ -355,7 +419,54 @@ async def segment(
         "series": redact_sensitive_data(report.to_dict()),
         "series_report": redact_sensitive_data(report.to_dict()),
         "provenance": provenance,
+        "_compressed_bytes": compressed_bytes,
     }
+
+
+@app.post("/segment/{model_id}")
+async def segment(
+    model_id: str,
+    files: list[UploadFile] = File(...),
+    auth_ok: bool = Depends(verify_service_auth),
+) -> dict:
+    raw = await _read_files(files)
+    res = _execute_segmentation(model_id, raw)
+    res.pop("_compressed_bytes", None)
+    return res
+
+
+@app.post("/storage/segment/{model_id}")
+def segment_from_storage(
+    model_id: str,
+    req: StorageSegmentRequest,
+    auth_ok: bool = Depends(verify_service_auth),
+) -> dict:
+    """Segments a DICOM series fetched directly from Supabase Storage (`reprocare-imaging`)
+    and optionally uploads the compressed segmentation mask to `reprocare-derived`.
+    """
+    raw = _download_storage_objects(req.objects)
+    res = _execute_segmentation(model_id, raw)
+    compressed_bytes = res.pop("_compressed_bytes", b"")
+
+    if req.output_mask_object_path:
+        target_bucket = req.output_mask_bucket or "reprocare-derived"
+        try:
+            client = storage_client.SupabaseStorageClient()
+            stored_mask = client.upload_object(
+                bucket=target_bucket,
+                object_path=req.output_mask_object_path,
+                data=compressed_bytes,
+                mime_type="application/octet-stream",
+                upsert=True,
+            )
+            res["stored_mask_object"] = stored_mask
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail={"error": "mask_storage_upload_failed", "reason": str(e)},
+            ) from e
+
+    return res
 
 
 class TrendPoint(BaseModel):

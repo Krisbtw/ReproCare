@@ -115,3 +115,30 @@ test("production Dockerfile builds .output/server/index.mjs, installs tesseract-
   assert.match(dockerfile, /HEALTHCHECK/);
   assert.match(dockerfile, /\.output\/server\/index\.mjs/);
 });
+
+test("vercel.json defines valid multi-service configuration with app (nitro), imaging-service (fastapi), bindings, and rewrites", () => {
+  const vercelConfig = JSON.parse(readFileSync(join(projectRoot(), "vercel.json"), "utf8"));
+  assert.equal(vercelConfig.$schema, "https://openapi.vercel.sh/vercel.json");
+  // Under Vercel Services, top-level build/install keys must be moved inside services.<name>
+  for (const forbiddenTopKey of ["buildCommand", "outputDirectory", "installCommand", "devCommand", "framework", "functions"]) {
+    assert.equal(vercelConfig[forbiddenTopKey], undefined, `Top-level '${forbiddenTopKey}' is not allowed with services`);
+  }
+  assert.ok(vercelConfig.services && typeof vercelConfig.services === "object");
+  assert.equal(vercelConfig.services.app.root, ".");
+  assert.equal(vercelConfig.services.app.framework, "nitro");
+  assert.ok(Array.isArray(vercelConfig.services.app.bindings));
+  const imagingBinding = vercelConfig.services.app.bindings.find((b) => b.service === "imaging-service");
+  assert.ok(imagingBinding, "app service must declare a binding to imaging-service");
+  assert.equal(imagingBinding.type, "service");
+  assert.equal(imagingBinding.format, "url");
+  assert.equal(imagingBinding.env, "ANATOMYBRIDGE_SERVICE_URL");
+
+  assert.equal(vercelConfig.services["imaging-service"].root, "imaging-service");
+  assert.equal(vercelConfig.services["imaging-service"].framework, "fastapi");
+  assert.equal(vercelConfig.services["imaging-service"].entrypoint, "app/main.py");
+
+  assert.ok(Array.isArray(vercelConfig.rewrites) && vercelConfig.rewrites.length >= 1);
+  const catchAll = vercelConfig.rewrites[vercelConfig.rewrites.length - 1];
+  assert.equal(catchAll.source, "/(.*)");
+  assert.deepEqual(catchAll.destination, { service: "app" });
+});

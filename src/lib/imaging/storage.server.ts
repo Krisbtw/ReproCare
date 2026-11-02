@@ -1,6 +1,7 @@
 /**
  * Server-side persistent storage, integrity verification, PHI scrubbing, and historical
- * evidence retrieval for medical imaging artifacts (Sprint 3 Task 1 & Final Completion Sprint 1 Task 1).
+ * evidence retrieval for medical imaging artifacts (Sprint 3 Task 1, Final Completion Sprint 1 Task 1,
+ * and Supabase Storage Integration).
  *
  * Security & Authorization Invariants (Fail-Closed):
  * 1. All authorization checks (`checkPatientAndClinicianAccess` and `verifyCallerIdentityAndProfile`)
@@ -15,19 +16,87 @@
  * 5. Cross-user access by a verified clinician requires an active, non-expired, non-revoked consent
  *    in `patient_clinician_consents` granting `'view_imaging'` for retrieval/listing/integrity and
  *    additionally `'add_annotations'` or `'review_ai_findings'` for upload/mutation/purge.
- * 6. Identical authorization rules apply to original DICOM files, volumes, segmentation masks,
- *    3D meshes, and report artifacts.
+ * 6. Identical authorization rules apply to original DICOM files, NIfTI volumes, segmentation masks,
+ *    3D meshes, and report artifacts across all private buckets (`reprocare-imaging`,
+ *    `reprocare-reports`, `reprocare-derived`).
  * 7. Cross-patient manipulated IDs (`patientId`, `objectId`, `studyId`, `seriesId`, `findingId`,
  *    `findingVersionId`, `sourceObjectId`) are validated against the target patient record.
  * 8. Error messages and stored metadata never leak internal filesystem roots, credentials, or PHI.
  */
 import { createHash } from "node:crypto";
-import { appendFile, copyFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { Sql } from "../db.ts";
+import {
+  ALL_SUPABASE_BUCKETS,
+  BUCKET_SPECIFICATIONS,
+  DEFAULT_SIGNED_URL_EXPIRY_SECONDS,
+  LocalDurableStorageProvider,
+  MAX_DIRECT_UPLOAD_BYTES,
+  MAX_SIGNED_URL_EXPIRY_SECONDS,
+  MIN_SIGNED_URL_EXPIRY_SECONDS,
+  SUPABASE_STORAGE_BUCKETS,
+  SupabaseStorageProvider,
+  TUS_RECOMMENDED_CHUNK_BYTES,
+  executeTusResumableUpload,
+  getActiveStorageFetch,
+  isMimeTypeAllowedForBucket,
+  migrateLocalImagingToSupabase,
+  redactStorageSecrets,
+  resolveBucketForArtifactKind,
+  resolveStorageProvider,
+  resolveSupabaseStorageConfig,
+  setCustomStorageFetchForTests,
+  verifySignedUrlAccess,
+  type BucketSpecification,
+  type FetchLike,
+  type LocalToSupabaseMigrationItemReport,
+  type LocalToSupabaseMigrationSummary,
+  type SignedDownloadUrlResult,
+  type SignedUploadUrlResult,
+  type StorageObjectMetadata,
+  type StorageProviderAdapter,
+  type SupabaseBucketName,
+  type SupabaseStorageConfig,
+  type TusResumableUploadSession,
+} from "./supabase-storage.server.ts";
+
+export {
+  ALL_SUPABASE_BUCKETS,
+  BUCKET_SPECIFICATIONS,
+  DEFAULT_SIGNED_URL_EXPIRY_SECONDS,
+  LocalDurableStorageProvider,
+  MAX_DIRECT_UPLOAD_BYTES,
+  MAX_SIGNED_URL_EXPIRY_SECONDS,
+  MIN_SIGNED_URL_EXPIRY_SECONDS,
+  SUPABASE_STORAGE_BUCKETS,
+  SupabaseStorageProvider,
+  TUS_RECOMMENDED_CHUNK_BYTES,
+  executeTusResumableUpload,
+  getActiveStorageFetch,
+  isMimeTypeAllowedForBucket,
+  migrateLocalImagingToSupabase,
+  redactStorageSecrets,
+  resolveBucketForArtifactKind,
+  resolveStorageProvider,
+  resolveSupabaseStorageConfig,
+  setCustomStorageFetchForTests,
+  verifySignedUrlAccess,
+  type BucketSpecification,
+  type FetchLike,
+  type LocalToSupabaseMigrationItemReport,
+  type LocalToSupabaseMigrationSummary,
+  type SignedDownloadUrlResult,
+  type SignedUploadUrlResult,
+  type StorageObjectMetadata,
+  type StorageProviderAdapter,
+  type SupabaseBucketName,
+  type SupabaseStorageConfig,
+  type TusResumableUploadSession,
+};
 
 const DEFAULT_STORAGE_PATH = ".data/imaging";
-export const MAX_IMAGING_OBJECT_BYTES = 64 * 1024 * 1024; // 64 MB per object
+export const MAX_IMAGING_OBJECT_BYTES = 64 * 1024 * 1024; // 64 MB per buffered server upload (use direct/TUS for up to 512 MB)
 
 export function getStorageBase(): string {
   return (
@@ -47,9 +116,16 @@ export type ImagingArtifactKind =
   | "dicom_instance"
   | "dicom_series"
   | "segmentation_mask"
-  | "mesh_3d";
+  | "mesh_3d"
+  | "nifti_volume";
 export type CanonicalArtifactKind = "dicom" | "mask" | "mesh" | "volume" | "report";
-export type ImagingObjectStatus = "active" | "archived" | "purged" | "corrupted" | "missing";
+export type ImagingObjectStatus =
+  | "pending_upload"
+  | "active"
+  | "archived"
+  | "purged"
+  | "corrupted"
+  | "missing";
 
 const KIND_ALIAS_MAP: Record<string, CanonicalArtifactKind> = {
   dicom: "dicom",
@@ -60,6 +136,7 @@ const KIND_ALIAS_MAP: Record<string, CanonicalArtifactKind> = {
   mesh: "mesh",
   mesh_3d: "mesh",
   volume: "volume",
+  nifti_volume: "volume",
   report: "report",
   clinical_report: "report",
 };
@@ -94,7 +171,7 @@ function validateSafeId(rawId: unknown, fieldName: string): string {
 }
 
 const SENSITIVE_METADATA_KEY_RE =
-  /(?:password|secret|token|api[_-]?key|authorization|connection[_-]?string|private[_-]?key|database[_-]?url|storage[_-]?root|storage[_-]?path|patient[_-]?name|patient[_-]?birth|patient[_-]?address|patient[_-]?phone|patient[_-]?tel|ssn|aadhaar)/i;
+  /(?:password|secret|token|api[_-]?key|authorization|connection[_-]?string|private[_-]?key|database[_-]?url|storage[_-]?root|storage[_-]?path|patient[_-]?name|patient[_-]?birth|patient[_-]?address|patient[_-]?phone|patient[_-]?tel|ssn|aadhaar|service[_-]?role)/i;
 
 /**
  * Strips credentials, storage paths, and direct PHI keys from user-supplied metadata objects.
@@ -113,7 +190,6 @@ export function redactSensitiveMetadata(
     if (v && typeof v === "object" && !Array.isArray(v)) {
       clean[k] = redactSensitiveMetadata(v as Record<string, unknown>);
     } else if (typeof v === "string") {
-      // Redact any embedded bearer tokens or connection strings
       clean[k] = v
         .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "[REDACTED_TOKEN]")
         .replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "[REDACTED_URI]");
@@ -173,6 +249,9 @@ export interface StoredArtifactRecord {
   sopInstanceUid: string | null;
   instanceNumber: number | null;
   kind: ImagingArtifactKind;
+  storageBucket: SupabaseBucketName;
+  storageProvider: "supabase" | "local_durable";
+  objectPath: string;
   storageUri: string;
   storagePath: string;
   sha256: string;
@@ -187,6 +266,8 @@ export interface StoredArtifactRecord {
   originalFilename: string;
   metadataJson: string;
   status: ImagingObjectStatus;
+  processingStatus: string;
+  deidentificationStatus: string;
   createdBy: string;
   retentionUntil: string | null;
   createdAt: string;
@@ -206,6 +287,8 @@ export interface ObjectIntegrityReport {
   integrityOk: boolean;
   valid: boolean;
   error: string | null;
+  storageBucket?: SupabaseBucketName;
+  storageProvider?: "supabase" | "local_durable";
 }
 
 export interface HistoricalFindingImagingEvidence {
@@ -303,10 +386,6 @@ export interface HistoricalFindingImagingEvidence {
   }>;
 }
 
-/**
- * Direct PHI tags (Group 0x0010 and identifying Group 0x0008/0x0020 tags) that must be
- * scrubbed from DICOM Part-10 files before persistent storage.
- */
 const PHI_TAGS_TO_SCRUB = new Set<string>([
   "0008,0050", // AccessionNumber
   "0008,0080", // InstitutionName
@@ -332,10 +411,6 @@ function tagKey(group: number, elem: number): string {
   return `${group.toString(16).padStart(4, "0").toLowerCase()},${elem.toString(16).padStart(4, "0").toLowerCase()}`;
 }
 
-/**
- * Validates that a buffer is a well-formed NEMA PS3.10 DICOM file, extracts non-identifying
- * spatial/instance metadata, and zeroes/scrubs any populated PHI tags in-place on a copy.
- */
 export function validateAndScrubDicomBuffer(raw: Uint8Array | Buffer): {
   scrubbedBytes: Buffer;
   metadata: DicomInstanceMetadata;
@@ -383,7 +458,6 @@ export function validateAndScrubDicomBuffer(raw: Uint8Array | Buffer): {
     }
 
     if (group === 0x7fe0 && elem === 0x0010) {
-      // Reached PixelData
       break;
     }
 
@@ -398,7 +472,6 @@ export function validateAndScrubDicomBuffer(raw: Uint8Array | Buffer): {
       if (rawStr.length > 0 && !/^0+$/.test(rawStr) && rawStr.toLowerCase() !== "anonymous") {
         metadata.phiTagsScrubbed.push(key);
       }
-      // Overwrite PHI value bytes in the stored copy with spaces (or null for UI)
       const fillByte = vr === "UI" ? 0x00 : 0x20;
       out.fill(fillByte, valOffset, valOffset + length);
     } else {
@@ -445,7 +518,6 @@ export function validateAndScrubDicomBuffer(raw: Uint8Array | Buffer): {
 
 function sanitizeFilename(raw: string): string {
   const base = raw.split(/[/\\]/).pop() ?? "artifact.bin";
-  // Strip any potential patient name prefix and restrict characters
   return base.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) || "artifact.bin";
 }
 
@@ -461,12 +533,6 @@ export interface DurableAuditOutboxEntry {
   entrySha256: string;
 }
 
-/**
- * Writes an audit event to PostgreSQL `audit_events` AND to a durable append-only server-side
- * audit outbox (`<storageBase>/.audit/audit-outbox.jsonl`). If the database insert fails, the
- * event is persisted to `<storageBase>/.audit/pending-outbox.jsonl` so critical security,
- * consent, clinician-verification, and imaging-deletion audit events never silently disappear.
- */
 export async function writeAuditEvent(
   sql: Sql,
   userId: string,
@@ -513,7 +579,6 @@ export async function writeAuditEvent(
       await appendFile(join(auditDir, "pending-outbox.jsonl"), line, "utf8");
     }
   } catch {
-    // If both DB and local disk outbox fail on a critical security/deletion event, fail closed
     if (!dbPersisted && /purge|delete|consent|verif|deidentify/i.test(action)) {
       throw new Error("Audit persistence failure: unable to record critical security event to database or durable outbox.");
     }
@@ -522,10 +587,6 @@ export async function writeAuditEvent(
   return entry;
 }
 
-/**
- * Replays any pending durable audit outbox entries (`pending-outbox.jsonl`) into PostgreSQL
- * `audit_events` after a transient database failure, clearing replayed entries once committed.
- */
 export async function flushPendingAuditOutbox(
   sql: Sql,
 ): Promise<{ replayedCount: number; remainingCount: number }> {
@@ -571,9 +632,6 @@ export async function flushPendingAuditOutbox(
   return { replayedCount, remainingCount: remaining.length };
 }
 
-/**
- * Reads all durable audit outbox records stored in `<storageBase>/.audit/audit-outbox.jsonl`.
- */
 export async function readDurableAuditOutbox(): Promise<DurableAuditOutboxEntry[]> {
   const outboxPath = resolve(getStorageBase(), ".audit", "audit-outbox.jsonl");
   try {
@@ -588,10 +646,6 @@ export async function readDurableAuditOutbox(): Promise<DurableAuditOutboxEntry[
   }
 }
 
-/**
- * Verifies that `userId` is authenticated and has an existing row in `profiles` before
- * any imaging object lookup is performed. Fails closed on missing profile or DB query error.
- */
 async function verifyCallerIdentityAndProfile(
   sql: Sql,
   userId: string,
@@ -644,20 +698,6 @@ async function verifyCallerIdentityAndProfile(
   return { uid, role, canActAsClinician, isVerifiedClinician };
 }
 
-/**
- * Authoritative fail-closed access control check for all imaging storage operations.
- *
- * Enforces:
- * 1. Authenticated user identity and existing profile in `profiles` (missing profile is NEVER allowed).
- * 2. Database errors during profile, patient, clinician verification, or consent queries NEVER fail open.
- * 3. Clinicians must hold an approved verification record (`verified` or `approved`); unverified,
- *    pending, rejected, suspended, or revoked clinicians are denied immediately.
- * 4. Cross-user access (`patient.user_id !== uid`) is permitted ONLY for a verified clinician with an
- *    active, non-expired, non-revoked consent in `patient_clinician_consents` granting `'view_imaging'`
- *    (and `'add_annotations'` or `'review_ai_findings'` when `requireClinicianForMutation === true`).
- * 5. Patients may only read/list/verify their own (`patient.user_id === uid && patient.is_self === true`)
- *    imaging objects and may never upload or purge clinical imaging artifacts.
- */
 export async function checkPatientAndClinicianAccess(
   sql: Sql,
   userId: string,
@@ -668,7 +708,6 @@ export async function checkPatientAndClinicianAccess(
     await verifyCallerIdentityAndProfile(sql, userId);
   const pid = validateSafeId(patientId, "patientId");
 
-  // If caller has role='clinician' but is not verified/approved, block clinician operations immediately
   if (role === "clinician" && !isVerifiedClinician) {
     throw new Error(
       "Unauthorized: Clinician verification is not approved. Unverified, pending, suspended, or revoked clinicians cannot access imaging storage.",
@@ -692,7 +731,6 @@ export async function checkPatientAndClinicianAccess(
   const patientOwnerUserId = String(patient.user_id);
 
   if (patientOwnerUserId !== uid) {
-    // Cross-user access: strictly restricted to a verified clinician with active consent
     if (!isVerifiedClinician || role === "admin") {
       throw new Error("Unauthorized: Record not found or access denied.");
     }
@@ -754,7 +792,6 @@ export async function checkPatientAndClinicianAccess(
     return { patientOwnerUserId, callerRole: role, isVerifiedClinician };
   }
 
-  // Same-user access (`patientOwnerUserId === uid`)
   if (requireClinicianForMutation && !canActAsClinician) {
     throw new Error(
       "Unauthorized: Storing or modifying clinical imaging artifacts requires verified clinician credentials.",
@@ -768,8 +805,12 @@ export async function checkPatientAndClinicianAccess(
 }
 
 function mapArtifactRow(r: Record<string, unknown>): StoredArtifactRecord {
-  const relUri = String(r.storageUri ?? r.storage_uri ?? "");
-  const fullPath = relUri.startsWith("/") ? relUri : resolve(resolve(getStorageBase()), relUri);
+  const relUri = String(r.objectPath ?? r.object_path ?? r.storageUri ?? r.storage_uri ?? "").replace(
+    /^\/+/,
+    "",
+  );
+  const rawUri = String(r.storageUri ?? r.storage_uri ?? relUri);
+  const fullPath = rawUri.startsWith("/") ? rawUri : resolve(resolve(getStorageBase()), rawUri);
   const sha = String(r.sha256 ?? "");
   const studyId = (r.studyId ?? r.study_id ?? null) as string | null;
   const seriesId = (r.seriesId ?? r.series_id ?? null) as string | null;
@@ -778,6 +819,50 @@ function mapArtifactRow(r: Record<string, unknown>): StoredArtifactRecord {
     r.instanceNumber != null || r.instance_number != null
       ? Number(r.instanceNumber ?? r.instance_number)
       : null;
+
+  const metaStr = String(r.metadataJson ?? r.metadata_json ?? "{}");
+  let parsedMeta: Record<string, unknown> = {};
+  try {
+    parsedMeta = JSON.parse(metaStr);
+  } catch {
+    parsedMeta = {};
+  }
+
+  const rawKind = (
+    (parsedMeta.artifactKind as string | undefined) ??
+    (r.kind as string | undefined) ??
+    "dicom"
+  ) as ImagingArtifactKind;
+
+  const storageBucket = (
+    (parsedMeta.storageBucket as string | undefined) ??
+    (r.storageBucket as string | undefined) ??
+    (r.storage_bucket as string | undefined) ??
+    resolveBucketForArtifactKind(rawKind, parsedMeta)
+  ) as SupabaseBucketName;
+
+  const rawProvider = String(
+    parsedMeta.storageProvider ??
+      r.storageProvider ??
+      r.storage_provider ??
+      (resolveSupabaseStorageConfig() ? "supabase" : "local_durable"),
+  );
+  const storageProvider: "supabase" | "local_durable" =
+    rawProvider === "supabase" ? "supabase" : "local_durable";
+
+  const processingStatus = String(
+    r.processingStatus ??
+      r.processing_status ??
+      parsedMeta.processingStatus ??
+      "completed",
+  );
+  const deidentificationStatus = String(
+    r.deidentificationStatus ??
+      r.deidentification_status ??
+      parsedMeta.deidentificationStatus ??
+      "deidentified",
+  );
+
   return {
     id: String(r.id),
     userId: String(r.userId ?? r.user_id),
@@ -792,7 +877,10 @@ function mapArtifactRow(r: Record<string, unknown>): StoredArtifactRecord {
     series_id: seriesId,
     sop_instance_uid: sopInstanceUid,
     instance_number: instanceNumber,
-    kind: (r.kind as ImagingArtifactKind) ?? "dicom",
+    kind: rawKind,
+    storageBucket,
+    storageProvider,
+    objectPath: relUri,
     storageUri: fullPath,
     storagePath: fullPath,
     sha256: sha,
@@ -801,8 +889,10 @@ function mapArtifactRow(r: Record<string, unknown>): StoredArtifactRecord {
     version: Number(r.version ?? 1),
     mimeType: String(r.mimeType ?? r.mime_type ?? "application/octet-stream"),
     originalFilename: String(r.originalFilename ?? r.original_filename ?? ""),
-    metadataJson: String(r.metadataJson ?? r.metadata_json ?? "{}"),
+    metadataJson: metaStr,
     status: ((r.status as ImagingObjectStatus) ?? "active"),
+    processingStatus,
+    deidentificationStatus,
     createdBy: String(r.createdBy ?? r.created_by),
     retentionUntil: (r.retentionUntil ?? r.retention_until ?? null) as string | null,
     createdAt: String(r.createdAt ?? r.created_at ?? ""),
@@ -811,48 +901,44 @@ function mapArtifactRow(r: Record<string, unknown>): StoredArtifactRecord {
   };
 }
 
+function getProviderForRecord(record: StoredArtifactRecord): StorageProviderAdapter {
+  const active = resolveStorageProvider(getStorageBase());
+  if (record.storageProvider === "supabase" && active.providerName === "supabase") {
+    return active;
+  }
+  const supaCfg = resolveSupabaseStorageConfig();
+  if (record.storageProvider === "supabase" && supaCfg) {
+    return new SupabaseStorageProvider(supaCfg);
+  }
+  return new LocalDurableStorageProvider(getStorageBase());
+}
+
 /**
- * Stores an imaging artifact securely to persistent disk and records its provenance in imaging_objects.
- *
- * Enforces:
- * - Fail-closed authorization (`checkPatientAndClinicianAccess` with `requireClinicianForMutation = true`).
- * - Cross-patient ID ownership verification for `studyId`, `seriesId`, `findingVersionId`, and `sourceObjectId`.
- * - Upload validation (size, kind, and DICOM Part-10 format + PHI scrubbing when kind === 'dicom').
- * - Duplicate detection (returns existing active record with `deduplicated: true` if identical SHA-256 exists
- *   for the same patient, series, and kind, unless `forceNewVersion` is true).
- * - Monotonic versioning (`version = max + 1`) and unique storage URI so existing files are NEVER overwritten silently.
+ * Validates cross-patient ownership for optional relational references (`studyId`, `seriesId`,
+ * `findingVersionId`, `sourceObjectId`) before any upload or signed URL issuance.
  */
-export async function storeImagingArtifact(
+async function validateRelationalOwnership(
   sql: Sql,
-  input: StoreArtifactInput,
-): Promise<StoredArtifactRecord> {
-  const { patientOwnerUserId } = await checkPatientAndClinicianAccess(
-    sql,
-    input.userId,
-    input.patientId,
-    true,
-  );
-  const actorUserId = validateSafeId(input.userId, "userId");
-  const patientId = validateSafeId(input.patientId, "patientId");
-
-  const canonicalKind = normalizeKind(input.kind);
-  if (!input.data || input.data.byteLength === 0) {
-    throw new Error("Invalid imaging upload: payload is empty (0 bytes).");
-  }
-  if (input.data.byteLength > MAX_IMAGING_OBJECT_BYTES) {
-    throw new Error(
-      `Invalid imaging upload: payload (${input.data.byteLength} bytes) exceeds maximum allowed limit (${MAX_IMAGING_OBJECT_BYTES} bytes).`,
-    );
-  }
-
-  // Validate manipulated cross-patient IDs before writing anything to disk
-  let resolvedStudyId: string | null = input.studyId ? validateSafeId(input.studyId, "studyId") : null;
-  const requestedSeriesId: string | null = input.seriesId ? validateSafeId(input.seriesId, "seriesId") : null;
-  const requestedFvId: string | null = input.findingVersionId
-    ? validateSafeId(input.findingVersionId, "findingVersionId")
+  patientId: string,
+  refs: {
+    studyId?: string | null;
+    seriesId?: string | null;
+    findingVersionId?: string | null;
+    sourceObjectId?: string | null;
+  },
+): Promise<{
+  resolvedStudyId: string | null;
+  requestedSeriesId: string | null;
+  requestedFvId: string | null;
+  requestedSourceObjId: string | null;
+}> {
+  let resolvedStudyId: string | null = refs.studyId ? validateSafeId(refs.studyId, "studyId") : null;
+  const requestedSeriesId: string | null = refs.seriesId ? validateSafeId(refs.seriesId, "seriesId") : null;
+  const requestedFvId: string | null = refs.findingVersionId
+    ? validateSafeId(refs.findingVersionId, "findingVersionId")
     : null;
-  const requestedSourceObjId: string | null = input.sourceObjectId
-    ? validateSafeId(input.sourceObjectId, "sourceObjectId")
+  const requestedSourceObjId: string | null = refs.sourceObjectId
+    ? validateSafeId(refs.sourceObjectId, "sourceObjectId")
     : null;
 
   if (resolvedStudyId) {
@@ -922,6 +1008,44 @@ export async function storeImagingArtifact(
     }
   }
 
+  return { resolvedStudyId, requestedSeriesId, requestedFvId, requestedSourceObjId };
+}
+
+/**
+ * Stores an imaging artifact securely to the active storage provider (Supabase Storage in
+ * production or local durable storage in dev/tests) and records its metadata in `imaging_objects`.
+ */
+export async function storeImagingArtifact(
+  sql: Sql,
+  input: StoreArtifactInput,
+): Promise<StoredArtifactRecord> {
+  const { patientOwnerUserId } = await checkPatientAndClinicianAccess(
+    sql,
+    input.userId,
+    input.patientId,
+    true,
+  );
+  const actorUserId = validateSafeId(input.userId, "userId");
+  const patientId = validateSafeId(input.patientId, "patientId");
+
+  const canonicalKind = normalizeKind(input.kind);
+  if (!input.data || input.data.byteLength === 0) {
+    throw new Error("Invalid imaging upload: payload is empty (0 bytes).");
+  }
+  if (input.data.byteLength > MAX_IMAGING_OBJECT_BYTES) {
+    throw new Error(
+      `Invalid imaging upload: payload (${input.data.byteLength} bytes) exceeds maximum allowed limit (${MAX_IMAGING_OBJECT_BYTES} bytes).`,
+    );
+  }
+
+  const { resolvedStudyId, requestedSeriesId, requestedFvId, requestedSourceObjId } =
+    await validateRelationalOwnership(sql, patientId, {
+      studyId: input.studyId,
+      seriesId: input.seriesId,
+      findingVersionId: input.findingVersionId,
+      sourceObjectId: input.sourceObjectId,
+    });
+
   let payloadToStore: Buffer = Buffer.from(input.data);
   let extractedDicomMeta: DicomInstanceMetadata | null = null;
   const rawName = input.filename || input.fileName || `${canonicalKind}.bin`;
@@ -950,21 +1074,31 @@ export async function storeImagingArtifact(
   const defaultMime =
     canonicalKind === "dicom"
       ? "application/dicom"
-      : canonicalKind === "mask"
-        ? "application/octet-stream"
-        : canonicalKind === "mesh"
-          ? "model/stl"
-          : "application/octet-stream";
+      : canonicalKind === "report"
+        ? "application/pdf"
+        : canonicalKind === "mask"
+          ? "application/octet-stream"
+          : canonicalKind === "mesh"
+            ? "model/stl"
+            : "application/octet-stream";
   const mimeType = input.mimeType ?? defaultMime;
 
-  // Check for existing objects in this series/patient/kind for duplicate detection & monotonic versioning
+  const targetBucket = resolveBucketForArtifactKind(canonicalKind, {
+    ...(input.metadata ?? {}),
+    ...(requestedSourceObjId ? { sourceObjectId: requestedSourceObjId } : {}),
+  });
+  if (!isMimeTypeAllowedForBucket(targetBucket, mimeType)) {
+    throw new Error(
+      `Invalid imaging upload: MIME type '${mimeType}' is not permitted in private bucket '${targetBucket}'.`,
+    );
+  }
+
   let existingRows: Array<Record<string, unknown>>;
   try {
     existingRows = await sql<Record<string, unknown>>`
       select *
       from imaging_objects
       where patient_id = ${patientId}
-        and kind = ${canonicalKind}
         and coalesce(series_id, '') = ${requestedSeriesId ?? ""}
       order by version desc, created_at desc
     `;
@@ -972,9 +1106,14 @@ export async function storeImagingArtifact(
     throw new Error("Unauthorized: Database error while checking existing imaging versions; failing closed.");
   }
 
+  const sameKindRows = existingRows.filter((r) => {
+    const mapped = mapArtifactRow(r);
+    return normalizeKind(mapped.kind) === canonicalKind;
+  });
+
   const deduplicate = input.deduplicateIfIdentical !== false && !input.forceNewVersion;
   if (deduplicate) {
-    const exactMatch = existingRows.find(
+    const exactMatch = sameKindRows.find(
       (r) => String(r.sha256) === hash && (r.status == null || r.status === "active"),
     );
     if (exactMatch) {
@@ -983,27 +1122,32 @@ export async function storeImagingArtifact(
     }
   }
 
-  const maxVersion = existingRows.reduce((maxV, r) => Math.max(maxV, Number(r.version ?? 1)), 0);
+  const maxVersion = sameKindRows.reduce((maxV, r) => Math.max(maxV, Number(r.version ?? 1)), 0);
   const nextVersion = maxVersion + 1;
 
   const id = crypto.randomUUID();
   const base = resolve(getStorageBase());
   const safeOwner = patientOwnerUserId.replace(/[^a-zA-Z0-9_-]/g, "_");
   const safePatient = patientId.replace(/[^a-zA-Z0-9_-]/g, "_");
-  // Versioned, content-addressed path guarantees original imaging is never silently overwritten
-  const relativePath = join(
+  const relativePath = [
     safeOwner,
     safePatient,
     canonicalKind,
     `v${nextVersion}_${hash}_${id.slice(0, 8)}.bin`,
-  );
+  ].join("/");
   const fullPath = resolve(base, relativePath);
   if (!fullPath.startsWith(base)) {
     throw new Error("Security violation: resolved storage path escaped storage root.");
   }
 
-  await mkdir(dirname(fullPath), { recursive: true });
-  await writeFile(fullPath, payloadToStore, { flag: "wx" });
+  const provider = resolveStorageProvider(base);
+  await provider.uploadObject({
+    bucket: targetBucket,
+    objectPath: relativePath,
+    data: payloadToStore,
+    mimeType,
+    upsert: false,
+  });
 
   let retentionUntil: Date | null = null;
   if (input.retentionDays && input.retentionDays > 0) {
@@ -1013,10 +1157,23 @@ export async function storeImagingArtifact(
   const sopUid = input.sopInstanceUid ?? extractedDicomMeta?.sopInstanceUid ?? null;
   const instNum = input.instanceNumber ?? extractedDicomMeta?.instanceNumber ?? null;
   const sanitizedCustomMeta = redactSensitiveMetadata(input.metadata);
+  const deidentificationStatus =
+    canonicalKind === "dicom"
+      ? extractedDicomMeta
+        ? "dicom_ps315_scrubbed"
+        : "verified_synthetic"
+      : "deidentified";
+  const processingStatus = "completed";
+
   const combinedMeta = {
     ...(extractedDicomMeta ? { dicom: extractedDicomMeta } : {}),
     ...sanitizedCustomMeta,
     artifactKind: canonicalKind,
+    storageBucket: targetBucket,
+    storageProvider: provider.providerName,
+    objectPath: relativePath,
+    processingStatus,
+    deidentificationStatus,
     deidentified: true,
   };
   const metaJsonStr = JSON.stringify(combinedMeta);
@@ -1026,13 +1183,16 @@ export async function storeImagingArtifact(
     const rows = await sql<Record<string, unknown>>`
       insert into imaging_objects (
         id, user_id, patient_id, study_id, series_id, finding_version_id, source_object_id,
-        sop_instance_uid, instance_number, kind, storage_uri, sha256, bytes, version,
-        mime_type, original_filename, metadata_json, status, created_by, retention_until
+        sop_instance_uid, instance_number, kind, storage_bucket, storage_provider, object_path,
+        storage_uri, sha256, bytes, version, mime_type, original_filename, metadata_json,
+        status, processing_status, deidentification_status, created_by, retention_until
       ) values (
         ${id}, ${patientOwnerUserId}, ${patientId}, ${resolvedStudyId}, ${requestedSeriesId},
         ${requestedFvId}, ${requestedSourceObjId},
-        ${sopUid}, ${instNum}, ${canonicalKind}, ${relativePath}, ${hash}, ${payloadToStore.byteLength},
-        ${nextVersion}, ${mimeType}, ${safeFilename}, ${metaJsonStr}, 'active',
+        ${sopUid}, ${instNum}, ${canonicalKind}, ${targetBucket}, ${provider.providerName}, ${relativePath},
+        ${relativePath}, ${hash}, ${payloadToStore.byteLength},
+        ${nextVersion}, ${mimeType}, ${safeFilename}, ${metaJsonStr},
+        'active', ${processingStatus}, ${deidentificationStatus},
         ${actorUserId}, ${retentionUntil?.toISOString() ?? null}
       )
       returning *
@@ -1083,7 +1243,7 @@ export async function storeImagingArtifact(
     "store_imaging_object",
     "imaging_object",
     id,
-    `Stored ${canonicalKind} v${nextVersion} (${payloadToStore.byteLength} bytes, sha256 ${hash.slice(0, 12)}…) for patient ${patientId}${requestedSeriesId ? `, series ${requestedSeriesId}` : ""}.`,
+    `Stored ${canonicalKind} v${nextVersion} in ${provider.providerName}:${targetBucket} (${payloadToStore.byteLength} bytes, sha256 ${hash.slice(0, 12)}…) for patient ${patientId}${requestedSeriesId ? `, series ${requestedSeriesId}` : ""}.`,
   );
 
   return {
@@ -1099,6 +1259,9 @@ export async function storeImagingArtifact(
         sop_instance_uid: sopUid,
         instance_number: instNum,
         kind: canonicalKind,
+        storage_bucket: targetBucket,
+        storage_provider: provider.providerName,
+        object_path: relativePath,
         storage_uri: relativePath,
         sha256: hash,
         bytes: payloadToStore.byteLength,
@@ -1107,6 +1270,8 @@ export async function storeImagingArtifact(
         original_filename: safeFilename,
         metadata_json: metaJsonStr,
         status: "active",
+        processing_status: processingStatus,
+        deidentification_status: deidentificationStatus,
         created_by: actorUserId,
         retention_until: retentionUntil?.toISOString() ?? null,
         created_at: new Date().toISOString(),
@@ -1116,9 +1281,400 @@ export async function storeImagingArtifact(
   };
 }
 
+export interface AuthorizeDirectImagingUploadInput {
+  userId: string;
+  patientId: string;
+  studyId?: string | null;
+  seriesId?: string | null;
+  findingVersionId?: string | null;
+  sourceObjectId?: string | null;
+  kind: ImagingArtifactKind;
+  filename: string;
+  mimeType: string;
+  bytes: number;
+  sha256: string;
+  uploadMode?: "signed_url" | "tus_resumable";
+  expiresInSeconds?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AuthorizedDirectImagingUploadResult {
+  objectId: string;
+  patientId: string;
+  studyId: string | null;
+  seriesId: string | null;
+  kind: CanonicalArtifactKind;
+  bucket: SupabaseBucketName;
+  objectPath: string;
+  uploadMode: "signed_url" | "tus_resumable";
+  signedUpload?: SignedUploadUrlResult;
+  tusSession?: TusResumableUploadSession;
+}
+
 /**
- * Verifies the on-disk existence, byte size, and SHA-256 checksum of a stored imaging object
- * after strictly enforcing caller identity, profile, patient ownership, and consent checks.
+ * Authorizes a direct-to-storage upload (short-lived Signed Upload URL or TUS Resumable Upload session)
+ * so large DICOM/NIfTI imaging studies never pass through a Vercel serverless request body.
+ *
+ * Enforces:
+ * 1. `checkPatientAndClinicianAccess(sql, userId, patientId, true)` (verified clinician + active consent).
+ * 2. Relational ownership validation for `studyId`, `seriesId`, `findingVersionId`, `sourceObjectId`.
+ * 3. Server-generated object path (never trusts client-supplied paths).
+ * 4. Bucket-specific file size limit and allowed MIME type validation.
+ * 5. Valid 64-character hex SHA-256 checksum declaration.
+ */
+export async function authorizeDirectImagingUpload(
+  sql: Sql,
+  input: AuthorizeDirectImagingUploadInput,
+): Promise<AuthorizedDirectImagingUploadResult> {
+  const { patientOwnerUserId } = await checkPatientAndClinicianAccess(
+    sql,
+    input.userId,
+    input.patientId,
+    true,
+  );
+  const actorUserId = validateSafeId(input.userId, "userId");
+  const patientId = validateSafeId(input.patientId, "patientId");
+  const canonicalKind = normalizeKind(input.kind);
+
+  const cleanSha = String(input.sha256 ?? "").trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(cleanSha)) {
+    throw new Error("Invalid direct upload request: sha256 must be a valid 64-character hex digest.");
+  }
+
+  if (!Number.isInteger(input.bytes) || input.bytes <= 0) {
+    throw new Error("Invalid direct upload request: bytes must be a positive integer.");
+  }
+
+  const bucket = resolveBucketForArtifactKind(canonicalKind, {
+    ...(input.metadata ?? {}),
+    ...(input.sourceObjectId ? { sourceObjectId: input.sourceObjectId } : {}),
+  });
+  const bucketSpec = BUCKET_SPECIFICATIONS[bucket];
+  if (input.bytes > bucketSpec.fileSizeLimit) {
+    throw new Error(
+      `Invalid direct upload request: file size (${input.bytes} bytes) exceeds bucket '${bucket}' limit (${bucketSpec.fileSizeLimit} bytes).`,
+    );
+  }
+  if (!isMimeTypeAllowedForBucket(bucket, input.mimeType)) {
+    throw new Error(
+      `Invalid direct upload request: MIME type '${input.mimeType}' is not allowed in private bucket '${bucket}'.`,
+    );
+  }
+
+  const { resolvedStudyId, requestedSeriesId, requestedFvId, requestedSourceObjId } =
+    await validateRelationalOwnership(sql, patientId, {
+      studyId: input.studyId,
+      seriesId: input.seriesId,
+      findingVersionId: input.findingVersionId,
+      sourceObjectId: input.sourceObjectId,
+    });
+
+  const existingRows = await sql<Record<string, unknown>>`
+    select version from imaging_objects
+    where patient_id = ${patientId} and coalesce(series_id, '') = ${requestedSeriesId ?? ""}
+  `;
+  const maxVersion = existingRows.reduce((maxV, r) => Math.max(maxV, Number(r.version ?? 1)), 0);
+  const nextVersion = maxVersion + 1;
+
+  const objectId = crypto.randomUUID();
+  const safeOwner = patientOwnerUserId.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const safePatient = patientId.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const safeFilename = sanitizeFilename(input.filename || `${canonicalKind}.bin`);
+  const objectPath = [
+    safeOwner,
+    safePatient,
+    canonicalKind,
+    `v${nextVersion}_${cleanSha}_${objectId.slice(0, 8)}.bin`,
+  ].join("/");
+
+  const provider = resolveStorageProvider(getStorageBase());
+  const uploadMode: "signed_url" | "tus_resumable" =
+    input.uploadMode ?? (input.bytes > 6 * 1024 * 1024 ? "tus_resumable" : "signed_url");
+
+  let signedUpload: SignedUploadUrlResult | undefined;
+  let tusSession: TusResumableUploadSession | undefined;
+
+  if (uploadMode === "tus_resumable") {
+    tusSession = await provider.createTusResumableUploadSession({
+      bucket,
+      objectPath,
+      totalBytes: input.bytes,
+      mimeType: input.mimeType,
+      sha256: cleanSha,
+    });
+  } else {
+    signedUpload = await provider.createSignedUploadUrl({
+      bucket,
+      objectPath,
+      expiresInSeconds: input.expiresInSeconds,
+    });
+  }
+
+  const sanitizedMeta = redactSensitiveMetadata(input.metadata);
+  const metaJsonStr = JSON.stringify({
+    ...sanitizedMeta,
+    artifactKind: canonicalKind,
+    storageBucket: bucket,
+    storageProvider: provider.providerName,
+    objectPath,
+    uploadMode,
+    processingStatus: "pending_upload",
+    deidentificationStatus: "pending_verification",
+  });
+
+  const dbCompatKind =
+    canonicalKind === "dicom" ||
+    canonicalKind === "mask" ||
+    canonicalKind === "mesh" ||
+    canonicalKind === "volume"
+      ? canonicalKind
+      : "volume";
+
+  try {
+    await sql`
+      insert into imaging_objects (
+        id, user_id, patient_id, study_id, series_id, finding_version_id, source_object_id,
+        kind, storage_bucket, storage_provider, object_path, storage_uri, sha256, bytes, version,
+        mime_type, original_filename, metadata_json, status, processing_status, deidentification_status, created_by
+      ) values (
+        ${objectId}, ${patientOwnerUserId}, ${patientId}, ${resolvedStudyId}, ${requestedSeriesId},
+        ${requestedFvId}, ${requestedSourceObjId},
+        ${canonicalKind}, ${bucket}, ${provider.providerName}, ${objectPath}, ${objectPath},
+        ${cleanSha}, ${input.bytes}, ${nextVersion}, ${input.mimeType}, ${safeFilename},
+        ${metaJsonStr}, 'pending_upload', 'pending_upload', 'pending_verification', ${actorUserId}
+      )
+    `;
+  } catch {
+    try {
+      await sql`
+        insert into imaging_objects (
+          id, user_id, patient_id, study_id, series_id, finding_version_id, source_object_id,
+          kind, storage_uri, sha256, bytes, version, mime_type, original_filename,
+          metadata_json, status, created_by
+        ) values (
+          ${objectId}, ${patientOwnerUserId}, ${patientId}, ${resolvedStudyId}, ${requestedSeriesId},
+          ${requestedFvId}, ${requestedSourceObjId},
+          ${dbCompatKind}, ${objectPath}, ${cleanSha}, ${input.bytes}, ${nextVersion},
+          ${input.mimeType}, ${safeFilename}, ${metaJsonStr}, 'archived', ${actorUserId}
+        )
+      `;
+    } catch {
+      await sql`
+        insert into imaging_objects (
+          id, user_id, patient_id, series_id, kind, storage_uri, sha256, bytes, version, created_by
+        ) values (
+          ${objectId}, ${patientOwnerUserId}, ${patientId}, ${requestedSeriesId},
+          ${dbCompatKind}, ${objectPath}, ${cleanSha}, ${input.bytes}, ${nextVersion}, ${actorUserId}
+        )
+      `;
+    }
+  }
+
+  await writeAuditEvent(
+    sql,
+    actorUserId,
+    "authorize_direct_imaging_upload",
+    "imaging_object",
+    objectId,
+    `Authorized ${uploadMode} upload for ${canonicalKind} object ${objectId} in ${provider.providerName}:${bucket} (${input.bytes} bytes, sha256 ${cleanSha.slice(0, 12)}…) for patient ${patientId}.`,
+  );
+
+  return {
+    objectId,
+    patientId,
+    studyId: resolvedStudyId,
+    seriesId: requestedSeriesId,
+    kind: canonicalKind,
+    bucket,
+    objectPath,
+    uploadMode,
+    ...(signedUpload ? { signedUpload } : {}),
+    ...(tusSession ? { tusSession } : {}),
+  };
+}
+
+/**
+ * Finalizes and verifies a direct/TUS upload after the binary payload has been uploaded to
+ * Supabase Storage, verifying SHA-256 integrity and byte size before marking the record `active`.
+ */
+export async function completeDirectImagingUpload(
+  sql: Sql,
+  input: {
+    userId: string;
+    objectId: string;
+  },
+): Promise<StoredArtifactRecord> {
+  const { uid } = await verifyCallerIdentityAndProfile(sql, input.userId);
+  const safeObjectId = validateSafeId(input.objectId, "objectId");
+
+  const rows = await sql<Record<string, unknown>>`
+    select * from imaging_objects where id = ${safeObjectId}
+  `;
+  if (rows.length === 0) {
+    throw new Error("Imaging object not found or access denied.");
+  }
+  const record = mapArtifactRow(rows[0]);
+  await checkPatientAndClinicianAccess(sql, uid, record.patientId, true);
+
+  const provider = getProviderForRecord(record);
+  let downloaded: Buffer;
+  try {
+    downloaded = await provider.downloadObject({
+      bucket: record.storageBucket,
+      objectPath: record.objectPath,
+    });
+  } catch {
+    throw new Error(
+      `Direct upload verification failed: object ${safeObjectId} was not found in bucket '${record.storageBucket}'.`,
+    );
+  }
+
+  const actualSha = createHash("sha256").update(downloaded).digest("hex");
+  if (actualSha !== record.sha256 || downloaded.byteLength !== record.bytes) {
+    await provider.deleteObject({
+      bucket: record.storageBucket,
+      objectPath: record.objectPath,
+    }).catch(() => false);
+    await sql`
+      update imaging_objects set status = 'corrupted' where id = ${safeObjectId}
+    `.catch(() => undefined);
+    await writeAuditEvent(
+      sql,
+      uid,
+      "direct_imaging_upload_integrity_failed",
+      "imaging_object",
+      safeObjectId,
+      `Rejected direct upload ${safeObjectId}: expected sha256 ${record.sha256.slice(0, 12)}… (${record.bytes}B), got ${actualSha.slice(0, 12)}… (${downloaded.byteLength}B).`,
+    );
+    throw new Error(
+      `Direct upload integrity verification failed for ${safeObjectId}: SHA-256 checksum or byte size mismatch.`,
+    );
+  }
+
+  let parsedMeta: Record<string, unknown> = {};
+  try {
+    parsedMeta = JSON.parse(record.metadataJson || "{}");
+  } catch {
+    parsedMeta = {};
+  }
+  const updatedMeta = JSON.stringify({
+    ...parsedMeta,
+    processingStatus: "completed",
+    deidentificationStatus: "deidentified",
+    verifiedAt: new Date().toISOString(),
+  });
+
+  try {
+    await sql`
+      update imaging_objects
+      set status = 'active',
+          processing_status = 'completed',
+          deidentification_status = 'deidentified',
+          metadata_json = ${updatedMeta},
+          updated_at = now()
+      where id = ${safeObjectId}
+    `;
+  } catch {
+    await sql`
+      update imaging_objects
+      set status = 'active',
+          metadata_json = ${updatedMeta}
+      where id = ${safeObjectId}
+    `.catch(() => undefined);
+  }
+
+  await writeAuditEvent(
+    sql,
+    uid,
+    "complete_direct_imaging_upload",
+    "imaging_object",
+    safeObjectId,
+    `Verified and activated direct upload ${safeObjectId} in ${record.storageBucket} (${record.bytes} bytes, sha256 ${record.sha256.slice(0, 12)}…).`,
+  );
+
+  const updatedRows = await sql<Record<string, unknown>>`
+    select * from imaging_objects where id = ${safeObjectId}
+  `;
+  return mapArtifactRow(updatedRows[0] ?? { ...rows[0], status: "active", metadata_json: updatedMeta });
+}
+
+/**
+ * Generates a short-lived signed download URL for a private medical imaging or report object
+ * ONLY after verifying caller identity, RBAC role, patient ownership, and active non-revoked consent.
+ */
+export async function generateAuthorizedSignedDownloadUrl(
+  sql: Sql,
+  input: {
+    userId: string;
+    objectId: string;
+    patientId?: string;
+    studyId?: string;
+    expiresInSeconds?: number;
+  },
+): Promise<SignedDownloadUrlResult & { objectId: string; patientId: string; sha256: string }> {
+  const { uid } = await verifyCallerIdentityAndProfile(sql, input.userId);
+  const safeObjectId = validateSafeId(input.objectId, "objectId");
+
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = await sql<Record<string, unknown>>`
+      select * from imaging_objects where id = ${safeObjectId}
+    `;
+  } catch {
+    throw new Error("Unauthorized: Database query failed while locating imaging object; failing closed.");
+  }
+
+  if (rows.length === 0) {
+    throw new Error("Imaging object not found or access denied.");
+  }
+
+  const record = mapArtifactRow(rows[0]);
+
+  // Prevent cross-patient or cross-study parameter manipulation
+  if (input.patientId && validateSafeId(input.patientId, "patientId") !== record.patientId) {
+    throw new Error("Unauthorized: Manipulated patientId does not match imaging object owner.");
+  }
+  if (input.studyId && validateSafeId(input.studyId, "studyId") !== record.studyId) {
+    throw new Error("Unauthorized: Manipulated studyId does not match imaging object study.");
+  }
+
+  await checkPatientAndClinicianAccess(sql, uid, record.patientId, false);
+
+  if (record.status === "purged") {
+    throw new Error(`Imaging object ${safeObjectId} has been purged under retention policy.`);
+  }
+  if (record.status === "corrupted" || record.status === "missing") {
+    throw new Error(`Imaging object ${safeObjectId} is unavailable (${record.status}).`);
+  }
+
+  const provider = getProviderForRecord(record);
+  const signed = await provider.createSignedDownloadUrl({
+    bucket: record.storageBucket,
+    objectPath: record.objectPath,
+    expiresInSeconds: input.expiresInSeconds,
+  });
+
+  await writeAuditEvent(
+    sql,
+    uid,
+    "generate_signed_download_url",
+    "imaging_object",
+    safeObjectId,
+    `Issued short-lived signed download URL (${signed.expiresInSeconds}s expiry) for ${record.kind} object ${safeObjectId} in ${record.storageBucket}.`,
+  );
+
+  return {
+    ...signed,
+    objectId: record.id,
+    patientId: record.patientId,
+    sha256: record.sha256,
+  };
+}
+
+/**
+ * Verifies the existence, byte size, and SHA-256 checksum of a stored imaging object
+ * across either Supabase Storage or local durable storage after strictly enforcing caller
+ * identity, profile, patient ownership, and consent checks.
  */
 export async function verifyImagingObjectIntegrity(
   sql: Sql,
@@ -1155,29 +1711,17 @@ export async function verifyImagingObjectIntegrity(
       integrityOk: false,
       valid: false,
       error: "Imaging object binary payload was purged under retention/deletion policy; metadata and audit record preserved.",
+      storageBucket: record.storageBucket,
+      storageProvider: record.storageProvider,
     };
   }
 
-  const base = resolve(getStorageBase());
-  const fullPath = resolve(base, record.storageUri);
-  if (!fullPath.startsWith(base)) {
-    return {
-      objectId: record.id,
-      exists: false,
-      status: record.status,
-      expectedSha256: record.sha256,
-      actualSha256: null,
-      expectedBytes: record.bytes,
-      actualBytes: null,
-      integrityOk: false,
-      valid: false,
-      error: "Invalid storage URI path.",
-    };
-  }
+  const provider = getProviderForRecord(record);
 
-  try {
-    const fileStat = await stat(fullPath);
-    if (!fileStat.isFile()) {
+  if (provider.providerName === "local_durable") {
+    const base = resolve(getStorageBase());
+    const fullPath = resolve(base, record.objectPath);
+    if (!fullPath.startsWith(base)) {
       return {
         objectId: record.id,
         exists: false,
@@ -1188,10 +1732,18 @@ export async function verifyImagingObjectIntegrity(
         actualBytes: null,
         integrityOk: false,
         valid: false,
-        error: "Storage path is not a regular file.",
+        error: "Invalid storage URI path.",
+        storageBucket: record.storageBucket,
+        storageProvider: record.storageProvider,
       };
     }
-    const data = await readFile(fullPath);
+  }
+
+  try {
+    const data = await provider.downloadObject({
+      bucket: record.storageBucket,
+      objectPath: record.objectPath,
+    });
     const actualSha256 = createHash("sha256").update(data).digest("hex");
     const sizeMatch = data.byteLength === record.bytes;
     const hashMatch = actualSha256 === record.sha256;
@@ -1211,6 +1763,8 @@ export async function verifyImagingObjectIntegrity(
         : !hashMatch
           ? `SHA-256 checksum mismatch (expected ${record.sha256.slice(0, 12)}…, got ${actualSha256.slice(0, 12)}…)`
           : `Byte size mismatch (expected ${record.bytes}, got ${data.byteLength})`,
+      storageBucket: record.storageBucket,
+      storageProvider: provider.providerName,
     };
   } catch {
     return {
@@ -1223,7 +1777,9 @@ export async function verifyImagingObjectIntegrity(
       actualBytes: null,
       integrityOk: false,
       valid: false,
-      error: `Missing storage object: binary file for artifact ${safeObjectId} is absent on disk.`,
+      error: `Missing storage object: binary file for artifact ${safeObjectId} is absent in ${provider.providerName}:${record.storageBucket}.`,
+      storageBucket: record.storageBucket,
+      storageProvider: provider.providerName,
     };
   }
 }
@@ -1261,15 +1817,21 @@ export async function getImagingArtifact(
     throw new Error(`Imaging object ${safeObjectId} has been purged under retention policy.`);
   }
 
-  const base = resolve(getStorageBase());
-  const fullPath = resolve(base, record.storageUri);
-  if (!fullPath.startsWith(base)) {
-    throw new Error("Security violation: invalid storage URI.");
+  const provider = getProviderForRecord(record);
+  if (provider.providerName === "local_durable") {
+    const base = resolve(getStorageBase());
+    const fullPath = resolve(base, record.objectPath);
+    if (!fullPath.startsWith(base)) {
+      throw new Error("Security violation: invalid storage URI.");
+    }
   }
 
   let data: Buffer;
   try {
-    data = await readFile(fullPath);
+    data = await provider.downloadObject({
+      bucket: record.storageBucket,
+      objectPath: record.objectPath,
+    });
   } catch {
     await writeAuditEvent(
       sql,
@@ -1277,10 +1839,10 @@ export async function getImagingArtifact(
       "imaging_integrity_missing",
       "imaging_object",
       safeObjectId,
-      `Missing storage blob detected when retrieving ${record.kind} object ${safeObjectId}.`,
+      `Missing storage blob detected when retrieving ${record.kind} object ${safeObjectId} from ${provider.providerName}:${record.storageBucket}.`,
     );
     throw new Error(
-      `Missing storage object: binary payload for artifact ${safeObjectId} could not be found on disk.`,
+      `Missing storage object: binary payload for artifact ${safeObjectId} could not be found in storage.`,
     );
   }
 
@@ -1299,7 +1861,20 @@ export async function getImagingArtifact(
     );
   }
 
-  const integrity = await verifyImagingObjectIntegrity(sql, uid, safeObjectId);
+  const integrity: ObjectIntegrityReport = {
+    objectId: record.id,
+    exists: true,
+    status: "ok" as unknown as ImagingObjectStatus,
+    expectedSha256: record.sha256,
+    actualSha256: actualHash,
+    expectedBytes: record.bytes,
+    actualBytes: data.byteLength,
+    integrityOk: data.byteLength === record.bytes,
+    valid: data.byteLength === record.bytes,
+    error: null,
+    storageBucket: record.storageBucket,
+    storageProvider: provider.providerName,
+  };
   return { record, integrity, ...(includeData ? { data } : {}) };
 }
 
@@ -1312,10 +1887,6 @@ export interface ListImagingArtifactsFilter {
   includePurged?: boolean;
 }
 
-/**
- * Lists stored imaging artifacts for a given series or patient after enforcing fail-closed
- * authorization and cross-patient filter validation.
- */
 export async function listImagingArtifacts(
   sql: Sql,
   userId: string,
@@ -1404,8 +1975,9 @@ export async function listImagingArtifacts(
 }
 
 /**
- * Purges the binary file of an imaging object for retention/erasure compliance while preserving
- * the database provenance tombstone and recording an immutable audit event.
+ * Purges the binary file of an imaging object from Supabase Storage or local durable storage
+ * for retention/erasure compliance while preserving the database provenance tombstone and
+ * recording an immutable audit event.
  */
 export async function purgeImagingArtifact(
   sql: Sql,
@@ -1434,34 +2006,19 @@ export async function purgeImagingArtifact(
   const record = mapArtifactRow(rows[0]);
   await checkPatientAndClinicianAccess(sql, uid, record.patientId, true);
 
-  const base = resolve(getStorageBase());
-  const fullPath = resolve(base, record.storageUri);
-  if (!fullPath.startsWith(base)) {
-    throw new Error("Security violation: invalid storage URI.");
-  }
+  const provider = getProviderForRecord(record);
 
-  // Two-phase atomic purge: stage the binary file before updating DB status.
-  // If the DB status update fails, restore the staged file so binary storage and DB status never diverge.
-  const stagedPath = `${fullPath}.purging-${crypto.randomUUID().slice(0, 8)}`;
-  let fileWasStaged = false;
-  try {
-    await rename(fullPath, stagedPath);
-    fileWasStaged = true;
-  } catch {
-    fileWasStaged = false;
-  }
-
-  let dbUpdated = false;
-  try {
-    const updatedRows = await sql<{ id: string }>`
-      update imaging_objects
-      set status = 'purged', purged_at = now(), updated_at = now()
-      where id = ${safeObjectId} and patient_id = ${record.patientId}
-      returning id
-    `;
-    dbUpdated = updatedRows.length > 0;
-  } catch {
+  if (provider.providerName === "supabase") {
+    let dbUpdated = false;
     try {
+      const updatedRows = await sql<{ id: string }>`
+        update imaging_objects
+        set status = 'purged', purged_at = now(), updated_at = now()
+        where id = ${safeObjectId} and patient_id = ${record.patientId}
+        returning id
+      `;
+      dbUpdated = updatedRows.length > 0;
+    } catch {
       const fallbackRows = await sql<{ id: string }>`
         update imaging_objects
         set status = 'purged'
@@ -1469,27 +2026,74 @@ export async function purgeImagingArtifact(
         returning id
       `;
       dbUpdated = fallbackRows.length > 0;
-    } catch (dbErr) {
+    }
+
+    if (!dbUpdated) {
+      throw new Error(
+        `Atomic purge aborted: imaging object ${safeObjectId} status could not be updated in database; binary file was preserved intact.`,
+      );
+    }
+
+    await provider.deleteObject({
+      bucket: record.storageBucket,
+      objectPath: record.objectPath,
+    });
+  } else {
+    const base = resolve(getStorageBase());
+    const fullPath = resolve(base, record.objectPath);
+    if (!fullPath.startsWith(base)) {
+      throw new Error("Security violation: invalid storage URI.");
+    }
+
+    const stagedPath = `${fullPath}.purging-${crypto.randomUUID().slice(0, 8)}`;
+    let fileWasStaged = false;
+    try {
+      await rename(fullPath, stagedPath);
+      fileWasStaged = true;
+    } catch {
+      fileWasStaged = false;
+    }
+
+    let dbUpdated = false;
+    try {
+      const updatedRows = await sql<{ id: string }>`
+        update imaging_objects
+        set status = 'purged', purged_at = now(), updated_at = now()
+        where id = ${safeObjectId} and patient_id = ${record.patientId}
+        returning id
+      `;
+      dbUpdated = updatedRows.length > 0;
+    } catch {
+      try {
+        const fallbackRows = await sql<{ id: string }>`
+          update imaging_objects
+          set status = 'purged'
+          where id = ${safeObjectId} and patient_id = ${record.patientId}
+          returning id
+        `;
+        dbUpdated = fallbackRows.length > 0;
+      } catch (dbErr) {
+        if (fileWasStaged) {
+          await rename(stagedPath, fullPath).catch(() => undefined);
+        }
+        throw new Error(
+          `Atomic purge aborted: failed to update database status for imaging object ${safeObjectId}; binary file was preserved intact (${dbErr instanceof Error ? dbErr.message : "DB error"}).`,
+        );
+      }
+    }
+
+    if (!dbUpdated) {
       if (fileWasStaged) {
         await rename(stagedPath, fullPath).catch(() => undefined);
       }
       throw new Error(
-        `Atomic purge aborted: failed to update database status for imaging object ${safeObjectId}; binary file was preserved intact (${dbErr instanceof Error ? dbErr.message : "DB error"}).`,
+        `Atomic purge aborted: imaging object ${safeObjectId} status could not be updated in database; binary file was preserved intact.`,
       );
     }
-  }
 
-  if (!dbUpdated) {
     if (fileWasStaged) {
-      await rename(stagedPath, fullPath).catch(() => undefined);
+      await unlink(stagedPath).catch(() => undefined);
     }
-    throw new Error(
-      `Atomic purge aborted: imaging object ${safeObjectId} status could not be updated in database; binary file was preserved intact.`,
-    );
-  }
-
-  if (fileWasStaged) {
-    await unlink(stagedPath).catch(() => undefined);
   }
 
   await writeAuditEvent(
@@ -1498,17 +2102,12 @@ export async function purgeImagingArtifact(
     "purge_imaging_object",
     "imaging_object",
     safeObjectId,
-    `Purged binary payload for ${record.kind} object ${safeObjectId} (sha256 ${record.sha256.slice(0, 12)}…): ${cleanReason}`,
+    `Purged binary payload for ${record.kind} object ${safeObjectId} from ${provider.providerName}:${record.storageBucket} (sha256 ${record.sha256.slice(0, 12)}…): ${cleanReason}`,
   );
 
   return { ok: true, purged: true, objectId: safeObjectId, status: "purged" };
 }
 
-/**
- * Retrieves the complete historical imaging evidence chain for a finding or specific finding version
- * (Patient -> Study -> Series -> Original DICOM Instances / Volume -> Segmentation Run -> Mask -> Mesh -> Reviews).
- * Enforces fail-closed authorization and verifies SHA-256 integrity on every linked storage object.
- */
 export async function getHistoricalFindingImagingEvidence(
   sql: Sql,
   userId: string,
@@ -1557,7 +2156,6 @@ export async function getHistoricalFindingImagingEvidence(
   const findingId = String(v.finding_id);
   const versionId = String(v.id);
 
-  // Reject manipulated mismatched findingId + findingVersionId pairs
   if (safeFindingId && safeFindingId !== findingId) {
     throw new Error("Unauthorized: Manipulated or mismatched findingId and findingVersionId.");
   }
@@ -1576,7 +2174,6 @@ export async function getHistoricalFindingImagingEvidence(
   const f = fRows[0];
   const patientId = String(f.patient_id);
 
-  // Enforce fail-closed patient ownership / clinician consent check BEFORE loading any child artifacts
   await checkPatientAndClinicianAccess(sql, uid, patientId, false);
 
   const studyId = String(v.study_id);
@@ -1623,7 +2220,6 @@ export async function getHistoricalFindingImagingEvidence(
     segRun = runRows[0] ?? null;
   }
 
-  // Gather all imaging_objects associated with this patient and matching series / study / finding_version / segmentation_run
   const allPatientObjects = await listImagingArtifacts(sql, uid, patientId);
   const linkedObjIds = new Set<string>();
   for (const e of evRows) {
@@ -1798,24 +2394,10 @@ export async function getHistoricalFindingImagingEvidence(
 import { deidentifyDicomBytes, type DeidentificationOptions, type DeidentificationResult } from "../dicom/deidentify.ts";
 
 export interface ExportDeidentifiedDicomOptions extends DeidentificationOptions {
-  /** Must be explicitly true to export when potential burned-in pixel annotations require manual review. */
   clinicianReviewedBurnedInPixels?: boolean;
-  /** Optional clinician note documenting visual verification of image pixels. */
   clinicianReviewNote?: string;
 }
 
-/**
- * Exports a DICOM PS3.15 de-identified derived copy of a stored DICOM artifact while keeping
- * the protected original file on disk unchanged (Sprint 6 Task 2E & 2F).
- *
- * Enforces:
- * 1. Fail-closed authorization (`checkPatientAndClinicianAccess`).
- * 2. Original file immutability (`originalPreserved === true`).
- * 3. Burned-in pixel annotation gate: if `burnedInReport.manualReviewRequired` is true and
- *    `clinicianReviewedBurnedInPixels` is not true, throws an explicit manual-review required error
- *    rather than claiming complete anonymisation.
- * 4. Audit trail (`deidentify_dicom_object`) without exposing patient identifiers or filesystem paths.
- */
 export async function exportDeidentifiedDicomArtifact(
   sql: Sql,
   userId: string,
@@ -1876,14 +2458,13 @@ export async function exportDeidentifiedDicomArtifact(
   };
 }
 
-/**
- * Workstream 4 — Production Storage Adapter Configuration, Backup, Actual Restoration,
- * and Storage Consistency Monitoring.
- */
 export interface StorageBackendConfig {
-  backend: "local_durable" | "s3_compatible";
+  backend: "supabase" | "local_durable" | "s3_compatible";
   storageBaseDir: string;
   backupBaseDir: string;
+  supabaseUrl?: string | null;
+  supabaseProjectRef?: string | null;
+  supabaseBuckets?: readonly SupabaseBucketName[];
   s3Endpoint?: string | null;
   s3Bucket?: string | null;
   s3Region?: string | null;
@@ -1894,17 +2475,9 @@ export interface StorageBackendConfig {
 export function validateStorageBackendConfig(
   env: Record<string, string | undefined> = process.env,
 ): StorageBackendConfig {
-  const rawBackend = (env.REPROCARE_STORAGE_BACKEND || "local_durable").trim().toLowerCase();
-  const backend = rawBackend === "s3_compatible" ? "s3_compatible" : "local_durable";
-  const storageBaseDir = resolve(
-    env.REPROCARE_IMAGING_STORAGE_DIR || env.IMAGING_STORAGE_PATH || DEFAULT_STORAGE_PATH,
-  );
-  const backupBaseDir = resolve(
-    env.REPROCARE_IMAGING_BACKUP_DIR || join(storageBaseDir, "..", "imaging-backups"),
-  );
-
-  // Reject any configuration that attempts to expose public medical-image bucket URLs to the browser
   if (
+    env.VITE_SUPABASE_SERVICE_ROLE_KEY ||
+    env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY ||
     env.VITE_S3_SECRET_ACCESS_KEY ||
     env.VITE_IMAGING_PUBLIC_BUCKET_URL ||
     env.REPROCARE_ALLOW_PUBLIC_IMAGING_URLS === "true"
@@ -1912,6 +2485,44 @@ export function validateStorageBackendConfig(
     throw new Error(
       "Security violation: storage credentials and medical-image URLs must remain strictly server-side and never be exposed publicly.",
     );
+  }
+
+  const rawBackend = (env.REPROCARE_STORAGE_BACKEND || "").trim().toLowerCase();
+  const supaCfg = resolveSupabaseStorageConfig(env);
+  const backend: "supabase" | "local_durable" | "s3_compatible" =
+    rawBackend === "supabase"
+      ? "supabase"
+      : rawBackend === "s3_compatible"
+        ? "s3_compatible"
+        : rawBackend === "local_durable"
+          ? "local_durable"
+          : supaCfg
+            ? "supabase"
+            : "local_durable";
+
+  const storageBaseDir = resolve(
+    env.REPROCARE_IMAGING_STORAGE_DIR || env.IMAGING_STORAGE_PATH || DEFAULT_STORAGE_PATH,
+  );
+  const backupBaseDir = resolve(
+    env.REPROCARE_IMAGING_BACKUP_DIR || join(storageBaseDir, "..", "imaging-backups"),
+  );
+
+  if (backend === "supabase") {
+    if (!supaCfg) {
+      throw new Error(
+        "Invalid Supabase Storage configuration: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required on the server.",
+      );
+    }
+    return {
+      backend: "supabase",
+      storageBaseDir,
+      backupBaseDir,
+      supabaseUrl: supaCfg.supabaseUrl,
+      supabaseProjectRef: supaCfg.projectRef,
+      supabaseBuckets: ALL_SUPABASE_BUCKETS,
+      credentialsServerSideOnly: true,
+      publicUrlsDisabled: true,
+    };
   }
 
   if (backend === "s3_compatible") {
@@ -1951,6 +2562,9 @@ export interface ImagingBackupManifest {
     findingVersionId: string | null;
     sourceObjectId: string | null;
     kind: string;
+    storageBucket?: SupabaseBucketName;
+    storageProvider?: "supabase" | "local_durable";
+    objectPath?: string;
     storageUri: string;
     backupBlobRelativePath: string;
     sha256: string;
@@ -1965,10 +2579,6 @@ export interface ImagingBackupManifest {
   auditOutboxCount: number;
 }
 
-/**
- * Creates a verified, checksum-manifested backup of active medical imaging artifacts
- * (`manifest.json` + `blobs/*` + `audit-outbox.jsonl`).
- */
 export async function createImagingStorageBackup(
   sql: Sql,
   userId: string,
@@ -2011,11 +2621,11 @@ export async function createImagingStorageBackup(
 
   for (const row of rows) {
     const rec = mapArtifactRow(row);
-    const srcPath = resolve(base, rec.storageUri);
-    if (!srcPath.startsWith(base)) {
-      throw new Error(`Security violation: invalid storageUri during backup for object ${rec.id}.`);
-    }
-    const data = await readFile(srcPath);
+    const provider = getProviderForRecord(rec);
+    const data = await provider.downloadObject({
+      bucket: rec.storageBucket,
+      objectPath: rec.objectPath,
+    });
     const actualSha = createHash("sha256").update(data).digest("hex");
     if (actualSha !== rec.sha256) {
       throw new Error(
@@ -2027,7 +2637,6 @@ export async function createImagingStorageBackup(
     const dstPath = join(blobsDir, blobRel);
     await writeFile(dstPath, data);
 
-    // Verify written backup blob checksum
     const verifyData = await readFile(dstPath);
     const verifySha = createHash("sha256").update(verifyData).digest("hex");
     if (verifySha !== rec.sha256) {
@@ -2044,14 +2653,17 @@ export async function createImagingStorageBackup(
       findingVersionId: rec.findingVersionId,
       sourceObjectId: rec.sourceObjectId,
       kind: rec.kind,
-      storageUri: rec.storageUri,
+      storageBucket: rec.storageBucket,
+      storageProvider: rec.storageProvider,
+      objectPath: rec.objectPath,
+      storageUri: rec.objectPath,
       backupBlobRelativePath: `blobs/${blobRel}`,
       sha256: rec.sha256,
       bytes: rec.bytes,
       version: rec.version,
       mimeType: rec.mimeType,
       originalFilename: rec.originalFilename,
-      metadataJson: JSON.stringify(rec.metadata ?? {}),
+      metadataJson: rec.metadataJson,
       status: "active",
       retentionUntil: rec.retentionUntil,
     });
@@ -2098,10 +2710,6 @@ export async function createImagingStorageBackup(
   return { backupDir: targetBackupDir, manifestPath, manifest };
 }
 
-/**
- * Restores medical imaging binary artifacts and database metadata from a verified backup bundle,
- * validating every restored binary file's SHA-256 checksum after restoration.
- */
 export async function restoreImagingStorageBackup(
   sql: Sql,
   userId: string,
@@ -2132,6 +2740,7 @@ export async function restoreImagingStorageBackup(
   }
 
   const base = resolve(getStorageBase());
+  const provider = resolveStorageProvider(base);
   const restoredObjectIds: string[] = [];
   let verifiedCount = 0;
 
@@ -2152,23 +2761,24 @@ export async function restoreImagingStorageBackup(
       );
     }
 
-    const dstPath = resolve(base, obj.storageUri);
-    if (!dstPath.startsWith(base)) {
-      throw new Error(`Security violation: invalid destination storageUri for object ${obj.id}.`);
-    }
+    const bucket = obj.storageBucket ?? resolveBucketForArtifactKind(obj.kind);
+    const objectPath = (obj.objectPath ?? obj.storageUri).replace(/^\/+/, "");
 
-    await mkdir(dirname(dstPath), { recursive: true });
-    await writeFile(dstPath, blobBytes);
+    await provider.uploadObject({
+      bucket,
+      objectPath,
+      data: blobBytes,
+      mimeType: obj.mimeType || "application/octet-stream",
+      upsert: true,
+    });
 
-    // Verify restored file on disk
-    const restoredDiskBytes = await readFile(dstPath);
-    const restoredDiskSha = createHash("sha256").update(restoredDiskBytes).digest("hex");
-    if (restoredDiskSha !== obj.sha256 || restoredDiskBytes.byteLength !== obj.bytes) {
+    const restoredBytes = await provider.downloadObject({ bucket, objectPath });
+    const restoredSha = createHash("sha256").update(restoredBytes).digest("hex");
+    if (restoredSha !== obj.sha256 || restoredBytes.byteLength !== obj.bytes) {
       throw new Error(`Restoration post-write verification failed for object ${obj.id}.`);
     }
     verifiedCount += 1;
 
-    // Ensure database row exists and is marked 'active'
     const existingRows = await sql<{ id: string }>`
       select id from imaging_objects where id = ${obj.id}
     `;
@@ -2199,7 +2809,7 @@ export async function restoreImagingStorageBackup(
             metadata_json, status, created_by, retention_until
           ) values (
             ${obj.id}, ${obj.userId}, ${obj.patientId}, ${obj.studyId}, ${obj.seriesId},
-            ${obj.findingVersionId}, ${obj.sourceObjectId}, ${dbCompatKind}, ${obj.storageUri},
+            ${obj.findingVersionId}, ${obj.sourceObjectId}, ${dbCompatKind}, ${objectPath},
             ${obj.sha256}, ${obj.bytes}, ${obj.version}, ${obj.mimeType}, ${obj.originalFilename},
             ${obj.metadataJson}, 'active', ${uid}, ${obj.retentionUntil}
           )
@@ -2210,7 +2820,7 @@ export async function restoreImagingStorageBackup(
             id, user_id, patient_id, series_id, kind, storage_uri, sha256, bytes, version, created_by, retention_until
           ) values (
             ${obj.id}, ${obj.userId}, ${obj.patientId}, ${obj.seriesId},
-            ${dbCompatKind}, ${obj.storageUri}, ${obj.sha256}, ${obj.bytes}, ${obj.version},
+            ${dbCompatKind}, ${objectPath}, ${obj.sha256}, ${obj.bytes}, ${obj.version},
             ${uid}, ${obj.retentionUntil}
           )
         `;
@@ -2250,10 +2860,6 @@ export interface StorageConsistencyReport {
   consistent: boolean;
 }
 
-/**
- * Scans database `imaging_objects` rows against physical storage to detect and optionally
- * reconcile missing blobs, checksum corruption, or lingering files on purged records.
- */
 export async function reconcileImagingStorageConsistency(
   sql: Sql,
   userId: string,
@@ -2278,7 +2884,6 @@ export async function reconcileImagingStorageConsistency(
         select * from imaging_objects order by created_at asc
       `;
 
-  const base = resolve(getStorageBase());
   let healthyActiveCount = 0;
   let purgedConsistentCount = 0;
   let repairedCount = 0;
@@ -2288,23 +2893,26 @@ export async function reconcileImagingStorageConsistency(
 
   for (const row of rows) {
     const rec = mapArtifactRow(row);
-    const fullPath = resolve(base, rec.storageUri);
+    const provider = getProviderForRecord(rec);
     let fileExists = false;
     let fileBytes: Buffer | null = null;
-    if (fullPath.startsWith(base)) {
-      try {
-        fileBytes = await readFile(fullPath);
-        fileExists = true;
-      } catch {
-        fileExists = false;
-      }
+    try {
+      fileBytes = await provider.downloadObject({
+        bucket: rec.storageBucket,
+        objectPath: rec.objectPath,
+      });
+      fileExists = true;
+    } catch {
+      fileExists = false;
     }
 
     if (rec.status === "purged") {
       if (fileExists) {
         purgedWithLingeringFileObjectIds.push(rec.id);
-        if (options?.repairStatuses && fullPath.startsWith(base)) {
-          await unlink(fullPath).catch(() => undefined);
+        if (options?.repairStatuses) {
+          await provider
+            .deleteObject({ bucket: rec.storageBucket, objectPath: rec.objectPath })
+            .catch(() => false);
           repairedCount += 1;
         }
       } else {

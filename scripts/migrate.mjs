@@ -2,54 +2,142 @@
 /**
  * Release/startup-time database migrator (node-postgres, `pg`).
  *
- * Decoupled from `npm run build` so CI and Docker image builds never require a
- * live production database connection. Invoked explicitly via `npm run db:migrate`
- * during container release/startup before traffic is served.
- *
- * Acquires a PostgreSQL session-level advisory lock (`pg_advisory_lock`) so
- * concurrent container replicas never race on schema creation or migration rows.
- *
- * No DATABASE_URL (local / preview builds) -> skip; the PGLite fallback applies
- * the same files at startup instead (see src/lib/db.ts).
+ * Supports Supabase PostgreSQL and standard PostgreSQL deployments:
+ * - Prefers `DIRECT_DATABASE_URL` (port 5432 direct or session pooler) when set for schema
+ *   migrations, falling back to `DATABASE_URL`.
+ * - Enforces encrypted SSL connections on Supabase (`*.supabase.co`, `*.pooler.supabase.com`)
+ *   and remote PostgreSQL hosts.
+ * - Acquires a PostgreSQL session-level advisory lock (`pg_advisory_lock`) on direct/session
+ *   connections, or a transaction-level advisory lock (`pg_advisory_xact_lock`) when connected
+ *   through a transaction-mode pooler (port 6543 / `pgbouncer=true`).
+ * - Rejects unreplaced password placeholders (`[YOUR-PASSWORD]`) and redacts credentials in logs.
  */
 import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import pg from "pg";
-import { pendingMigrations } from "./migration-plan.mjs";
+import { discoverMigrationFiles, pendingMigrations } from "./migration-plan.mjs";
 
 export const MIGRATION_ADVISORY_LOCK_ID = 72839401;
 
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) {
-  console.log(
-    "[migrate] DATABASE_URL not set — skipping (the PGLite fallback migrates itself).",
-  );
-  process.exit(0);
+const PLACEHOLDER_RE =
+  /\[YOUR-PASSWORD\]|<YOUR-PASSWORD>|\[PASSWORD\]|<PASSWORD>|YOUR_PASSWORD_HERE/i;
+
+export function redactMigrationUrl(input) {
+  if (!input) return "";
+  return String(input)
+    .replace(/(postgres(?:ql)?:\/\/[^:/\s@]+:)([^@\s]+)(@)/gi, "$1***$3")
+    .replace(/password=\S+/gi, "password=***");
+}
+
+export function resolveMigrationConnectionConfig(env = process.env) {
+  const rawUrl = (env.DIRECT_DATABASE_URL || env.DATABASE_URL || "").trim();
+  const isProd =
+    (env.NODE_ENV || "").toLowerCase() === "production" ||
+    env.VERCEL === "1" ||
+    env.REPROCARE_REQUIRE_DATABASE_URL === "true";
+
+  if (!rawUrl) {
+    if (isProd) {
+      throw new Error(
+        "[migrate] DATABASE_URL (or DIRECT_DATABASE_URL) is required in production.",
+      );
+    }
+    return null;
+  }
+
+  if (PLACEHOLDER_RE.test(rawUrl)) {
+    throw new Error(
+      "[migrate] Connection string contains an unreplaced password placeholder ([YOUR-PASSWORD]).",
+    );
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error("[migrate] Invalid PostgreSQL connection URI.");
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  const port = parsed.port ? Number(parsed.port) : 5432;
+  const isSupabase =
+    host.endsWith(".supabase.co") || host.endsWith(".pooler.supabase.com");
+  const isTransactionPooler =
+    port === 6543 ||
+    (parsed.searchParams.get("pgbouncer") || "").toLowerCase() === "true";
+
+  const cleanUrl = new URL(parsed.toString());
+  cleanUrl.searchParams.delete("pgbouncer");
+  cleanUrl.searchParams.delete("connection_limit");
+  const sslMode = (cleanUrl.searchParams.get("sslmode") || env.PGSSLMODE || "").toLowerCase();
+  cleanUrl.searchParams.delete("sslmode");
+
+  const isLocal =
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "::1" ||
+    host === "db" ||
+    host === "postgres";
+
+  const ssl =
+    sslMode === "disable" && !isSupabase
+      ? false
+      : isLocal && sslMode !== "require"
+        ? false
+        : {
+            rejectUnauthorized:
+              sslMode === "verify-full" ||
+              env.DATABASE_SSL_REJECT_UNAUTHORIZED === "true",
+          };
+
+  return {
+    connectionString: cleanUrl.toString(),
+    redactedUrl: redactMigrationUrl(parsed.toString()),
+    isSupabase,
+    isTransactionPooler,
+    ssl,
+  };
 }
 
 const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
 
 async function main() {
-  let entries;
+  const cfg = resolveMigrationConnectionConfig(process.env);
+  if (!cfg) {
+    console.log(
+      "[migrate] DATABASE_URL not set — skipping (the PGLite fallback migrates itself in development).",
+    );
+    return;
+  }
+
+  let rawEntries;
   try {
-    entries = await readdir(migrationsDir);
+    rawEntries = await readdir(migrationsDir);
   } catch {
     console.log("[migrate] no migrations/ directory — nothing to do.");
     return;
   }
-  // An app with no schema of its own must not pay for a database connection.
+  const entries = discoverMigrationFiles(migrationsDir, rawEntries);
   if (pendingMigrations(entries, []).length === 0) {
     console.log("[migrate] no migrations — nothing to do.");
     return;
   }
 
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
+  const { default: pg } = await import("pg");
+  const pool = new pg.Pool({
+    connectionString: cfg.connectionString,
+    ssl: cfg.ssl,
+    max: 1,
+    connectionTimeoutMillis: 15_000,
+    application_name: "reprocare_migrator",
+  });
   const client = await pool.connect();
-  let lockAcquired = false;
+  let sessionLockAcquired = false;
   try {
-    await client.query("SELECT pg_advisory_lock($1)", [MIGRATION_ADVISORY_LOCK_ID]);
-    lockAcquired = true;
+    if (!cfg.isTransactionPooler) {
+      await client.query("SELECT pg_advisory_lock($1)", [MIGRATION_ADVISORY_LOCK_ID]);
+      sessionLockAcquired = true;
+    }
 
     await client.query(
       "CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())",
@@ -63,9 +151,14 @@ async function main() {
       const text = await readFile(join(migrationsDir, name), "utf8");
       try {
         await client.query("BEGIN");
-        // pg's simple-query protocol runs a whole multi-statement file at once.
+        if (cfg.isTransactionPooler) {
+          await client.query("SELECT pg_advisory_xact_lock($1)", [MIGRATION_ADVISORY_LOCK_ID]);
+        }
         await client.query(text);
-        await client.query("INSERT INTO _migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", [name]);
+        await client.query(
+          "INSERT INTO _migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
+          [name],
+        );
         await client.query("COMMIT");
       } catch (err) {
         console.error(`[migrate] error applying ${name}`);
@@ -79,21 +172,32 @@ async function main() {
       console.log(`[migrate] applied ${name}`);
       count += 1;
     }
-    console.log(count ? `[migrate] done — ${count} migration(s) applied.` : "[migrate] up to date.");
+    console.log(
+      count ? `[migrate] done — ${count} migration(s) applied.` : "[migrate] up to date.",
+    );
   } finally {
-    if (lockAcquired) {
-      await client.query("SELECT pg_advisory_unlock($1)", [MIGRATION_ADVISORY_LOCK_ID]).catch(() => {});
+    if (sessionLockAcquired) {
+      await client
+        .query("SELECT pg_advisory_unlock($1)", [MIGRATION_ADVISORY_LOCK_ID])
+        .catch(() => {});
     }
     client.release();
     await pool.end();
   }
 }
 
-main().catch((err) => {
-  console.error("[migrate] failed:", err?.message || err);
-  // pg errors carry the context needed to debug a bad SQL file.
-  for (const key of ["code", "detail", "hint", "position", "where"]) {
-    if (err?.[key] != null) console.error(`[migrate]   ${key}: ${err[key]}`);
-  }
-  process.exit(1);
-});
+const isMainModule =
+  process.argv[1] &&
+  fileURLToPath(import.meta.url) === process.argv[1];
+
+if (isMainModule) {
+  main().catch((err) => {
+    console.error("[migrate] failed:", redactMigrationUrl(err?.message || err));
+    for (const key of ["code", "detail", "hint", "position", "where"]) {
+      if (err?.[key] != null) {
+        console.error(`[migrate]   ${key}: ${redactMigrationUrl(err[key])}`);
+      }
+    }
+    process.exit(1);
+  });
+}

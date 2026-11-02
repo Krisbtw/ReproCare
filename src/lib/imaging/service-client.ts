@@ -539,19 +539,20 @@ export async function checkHealth(
   timeoutMs = 8000,
   token?: string | null,
 ): Promise<ServiceResult<ServiceHealth>> {
+  const cleanBase = base.replace(/\/+$/, "");
   const authToken = serviceToken(token);
   const headers: Record<string, string> = {};
   if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
   try {
     return await withTimeout(timeoutMs, async (signal) => {
-      const res = await fetchImpl(`${base}/health`, { method: "GET", headers, signal });
+      const res = await fetchImpl(`${cleanBase}/health`, { method: "GET", headers, signal });
       if (!res.ok) return { ok: false, error: `Service answered ${res.status}: ${await detailOf(res)}` };
       const j = (await res.json()) as Partial<ServiceHealth>;
       if (typeof j.status !== "string" || typeof j.any_model_connected !== "boolean") return { ok: false, error: "The service answered, but not with the expected health shape." };
       return { ok: true, value: { status: j.status, service: String(j.service ?? ""), any_model_connected: j.any_model_connected } };
     });
   } catch (e) {
-    return { ok: false, error: networkError(e, base) };
+    return { ok: false, error: networkError(e, cleanBase) };
   }
 }
 
@@ -566,6 +567,7 @@ export async function inspectWithService(
   if (files.length > SERVICE_MAX_FILES) return { ok: false, error: `The service accepts at most ${SERVICE_MAX_FILES} files per request; this series has ${files.length}.` };
   const big = files.find((f) => f.bytes.byteLength > SERVICE_MAX_BYTES_EACH);
   if (big) return { ok: false, error: `${big.name} is larger than the service limit (${SERVICE_MAX_BYTES_EACH / 1024 / 1024} MB).` };
+  const cleanBase = base.replace(/\/+$/, "");
   const form = new FormData();
   files.forEach((f, i) => {
     // Send a neutral file name: the original path can contain a patient name.
@@ -578,13 +580,13 @@ export async function inspectWithService(
   if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
   try {
     return await withTimeout(timeoutMs, async (signal) => {
-      const res = await fetchImpl(`${base}/series/inspect`, { method: "POST", headers, body: form, signal });
+      const res = await fetchImpl(`${cleanBase}/series/inspect`, { method: "POST", headers, body: form, signal });
       if (!res.ok) return { ok: false, error: `Service answered ${res.status}: ${await detailOf(res)}` };
       const parsed = parseServiceReport(await res.json());
       if (!parsed) return { ok: false, error: "The service answered, but the report was not in the expected shape. It was not used." };
       return { ok: true, value: parsed };
     });
   } catch (e) {
-    return { ok: false, error: networkError(e, base) };
+    return { ok: false, error: networkError(e, cleanBase) };
   }
 }

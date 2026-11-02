@@ -11,6 +11,43 @@
  * Neither applier descends into subdirectories, so `migrations/auth/*.sql` is
  * out of scope for both until it is copied up.
  */
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
+export const KNOWN_MIGRATION_FILES = [
+  "0001_auth.sql",
+  "0002_anatomybridge.sql",
+  "0003_append_only.sql",
+  "0004_menarche_year.sql",
+  "0005_report_ingestion.sql",
+  "0006_performance_indices.sql",
+  "0007_fix_profile_default.sql",
+  "0008_clinician_verification.sql",
+  "0009_imaging_and_provenance.sql",
+  "0010_sprint1_auth_and_registration.sql",
+  "0011_sprint3_imaging_storage_and_reprotrace.sql",
+  "0012_sprint4_collaboration_and_report_intelligence.sql",
+  "0013_sprint5_dicom_and_condition_workflows.sql",
+  "0014_supabase_storage_integration.sql",
+];
+
+/**
+ * Discovers all `.sql` migration filenames in `migrationsDir`, combining `readdir`
+ * output with direct `existsSync` checks for `KNOWN_MIGRATION_FILES` so mounted/FUSE
+ * filesystems with cached directory listings never miss a migration file.
+ * @param {string} migrationsDir
+ * @param {Iterable<string>} [readdirEntries]
+ * @returns {string[]}
+ */
+export function discoverMigrationFiles(migrationsDir, readdirEntries = []) {
+  const found = new Set(readdirEntries);
+  for (const known of KNOWN_MIGRATION_FILES) {
+    if (!found.has(known) && existsSync(join(migrationsDir, known))) {
+      found.add(known);
+    }
+  }
+  return [...found];
+}
 
 /**
  * The `_migrations` key for a migration path (or bare filename).

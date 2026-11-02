@@ -10,6 +10,11 @@
  * calls /api/imaging-proxy/* (same-origin, auth-gated), and this handler forwards
  * to the Python service with the server-held token.
  *
+ * VERCEL MULTI-SERVICE BINDINGS:
+ * When deployed as a Vercel multi-service project (`vercel.json` -> `services.app.bindings`),
+ * Vercel injects the internal URL of `imaging-service` into `process.env.ANATOMYBRIDGE_SERVICE_URL`
+ * (or fallback `process.env.IMAGING_SERVICE_URL`). Endpoint URLs are constructed via `new URL(path, base)`.
+ *
  * SECURITY:
  *   - Only authenticated users with verified clinician credentials (approved verification status)
  *     or administrator privileges may invoke imaging proxy endpoints.
@@ -26,16 +31,33 @@ const PROXY_TIMEOUT_MS = 90_000;
 const MAX_PROXY_FILES = 1000;
 const MAX_TOTAL_BYTES = 64 * 1024 * 1024; // 64MB
 
-function imagingServiceUrl(): string | null {
-  const raw = process.env["ANATOMYBRIDGE_SERVICE_URL"];
+export function imagingServiceUrl(
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const raw = env["ANATOMYBRIDGE_SERVICE_URL"] || env["IMAGING_SERVICE_URL"];
   if (!raw) return null;
   try {
     const u = new URL(raw.trim());
     if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    if (u.username || u.password) return null;
     return u.toString().replace(/\/+$/, "");
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolves a service endpoint path against the configured imaging service URL
+ * using standard `new URL(relativePath, baseWithTrailingSlash)` resolution.
+ */
+export function resolveImagingServiceEndpoint(
+  path: string,
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const base = imagingServiceUrl(env);
+  if (!base) return null;
+  const cleanRelativePath = path.replace(/^\/+/, "");
+  return new URL(cleanRelativePath, `${base}/`).toString();
 }
 
 function imagingServiceKey(): string | null {
@@ -74,12 +96,12 @@ async function proxyFetch(
   init: RequestInit,
   timeoutMs = PROXY_TIMEOUT_MS,
 ): Promise<Response> {
-  const base = imagingServiceUrl();
-  if (!base) throw new Error("ANATOMYBRIDGE_SERVICE_URL is not configured on the server.");
+  const targetUrl = resolveImagingServiceEndpoint(path);
+  if (!targetUrl) throw new Error("ANATOMYBRIDGE_SERVICE_URL is not configured on the server.");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(`${base}${path}`, { ...init, signal: controller.signal });
+    return await fetch(targetUrl, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
