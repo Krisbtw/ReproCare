@@ -1,0 +1,9 @@
+.git
+.github
+docs/
+clinical_validation/
+tests/
+imaging-service/tests/
+*.patch
+*.md
+.data/
