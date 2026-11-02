@@ -91,7 +91,7 @@ test("Hackathon Demo Journey: Stages A through F End-to-End Continuous Verificat
     // 1. Unconsented / Unverified access fails closed (403 Forbidden)
     await assert.rejects(
       async () => {
-        await executeGetUnifiedPatientHistory(sql, "unverified_dr_rao", { patientId: "p_meera" });
+        await executeGetUnifiedPatientHistory(sql, "unverified_dr_rao", "p_meera");
       },
       /unverified/i,
       "Unverified clinician must be blocked immediately",
@@ -117,13 +117,13 @@ test("Hackathon Demo Journey: Stages A through F End-to-End Continuous Verificat
     assert.equal(consentRes.consent.status, "active");
 
     // 3. Approved clinician now successfully reads consented patient history
-    const history = await executeGetUnifiedPatientHistory(sql, "approved_dr_sharma", { patientId: "p_meera" });
+    const history = await executeGetUnifiedPatientHistory(sql, "approved_dr_sharma", "p_meera");
     assert.equal(history.patient.id, "p_meera");
   });
 
   await t.test("Stage B: DICOM Physical LPS Coordinates & Volume Lab Integration", async () => {
     // Verify physical LPS basis transformation parameters and finding version preservation
-    const history = await executeGetUnifiedPatientHistory(sql, "patient_meera", { patientId: "p_meera" });
+    const history = await executeGetUnifiedPatientHistory(sql, "patient_meera", "p_meera");
     const baseline = history.timeline.find((t: any) => t.id === "fv_demo_base");
     assert.ok(baseline, "Baseline finding version must exist");
     assert.equal(baseline.evidence_tier, "imaging_observation");
@@ -133,7 +133,7 @@ test("Hackathon Demo Journey: Stages A through F End-to-End Continuous Verificat
 
   await t.test("Stage C: ReproTrace Longitudinal Tracking & Difference Attribution", async () => {
     // Verify interval change tracking between baseline and follow-up
-    const history = await executeGetUnifiedPatientHistory(sql, "approved_dr_sharma", { patientId: "p_meera" });
+    const history = await executeGetUnifiedPatientHistory(sql, "approved_dr_sharma", "p_meera");
     const baseline = history.timeline.find((t: any) => t.id === "fv_demo_base");
     const followUp = history.timeline.find((t: any) => t.id === "fv_demo_follow");
     assert.ok(baseline && followUp);
@@ -203,7 +203,7 @@ test("Hackathon Demo Journey: Stages A through F End-to-End Continuous Verificat
   });
 
   await t.test("Stage F: Unified Patient History & 6-Tier Immutable Evidence Provenance", async () => {
-    const history = await executeGetUnifiedPatientHistory(sql, "patient_meera", { patientId: "p_meera" });
+    const history = await executeGetUnifiedPatientHistory(sql, "patient_meera", "p_meera");
     assert.ok(history.timeline.length >= 4);
 
     const tiers = new Set(history.timeline.map((item: any) => item.evidence_tier));

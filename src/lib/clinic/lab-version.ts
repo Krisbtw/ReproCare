@@ -1,5 +1,5 @@
 import type { Sql } from "../db.ts";
-import { storeImagingArtifact } from "../imaging/storage.server.ts";
+import { storeImagingArtifact } from "../imaging/storage.ts";
 import { computeVoxelBoundaryUncertainty } from "../reprotrace/params.ts";
 import { evaluateClinicianConsentForPatient } from "./collaboration.ts";
 

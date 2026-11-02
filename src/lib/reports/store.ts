@@ -17,7 +17,7 @@ import {
   type ReportFileKind,
 } from "./text.ts";
 import type { PdfPageExtraction } from "./ocr.ts";
-import { storeImagingArtifact } from "../imaging/storage.server.ts";
+import { storeImagingArtifact } from "../imaging/storage.ts";
 import {
   evaluateClinicianConsentForPatient,
   type ClinicianPermission,

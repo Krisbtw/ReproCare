@@ -23,7 +23,7 @@ import {
   getHistoricalFindingImagingEvidence,
   writeAuditEvent,
   type ImagingArtifactKind,
-} from "../imaging/storage.server.ts";
+} from "../imaging/storage.ts";
 import { insertLabVersion, type LabVersionInput } from "./lab-version.ts";
 import { applyMenarcheYear } from "./menarche.ts";
 import {
