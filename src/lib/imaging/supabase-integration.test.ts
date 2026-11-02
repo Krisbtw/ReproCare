@@ -45,7 +45,7 @@ import {
   executeGrantClinicianConsent,
   executeRevokeClinicianConsent,
   executeSaveLabMeasurement,
-} from "../clinic/server.ts";
+} from "../clinic/server.backend.ts";
 
 /**
  * In-memory simulation of Supabase Storage REST API + TUS 1.0.0 Resumable Upload server

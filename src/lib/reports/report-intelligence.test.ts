@@ -48,7 +48,7 @@ import {
   executeGetReportRevisions,
   executeInterpretReportWithLlm,
   executeAnswerReportQuestion,
-} from "../clinic/server.ts";
+} from "../clinic/server.backend.ts";
 
 const MIGRATION_FILES = [
   "migrations/0002_anatomybridge.sql",

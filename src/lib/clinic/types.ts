@@ -458,3 +458,24 @@ export type ExportPayload = {
   findings: FindingRow[];
   versions: VersionRow[];
 };
+
+export const ALL_CLINICIAN_PERMISSIONS = [
+  "view_demographics",
+  "view_reports",
+  "view_imaging",
+  "view_findings",
+  "view_longitudinal_history",
+  "add_annotations",
+  "review_ai_findings",
+  "approve_or_reject_findings",
+] as const;
+
+export type ClinicianPermission = (typeof ALL_CLINICIAN_PERMISSIONS)[number];
+
+export const DEFAULT_CLINICIAN_PERMISSIONS: readonly ClinicianPermission[] = [
+  "view_demographics",
+  "view_reports",
+  "view_imaging",
+  "view_findings",
+  "view_longitudinal_history",
+] as const;

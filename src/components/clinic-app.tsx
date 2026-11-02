@@ -35,9 +35,11 @@ import {
   decideReportFinding,
   interpretClinicalReport,
   askClinicalReportQuestion,
+} from "@/lib/clinic/server";
+import {
   ALL_CLINICIAN_PERMISSIONS,
   DEFAULT_CLINICIAN_PERMISSIONS,
-} from "@/lib/clinic/server";
+} from "@/lib/clinic/collaboration";
 import { explainPlain } from "@/lib/clinic/plain";
 import { checkMenarcheYear, cycleBand, outsideBand, pcosContext } from "@/lib/clinic/pcos-context";
 import { AnatomyStage, type AnatomyItem } from "./anatomy-stage";

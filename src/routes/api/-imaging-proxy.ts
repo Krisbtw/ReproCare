@@ -1,111 +1,24 @@
 /**
  * Server-side proxy for the optional Python imaging service (imaging-service/, FastAPI).
  *
- * WHY A PROXY?
- * The Python service requires an API key (ANATOMYBRIDGE_SERVICE_API_KEY). If the
- * frontend called the service directly, the key would have to be a VITE_* variable,
- * which Vite inlines into the public JS bundle — anyone viewing source would see it.
- *
- * This proxy keeps the key exclusively in server-side process.env. The browser
- * calls /api/imaging-proxy/* (same-origin, auth-gated), and this handler forwards
- * to the Python service with the server-held token.
- *
- * VERCEL MULTI-SERVICE BINDINGS:
- * When deployed as a Vercel multi-service project (`vercel.json` -> `services.app.bindings`),
- * Vercel injects the internal URL of `imaging-service` into `process.env.ANATOMYBRIDGE_SERVICE_URL`
- * (or fallback `process.env.IMAGING_SERVICE_URL`). Endpoint URLs are constructed via `new URL(path, base)`.
- *
- * SECURITY:
- *   - Only authenticated users with verified clinician credentials (approved verification status)
- *     or administrator privileges may invoke imaging proxy endpoints.
- *   - A role string alone ('clinician') without an approved verification status is rejected.
- *   - Requests are size-limited (max 1000 files, max 64MB total).
- *   - Every invocation is recorded in audit_events.
+ * Exposes type-safe TanStack Start server functions to the frontend without leaking
+ * secrets or internal service topologies into public client bundles.
  */
 import { createServerFn } from "@tanstack/react-start";
 import { authMiddleware } from "../../lib/auth/middleware.ts";
-import { getSql, type Sql } from "../../lib/db.ts";
-import { requireVerifiedClinicianOrAdmin } from "../../lib/clinic/server.ts";
+import {
+  imagingServiceUrl,
+  resolveImagingServiceEndpoint,
+  requireClinicianOrAdmin,
+  serviceHeaders,
+  auditProxyAction,
+  proxyFetch,
+} from "../../lib/imaging/proxy.server.ts";
 
-const PROXY_TIMEOUT_MS = 90_000;
+
+
 const MAX_PROXY_FILES = 1000;
 const MAX_TOTAL_BYTES = 64 * 1024 * 1024; // 64MB
-
-export function imagingServiceUrl(
-  env: Record<string, string | undefined> = process.env,
-): string | null {
-  const raw = env["ANATOMYBRIDGE_SERVICE_URL"] || env["IMAGING_SERVICE_URL"];
-  if (!raw) return null;
-  try {
-    const u = new URL(raw.trim());
-    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-    if (u.username || u.password) return null;
-    return u.toString().replace(/\/+$/, "");
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Resolves a service endpoint path against the configured imaging service URL
- * using standard `new URL(relativePath, baseWithTrailingSlash)` resolution.
- */
-export function resolveImagingServiceEndpoint(
-  path: string,
-  env: Record<string, string | undefined> = process.env,
-): string | null {
-  const base = imagingServiceUrl(env);
-  if (!base) return null;
-  const cleanRelativePath = path.replace(/^\/+/, "");
-  return new URL(cleanRelativePath, `${base}/`).toString();
-}
-
-function imagingServiceKey(): string | null {
-  const key = process.env["ANATOMYBRIDGE_SERVICE_API_KEY"];
-  return key && key.trim().length > 0 ? key.trim() : null;
-}
-
-function serviceHeaders(): Record<string, string> {
-  const key = imagingServiceKey();
-  const h: Record<string, string> = {};
-  if (key) h["Authorization"] = `Bearer ${key}`;
-  return h;
-}
-
-/**
- * Enforces the unified clinician verification & administrator authorization rules for all imaging proxy operations.
- */
-export async function requireClinicianOrAdmin(userId: string, sqlOverride?: Sql): Promise<string> {
-  const sql = sqlOverride ?? (await getSql());
-  const auth = await requireVerifiedClinicianOrAdmin(sql, userId, "imaging inspection and AI segmentation");
-  return auth.effectiveRole;
-}
-
-async function auditProxyAction(userId: string, action: string, detail: string) {
-  try {
-    const sql = await getSql();
-    await sql`insert into audit_events (id, user_id, action, entity_type, entity_id, detail)
-      values (${crypto.randomUUID()}, ${userId}, ${action}, 'imaging_proxy', ${userId}, ${detail})`;
-  } catch {
-    // Non-fatal logging
-  }
-}
-
-async function proxyFetch(
-  path: string,
-  init: RequestInit,
-  timeoutMs = PROXY_TIMEOUT_MS,
-): Promise<Response> {
-  const targetUrl = resolveImagingServiceEndpoint(path);
-  if (!targetUrl) throw new Error("ANATOMYBRIDGE_SERVICE_URL is not configured on the server.");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(targetUrl, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 export type ProxyModelStatus = {
   id: string;
@@ -127,6 +40,8 @@ export type ProxyModelStatus = {
   validation_metrics?: Record<string, any> | null;
 };
 
+export type ProxyFile = { name: string; base64: string };
+
 /** List available segmentation models. Requires verified clinician or administrator credentials. */
 export const proxyListModels = createServerFn({ method: "GET" })
   .middleware([authMiddleware])
@@ -145,9 +60,6 @@ export const proxyListModels = createServerFn({ method: "GET" })
     }
     return (await res.json()) as ProxyModelStatus[];
   });
-
-/** Proxy type for inspect — accepts serialized FormData entries. */
-export type ProxyFile = { name: string; base64: string };
 
 /** Forward a DICOM series to the Python /series/inspect endpoint. Requires verified clinician/admin. */
 export const proxyInspectSeries = createServerFn({ method: "POST" })

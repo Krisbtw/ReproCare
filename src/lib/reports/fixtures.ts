@@ -3,7 +3,7 @@
  * multi-page PDF, and scanned-image PDF files, used by tests and by the
  * "synthetic sample report" buttons. Every byte is generated here; no real report is bundled.
  */
-import { renderTextToGrayscaleRaster } from "./ocr.ts";
+import { renderTextToGrayscaleRaster } from "./raster.ts";
 
 const enc = new TextEncoder();
 

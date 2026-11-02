@@ -12,7 +12,7 @@ import {
 import {
   imagingServiceUrl,
   resolveImagingServiceEndpoint,
-} from "../../routes/api/-imaging-proxy.ts";
+} from "./proxy.server.ts";
 import type { SeriesReport } from "./series.ts";
 
 const browser = (over: Partial<SeriesReport> = {}): SeriesReport => ({

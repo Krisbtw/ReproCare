@@ -28,7 +28,7 @@ import {
   executeGetHistoricalFindingImagingEvidence,
   executeSaveLabMeasurement,
   executeAddReview,
-} from "../clinic/server.ts";
+} from "../clinic/server.backend.ts";
 
 async function createTestStorageDb() {
   const storageDir = mkdtempSync(join(tmpdir(), "reprocare-imaging-test-"));

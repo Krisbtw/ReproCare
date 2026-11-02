@@ -49,7 +49,7 @@ import {
   executeGetLongitudinalComparisonProvenance,
   executeSaveVolumeRegistration,
   recomputeReproTrace,
-} from "../clinic/server.ts";
+} from "../clinic/server.backend.ts";
 
 test("Task 2A: Physical volume and centroid calculations with known anisotropic voxel spacing and orientations", () => {
   // 1. Validate spacing guardrails

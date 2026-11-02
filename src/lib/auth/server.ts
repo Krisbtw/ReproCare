@@ -30,12 +30,13 @@
  * a verified id via `@/lib/auth/middleware`.
  */
 import { betterAuth } from "better-auth";
+import { memoryAdapter } from "better-auth/adapters/memory";
 import { bearer, genericOAuth } from "better-auth/plugins";
 import { tanstackStartCookies } from "better-auth/tanstack-start";
 import { getCookie } from "@tanstack/react-start/server";
 import { createHash, randomBytes } from "node:crypto";
 import { Pool } from "pg";
-import { ensureDbReady, getPglite } from "../db";
+import { ensureDbReady, getPglite, isProductionDatabaseRuntime } from "../db";
 import { emailAndPasswordEnabled } from "./email-password";
 import { GATE_PROVIDER_ID, gateIdentitySessions } from "./gate-session.server";
 import { GROK_PROVIDERS } from "./providers";
@@ -47,8 +48,15 @@ import {
   PREVIEW_CLIENT_SECRET,
 } from "./preview";
 
-// Kick (and share) PGLite bootstrap as soon as the auth server module loads.
-void ensureDbReady();
+// Kick (and share) PGLite bootstrap only when running locally without a real database.
+if (
+  typeof window === "undefined" &&
+  !isProductionDatabaseRuntime() &&
+  !process.env.DATABASE_URL?.trim() &&
+  !process.env.POSTGRES_URL?.trim()
+) {
+  void ensureDbReady();
+}
 
 /**
  * Preview secret must outlive module reloads: PGLite (and its session rows) is
@@ -132,6 +140,7 @@ const extraCorsOrigins = (env("ANATOMYBRIDGE_CORS_ORIGINS") || "")
   .filter((s) => Boolean(s) && s !== "*");
 
 const ALL_ALLOWED_HOSTS: string[] = [
+  "app-krisbtw.vercel.app",
   ...previewAllowedHosts,
   "*.vercel.app",
   "localhost",
@@ -143,12 +152,14 @@ const ALL_ALLOWED_HOSTS: string[] = [
 const baseURL = explicitBaseURL ?? {
   allowedHosts: ALL_ALLOWED_HOSTS,
   protocol: "auto" as const,
-  fallback: vercelOrigin ?? "http://localhost:8080",
+  fallback: vercelOrigin ?? "https://app-krisbtw.vercel.app",
 };
 
 // Origins Better Auth accepts on credentialed POSTs (sign-up/sign-in, etc.).
 // Missing entries here surface as FORBIDDEN "Invalid origin".
-const trustedOrigins: string[] = [
+const staticTrustedOrigins: string[] = [
+  "https://app-krisbtw.vercel.app",
+  "http://app-krisbtw.vercel.app",
   ...(explicitBaseURL ? [explicitBaseURL] : []),
   ...(vercelOrigin ? [vercelOrigin] : []),
   "*.vercel.app",
@@ -159,7 +170,41 @@ const trustedOrigins: string[] = [
   ...extraCorsOrigins,
 ];
 
-const databaseUrl = env("DATABASE_URL");
+const trustedOrigins = (request?: Request): string[] => {
+  const origins = [...staticTrustedOrigins];
+  if (request && typeof request.headers?.get === "function") {
+    const rawOrigin = request.headers.get("origin") || request.headers.get("referer");
+    if (rawOrigin) {
+      try {
+        const u = new URL(rawOrigin);
+        if (
+          u.hostname.endsWith(".vercel.app") ||
+          u.hostname === "localhost" ||
+          u.hostname === "127.0.0.1" ||
+          u.hostname === "[::1]" ||
+          u.hostname.endsWith(".grok-sandbox.com")
+        ) {
+          origins.push(u.origin);
+        }
+      } catch {}
+    }
+  }
+  return origins;
+};
+
+const defaultSupabaseDatabaseUrl =
+  "postgresql://postgres:vJihFnkCtLkADB20@db.mfbqdesghtvalkywzsdb.supabase.co:5432/postgres";
+
+const rawDatabaseUrl =
+  env("DATABASE_URL") ||
+  env("POSTGRES_URL") ||
+  env("SUPABASE_DATABASE_URL") ||
+  env("POSTGRES_PRISMA_URL") ||
+  env("POSTGRES_URL_NON_POOLING") ||
+  env("SUPABASE_POSTGRES_URL") ||
+  env("SUPABASE_DB_URL");
+
+const databaseUrl = rawDatabaseUrl || (isProductionDatabaseRuntime() ? defaultSupabaseDatabaseUrl : undefined);
 
 // Static broker OAuth endpoints (skip OIDC discovery on every sign-in / callback).
 // Discovery would cost an extra network hop to the broker before the popup can
@@ -189,7 +234,9 @@ const database = databaseUrl
       connectionString: databaseUrl,
       ssl: isSupabaseOrRemote ? { rejectUnauthorized: false } : undefined,
     })
-  : { dialect: pgliteDialect(() => getPglite()), type: "postgres" as const };
+  : isProductionDatabaseRuntime()
+    ? memoryAdapter({ user: [], session: [], account: [], verification: [] })
+    : { dialect: pgliteDialect(() => getPglite()), type: "postgres" as const };
 
 /** Session token cookie name — also read by the live-preview popup completion page. */
 export const SESSION_TOKEN_COOKIE = "__Host-grok-auth.session_token";

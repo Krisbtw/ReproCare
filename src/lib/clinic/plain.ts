@@ -1,7 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { authMiddleware } from "../auth/middleware.ts";
-import { getSql, type Sql } from "../db.ts";
-import { requireVerifiedClinicianOrAdmin } from "./server.ts";
+import type { Sql } from "../db.ts";
 
 export type PlainResult = {
   available: boolean;
@@ -38,60 +37,9 @@ export const explainPlain = createServerFn({ method: "POST" })
     }),
   )
   .handler(async ({ data, context }): Promise<PlainResult> => {
+    const { getSql } = await import("../db.ts");
     const sql = await getSql();
-    await requireVerifiedClinicianOrAdmin(sql, context.userId, "rewriting clinical excerpts");
-    if (!data.quote) {
-      return {
-        available: true,
-        text: null,
-        note: "The stored report excerpt is empty, so no rewrite was requested.",
-      };
-    }
-    const apiKey = process.env.XAI_API_KEY;
-    if (!apiKey) {
-      return {
-        available: false,
-        text: null,
-        note: "A language model is not configured here. The stored excerpt above is the explanation.",
-      };
-    }
-    const user = [
-      `Structure: ${data.structure}`,
-      `Location label on file: ${data.location}`,
-      `Structured measurement: ${data.measurement || "none"}`,
-      `Measurement basis: ${data.basis || "not recorded"}`,
-      `Clinician verification on this version: ${data.verified ? "yes" : "no"}`,
-      `Excerpt: ${data.quote}`,
-    ].join("\n");
-    const res = await fetch("https://api.x.ai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "grok-4.5",
-        temperature: 0,
-        max_tokens: 180,
-        messages: [
-          { role: "system", content: SYSTEM },
-          { role: "user", content: user },
-        ],
-      }),
-    });
-    if (!res.ok) {
-      return { available: true, text: null, note: `The language model did not answer (${res.status}). The stored excerpt still stands.` };
-    }
-    const body = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    const text = body.choices?.[0]?.message?.content?.trim() ?? "";
-    if (!text || text.includes("SOURCE_INSUFFICIENT")) {
-      return { available: true, text: null, note: "The model declined because the source text was not enough." };
-    }
-    return {
-      available: true,
-      text,
-      note: "Rewrite from the stored excerpt only. Not a diagnosis, and not a substitute for the report.",
-    };
+    return executeExplainPlain(sql, context.userId, data);
   });
 
 export async function executeExplainPlain(
@@ -106,17 +54,78 @@ export async function executeExplainPlain(
     verified: boolean;
   },
 ): Promise<PlainResult> {
+  const { requireVerifiedClinicianOrAdmin } = await import("./server.backend.ts");
   await requireVerifiedClinicianOrAdmin(sql, userId, "rewriting clinical excerpts");
-  if (!data.quote || !data.quote.trim()) {
+  if (!data.quote) {
     return {
       available: true,
       text: null,
       note: "The stored report excerpt is empty, so no rewrite was requested.",
     };
   }
-  return {
-    available: false,
-    text: null,
-    note: "A language model is not configured here. The stored excerpt above is the explanation.",
-  };
+  const apiKey = process.env.XAI_API_KEY;
+  if (!apiKey) {
+    return {
+      available: false,
+      text: null,
+      note: "A language model is not configured here. The stored excerpt above is the explanation.",
+    };
+  }
+
+  const userMessage = [
+    `Structure: ${data.structure}`,
+    `Location: ${data.location}`,
+    `Measurement: ${data.measurement}`,
+    `Basis: ${data.basis}`,
+    `Verified by clinician: ${data.verified ? "yes" : "no"}`,
+    `Original excerpt: "${data.quote}"`,
+  ].join("\n");
+
+  try {
+    const res = await fetch("https://api.x.ai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "grok-beta",
+        messages: [
+          { role: "system", content: SYSTEM },
+          { role: "user", content: userMessage },
+        ],
+        temperature: 0.2,
+        max_tokens: 180,
+      }),
+    });
+    if (!res.ok) {
+      return {
+        available: false,
+        text: null,
+        note: `The rewrite request was rejected (${res.status}). The stored excerpt above is the explanation.`,
+      };
+    }
+    const json = (await res.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const text = json.choices?.[0]?.message?.content?.trim();
+    if (!text || text.includes("SOURCE_INSUFFICIENT")) {
+      return {
+        available: false,
+        text: null,
+        note: "The model found the stored excerpt insufficient to rewrite safely.",
+      };
+    }
+    return {
+      available: true,
+      text,
+      note: "Rewritten from the stored excerpt. This is not a diagnosis.",
+    };
+  } catch {
+    return {
+      available: false,
+      text: null,
+      note: "Could not reach the language model. The stored excerpt above is the explanation.",
+    };
+  }
 }

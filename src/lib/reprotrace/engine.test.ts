@@ -19,7 +19,7 @@ import { toMatrix4x4, eulerToRotationMatrix } from "../imaging/registration.ts";
 import {
   executeSaveVolumeRegistration,
   recomputeReproTrace,
-} from "../clinic/server.ts";
+} from "../clinic/server.backend.ts";
 
 function snap(partial: Partial<Snap> & Pick<Snap, "id" | "locationLabel" | "centroidMm">): Snap {
   return {

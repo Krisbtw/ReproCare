@@ -5,7 +5,7 @@ import { PGlite } from "@electric-sql/pglite";
 import type { Sql } from "../db.ts";
 import { insertLabVersion } from "./lab-version.ts";
 import { executeExplainPlain } from "./plain.ts";
-import { requireClinicianOrAdmin as requireProxyClinicianOrAdmin } from "../../routes/api/-imaging-proxy.ts";
+import { requireClinicianOrAdmin as requireProxyClinicianOrAdmin } from "../imaging/proxy.server.ts";
 import { updateMenarcheYear } from "./menarche.ts";
 import { ingestReport, linkReportQuote } from "../reports/store.ts";
 import {

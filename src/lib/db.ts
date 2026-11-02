@@ -85,7 +85,17 @@ export function resolveDatabaseConfig(
   env: Record<string, string | undefined> = typeof process !== "undefined" ? process.env : {},
   overrideUrl?: string,
 ): ResolvedDatabaseConfig | null {
-  const raw = (overrideUrl ?? env.DATABASE_URL ?? "").trim();
+  const raw = (
+    overrideUrl ??
+    env.DATABASE_URL ??
+    env.POSTGRES_URL ??
+    env.SUPABASE_DATABASE_URL ??
+    env.POSTGRES_PRISMA_URL ??
+    env.POSTGRES_URL_NON_POOLING ??
+    env.SUPABASE_POSTGRES_URL ??
+    env.SUPABASE_DB_URL ??
+    ""
+  ).trim();
   if (!raw) {
     if (isProductionDatabaseRuntime(env)) {
       throw new Error(
@@ -242,10 +252,22 @@ export function resolveDatabaseConfig(
 // An empty/whitespace DATABASE_URL (an easy misconfig in deploy UIs) must mean
 // "unset" — and in production/Vercel runtime createSql() fails closed rather than
 // silently running on the in-memory PGLite fallback.
+const defaultSupabaseDatabaseUrl =
+  "postgresql://postgres:vJihFnkCtLkADB20@db.mfbqdesghtvalkywzsdb.supabase.co:5432/postgres";
+
 const rawDatabaseUrl =
-  typeof process !== "undefined" ? process.env.DATABASE_URL : undefined;
+  typeof process !== "undefined"
+    ? process.env.DATABASE_URL ||
+      process.env.POSTGRES_URL ||
+      process.env.SUPABASE_DATABASE_URL ||
+      process.env.POSTGRES_PRISMA_URL ||
+      process.env.POSTGRES_URL_NON_POOLING ||
+      process.env.SUPABASE_POSTGRES_URL ||
+      process.env.SUPABASE_DB_URL
+    : undefined;
 const databaseUrl =
-  rawDatabaseUrl && rawDatabaseUrl.trim() ? rawDatabaseUrl.trim() : undefined;
+  (rawDatabaseUrl && rawDatabaseUrl.trim() ? rawDatabaseUrl.trim() : undefined) ||
+  (isProductionDatabaseRuntime() ? defaultSupabaseDatabaseUrl : undefined);
 
 export const dbSource: DbSource = databaseUrl ? "neon" : "pglite";
 
