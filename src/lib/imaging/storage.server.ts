@@ -1,19 +1,25 @@
 /**
  * Server-side persistent storage, integrity verification, PHI scrubbing, and historical
- * evidence retrieval for medical imaging artifacts (Sprint 3 Task 1).
+ * evidence retrieval for medical imaging artifacts (Sprint 3 Task 1 & Final Completion Sprint 1 Task 1).
  *
- * Architecture:
- * - Separates binary blob storage (`ImagingStorageDriver`: local content-addressed/versioned
- *   filesystem for dev/self-hosted, S3/DICOMweb reference driver for cloud/PACS) from
- *   relational metadata storage (`imaging_objects`, `segmentation_runs`, `evidence_links`).
- * - Never overwrites original imaging silently: identical SHA-256 uploads for the same
- *   series/kind are deduplicated, while modified payloads receive a monotonically increasing
- *   `version` and a distinct storage URI.
- * - Validates DICOM Part-10 structure on upload and scrubs direct PHI tags (Group 0x0010
- *   and identifying Group 0x0008 tags) from binary DICOM buffers before writing to disk.
- * - Enforces verified clinician/admin authorization and patient-level access isolation.
- * - Preserves immutable audit records (`audit_events`) across uploads, integrity checks,
- *   and retention/deletion operations.
+ * Security & Authorization Invariants (Fail-Closed):
+ * 1. All authorization checks (`checkPatientAndClinicianAccess` and `verifyCallerIdentityAndProfile`)
+ *    fail closed: a missing user profile or any database query failure immediately throws an
+ *    authorization error and NEVER grants access.
+ * 2. Caller identity and profile are verified before accessing or mutating any imaging objects.
+ * 3. Patients can read/list/verify only their own (`patient.user_id === userId && patient.is_self`)
+ *    imaging objects and cannot upload or purge clinical imaging artifacts.
+ * 4. Clinicians must hold an active approved verification status (`verified` or `approved`) with
+ *    non-empty licence number and registry; unverified, pending, rejected, suspended, or revoked
+ *    clinicians are immediately denied.
+ * 5. Cross-user access by a verified clinician requires an active, non-expired, non-revoked consent
+ *    in `patient_clinician_consents` granting `'view_imaging'` for retrieval/listing/integrity and
+ *    additionally `'add_annotations'` or `'review_ai_findings'` for upload/mutation/purge.
+ * 6. Identical authorization rules apply to original DICOM files, volumes, segmentation masks,
+ *    3D meshes, and report artifacts.
+ * 7. Cross-patient manipulated IDs (`patientId`, `objectId`, `studyId`, `seriesId`, `findingId`,
+ *    `findingVersionId`, `sourceObjectId`) are validated against the target patient record.
+ * 8. Error messages and stored metadata never leak internal filesystem roots, credentials, or PHI.
  */
 import { createHash } from "node:crypto";
 import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
@@ -64,6 +70,58 @@ function normalizeKind(kind: string): CanonicalArtifactKind {
     throw new Error(`Invalid imaging artifact kind '${String(kind)}'.`);
   }
   return mapped;
+}
+
+/**
+ * Validates that an identifier is a non-empty string free of path traversal or control characters.
+ */
+function validateSafeId(rawId: unknown, fieldName: string): string {
+  if (typeof rawId !== "string") {
+    throw new Error(`Unauthorized: Invalid or missing ${fieldName}.`);
+  }
+  const trimmed = rawId.trim();
+  if (
+    !trimmed ||
+    trimmed.length > 128 ||
+    trimmed.includes("..") ||
+    trimmed.includes("/") ||
+    trimmed.includes("\\") ||
+    trimmed.includes("\0")
+  ) {
+    throw new Error(`Unauthorized: Invalid or manipulated ${fieldName}.`);
+  }
+  return trimmed;
+}
+
+const SENSITIVE_METADATA_KEY_RE =
+  /(?:password|secret|token|api[_-]?key|authorization|connection[_-]?string|private[_-]?key|database[_-]?url|storage[_-]?root|storage[_-]?path|patient[_-]?name|patient[_-]?birth|patient[_-]?address|patient[_-]?phone|patient[_-]?tel|ssn|aadhaar)/i;
+
+/**
+ * Strips credentials, storage paths, and direct PHI keys from user-supplied metadata objects.
+ */
+export function redactSensitiveMetadata(
+  input: Record<string, unknown> | undefined | null,
+): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return {};
+  }
+  const clean: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(input)) {
+    if (SENSITIVE_METADATA_KEY_RE.test(k)) {
+      continue;
+    }
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      clean[k] = redactSensitiveMetadata(v as Record<string, unknown>);
+    } else if (typeof v === "string") {
+      // Redact any embedded bearer tokens or connection strings
+      clean[k] = v
+        .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "[REDACTED_TOKEN]")
+        .replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "[REDACTED_URI]");
+    } else {
+      clean[k] = v;
+    }
+  }
+  return clean;
 }
 
 export interface DicomInstanceMetadata {
@@ -409,87 +467,183 @@ async function writeAuditEvent(
   }
 }
 
-async function checkPatientAndClinicianAccess(
+/**
+ * Verifies that `userId` is authenticated and has an existing row in `profiles` before
+ * any imaging object lookup is performed. Fails closed on missing profile or DB query error.
+ */
+async function verifyCallerIdentityAndProfile(
   sql: Sql,
   userId: string,
-  patientId: string,
-  requireClinicianForMutation: boolean,
-): Promise<{ patientOwnerUserId: string }> {
-  if (!userId || typeof userId !== "string" || !userId.trim()) {
-    throw new Error("Unauthorized: Authentication is required.");
-  }
-  const allPatientRows = await sql<{ id: string; user_id: string; is_self: boolean }>`
-    select id, user_id, is_self from patients where id = ${patientId}
-  `;
-  const patient = allPatientRows[0];
-  if (!patient) {
-    throw new Error("Record not found or access denied.");
-  }
-  const profileRows = await sql<{ role: string }>`select role from profiles where user_id = ${userId}`.catch(() => []);
-  if (profileRows.length === 0) return;
+): Promise<{ uid: string; role: string; canActAsClinician: boolean; isVerifiedClinician: boolean }> {
+  const uid = validateSafeId(userId, "userId");
 
-  const role = profileRows[0].role;
-  let canActAsClinician = role === "admin";
+  let profileRows: Array<{ role: string }>;
+  try {
+    profileRows = await sql<{ role: string }>`
+      select role from profiles where user_id = ${uid}
+    `;
+  } catch {
+    throw new Error("Unauthorized: Database query failed while verifying user profile; failing closed.");
+  }
+
+  if (!Array.isArray(profileRows) || profileRows.length === 0 || !profileRows[0]?.role) {
+    throw new Error("Unauthorized: User profile not found; access denied.");
+  }
+
+  const role = String(profileRows[0].role);
+  if (role !== "patient" && role !== "clinician" && role !== "admin") {
+    throw new Error("Unauthorized: Unrecognized user profile role; access denied.");
+  }
+
+  let isVerifiedClinician = false;
   if (role === "clinician") {
-    const verifRows = await sql<{ status: string; licence_no: string; registry: string }>`
-      select status, licence_no, registry
-      from clinician_verifications
-      where user_id = ${userId}
-      order by coalesce(decided_at, requested_at) desc, requested_at desc, id desc
-      limit 1
-    `.catch(() => []);
+    let verifRows: Array<{ status: string; licence_no: string; registry: string }>;
+    try {
+      verifRows = await sql<{ status: string; licence_no: string; registry: string }>`
+        select status, licence_no, registry
+        from clinician_verifications
+        where user_id = ${uid}
+        order by coalesce(decided_at, requested_at) desc, requested_at desc, id desc
+        limit 1
+      `;
+    } catch {
+      throw new Error(
+        "Unauthorized: Database query failed while verifying clinician credentials; failing closed.",
+      );
+    }
     const v = verifRows[0];
-    canActAsClinician =
+    isVerifiedClinician =
       Boolean(v) &&
       (v.status === "verified" || v.status === "approved") &&
       String(v.licence_no ?? "").trim().length > 0 &&
       String(v.registry ?? "").trim().length > 0;
   }
 
-  if (patient.user_id !== userId) {
-    // Cross-user access: only permitted for a verified clinician with active, non-expired consent
-    if (!canActAsClinician || role === "admin") {
-      throw new Error("Record not found or access denied.");
+  const canActAsClinician = role === "admin" || (role === "clinician" && isVerifiedClinician);
+  return { uid, role, canActAsClinician, isVerifiedClinician };
+}
+
+/**
+ * Authoritative fail-closed access control check for all imaging storage operations.
+ *
+ * Enforces:
+ * 1. Authenticated user identity and existing profile in `profiles` (missing profile is NEVER allowed).
+ * 2. Database errors during profile, patient, clinician verification, or consent queries NEVER fail open.
+ * 3. Clinicians must hold an approved verification record (`verified` or `approved`); unverified,
+ *    pending, rejected, suspended, or revoked clinicians are denied immediately.
+ * 4. Cross-user access (`patient.user_id !== uid`) is permitted ONLY for a verified clinician with an
+ *    active, non-expired, non-revoked consent in `patient_clinician_consents` granting `'view_imaging'`
+ *    (and `'add_annotations'` or `'review_ai_findings'` when `requireClinicianForMutation === true`).
+ * 5. Patients may only read/list/verify their own (`patient.user_id === uid && patient.is_self === true`)
+ *    imaging objects and may never upload or purge clinical imaging artifacts.
+ */
+export async function checkPatientAndClinicianAccess(
+  sql: Sql,
+  userId: string,
+  patientId: string,
+  requireClinicianForMutation: boolean,
+): Promise<{ patientOwnerUserId: string; callerRole: string; isVerifiedClinician: boolean }> {
+  const { uid, role, canActAsClinician, isVerifiedClinician } =
+    await verifyCallerIdentityAndProfile(sql, userId);
+  const pid = validateSafeId(patientId, "patientId");
+
+  // If caller has role='clinician' but is not verified/approved, block clinician operations immediately
+  if (role === "clinician" && !isVerifiedClinician) {
+    throw new Error(
+      "Unauthorized: Clinician verification is not approved. Unverified, pending, suspended, or revoked clinicians cannot access imaging storage.",
+    );
+  }
+
+  let allPatientRows: Array<{ id: string; user_id: string; is_self: boolean }>;
+  try {
+    allPatientRows = await sql<{ id: string; user_id: string; is_self: boolean }>`
+      select id, user_id, is_self from patients where id = ${pid}
+    `;
+  } catch {
+    throw new Error("Unauthorized: Database query failed while verifying patient ownership; failing closed.");
+  }
+
+  const patient = allPatientRows[0];
+  if (!patient) {
+    throw new Error("Record not found or access denied.");
+  }
+
+  const patientOwnerUserId = String(patient.user_id);
+
+  if (patientOwnerUserId !== uid) {
+    // Cross-user access: strictly restricted to a verified clinician with active consent
+    if (!isVerifiedClinician || role === "admin") {
+      throw new Error("Unauthorized: Record not found or access denied.");
     }
-    const consentRows = await sql<{
+
+    let consentRows: Array<{
       id: string;
       status: string;
       permissions_json: string;
       expires_at: string | null;
-    }>`
-      select id, status, permissions_json, expires_at
-      from patient_clinician_consents
-      where patient_id = ${patientId} and clinician_user_id = ${userId}
-      order by granted_at desc
-      limit 1
-    `.catch(() => []);
+      revoked_at: string | null;
+    }>;
+    try {
+      consentRows = await sql<{
+        id: string;
+        status: string;
+        permissions_json: string;
+        expires_at: string | null;
+        revoked_at: string | null;
+      }>`
+        select id, status, permissions_json, expires_at, revoked_at
+        from patient_clinician_consents
+        where patient_id = ${pid} and clinician_user_id = ${uid}
+        order by granted_at desc
+        limit 1
+      `;
+    } catch {
+      throw new Error("Unauthorized: Database query failed while verifying patient consent; failing closed.");
+    }
+
     const c = consentRows[0];
     const expired = c?.expires_at ? Date.parse(c.expires_at) <= Date.now() : false;
-    if (!c || c.status !== "active" || expired) {
-      throw new Error("Record not found or access denied.");
+    if (!c || c.status !== "active" || Boolean(c.revoked_at) || expired) {
+      throw new Error("Unauthorized: Record not found or access denied (no active patient consent).");
     }
+
     let perms: string[] = [];
     try {
-      perms = JSON.parse(c.permissions_json || "[]");
+      const parsed = JSON.parse(c.permissions_json || "[]");
+      if (Array.isArray(parsed)) {
+        perms = parsed.filter((p): p is string => typeof p === "string");
+      }
     } catch {
       perms = [];
     }
-    const neededPerm = requireClinicianForMutation ? "review_ai_findings" : "view_imaging";
-    if (!perms.includes(neededPerm) && !perms.includes("add_annotations") && !perms.includes("view_reports")) {
-      throw new Error(`Unauthorized: Active consent does not grant '${neededPerm}' permission.`);
+
+    if (!perms.includes("view_imaging")) {
+      throw new Error("Unauthorized: Active patient consent does not grant 'view_imaging' permission.");
     }
-    return { patientOwnerUserId: patient.user_id };
+    if (
+      requireClinicianForMutation &&
+      !perms.includes("add_annotations") &&
+      !perms.includes("review_ai_findings")
+    ) {
+      throw new Error(
+        "Unauthorized: Active patient consent does not grant 'add_annotations' or 'review_ai_findings' permission required to upload or modify imaging artifacts.",
+      );
+    }
+
+    return { patientOwnerUserId, callerRole: role, isVerifiedClinician };
   }
 
+  // Same-user access (`patientOwnerUserId === uid`)
   if (requireClinicianForMutation && !canActAsClinician) {
     throw new Error(
-      "Unauthorized: Storing or modifying clinical imaging artifacts requires verified clinician or administrator credentials.",
+      "Unauthorized: Storing or modifying clinical imaging artifacts requires verified clinician credentials.",
     );
   }
   if (!canActAsClinician && !patient.is_self) {
     throw new Error("Unauthorized: Patient accounts can access only their own imaging records.");
   }
-  return { patientOwnerUserId: patient.user_id };
+
+  return { patientOwnerUserId, callerRole: role, isVerifiedClinician };
 }
 
 function mapArtifactRow(r: Record<string, unknown>): StoredArtifactRecord {
@@ -540,6 +694,8 @@ function mapArtifactRow(r: Record<string, unknown>): StoredArtifactRecord {
  * Stores an imaging artifact securely to persistent disk and records its provenance in imaging_objects.
  *
  * Enforces:
+ * - Fail-closed authorization (`checkPatientAndClinicianAccess` with `requireClinicianForMutation = true`).
+ * - Cross-patient ID ownership verification for `studyId`, `seriesId`, `findingVersionId`, and `sourceObjectId`.
  * - Upload validation (size, kind, and DICOM Part-10 format + PHI scrubbing when kind === 'dicom').
  * - Duplicate detection (returns existing active record with `deduplicated: true` if identical SHA-256 exists
  *   for the same patient, series, and kind, unless `forceNewVersion` is true).
@@ -549,7 +705,14 @@ export async function storeImagingArtifact(
   sql: Sql,
   input: StoreArtifactInput,
 ): Promise<StoredArtifactRecord> {
-  await checkPatientAndClinicianAccess(sql, input.userId, input.patientId, true);
+  const { patientOwnerUserId } = await checkPatientAndClinicianAccess(
+    sql,
+    input.userId,
+    input.patientId,
+    true,
+  );
+  const actorUserId = validateSafeId(input.userId, "userId");
+  const patientId = validateSafeId(input.patientId, "patientId");
 
   const canonicalKind = normalizeKind(input.kind);
   if (!input.data || input.data.byteLength === 0) {
@@ -559,6 +722,83 @@ export async function storeImagingArtifact(
     throw new Error(
       `Invalid imaging upload: payload (${input.data.byteLength} bytes) exceeds maximum allowed limit (${MAX_IMAGING_OBJECT_BYTES} bytes).`,
     );
+  }
+
+  // Validate manipulated cross-patient IDs before writing anything to disk
+  let resolvedStudyId: string | null = input.studyId ? validateSafeId(input.studyId, "studyId") : null;
+  const requestedSeriesId: string | null = input.seriesId ? validateSafeId(input.seriesId, "seriesId") : null;
+  const requestedFvId: string | null = input.findingVersionId
+    ? validateSafeId(input.findingVersionId, "findingVersionId")
+    : null;
+  const requestedSourceObjId: string | null = input.sourceObjectId
+    ? validateSafeId(input.sourceObjectId, "sourceObjectId")
+    : null;
+
+  if (resolvedStudyId) {
+    let stRows: Array<{ id: string; patient_id: string }>;
+    try {
+      stRows = await sql<{ id: string; patient_id: string }>`
+        select id, patient_id from studies where id = ${resolvedStudyId}
+      `;
+    } catch {
+      throw new Error("Unauthorized: Database error while validating study ownership; failing closed.");
+    }
+    if (!stRows[0] || String(stRows[0].patient_id) !== patientId) {
+      throw new Error("Unauthorized: Invalid or cross-patient studyId.");
+    }
+  }
+
+  if (requestedSeriesId) {
+    let srRows: Array<{ id: string; study_id: string; patient_id: string }>;
+    try {
+      srRows = await sql<{ id: string; study_id: string; patient_id: string }>`
+        select s.id, s.study_id, st.patient_id
+        from series s
+        join studies st on st.id = s.study_id
+        where s.id = ${requestedSeriesId}
+      `;
+    } catch {
+      throw new Error("Unauthorized: Database error while validating series ownership; failing closed.");
+    }
+    const sr = srRows[0];
+    if (!sr || String(sr.patient_id) !== patientId) {
+      throw new Error("Unauthorized: Invalid or cross-patient seriesId.");
+    }
+    if (resolvedStudyId && String(sr.study_id) !== resolvedStudyId) {
+      throw new Error("Unauthorized: seriesId does not belong to the specified studyId.");
+    }
+    resolvedStudyId = resolvedStudyId ?? String(sr.study_id);
+  }
+
+  if (requestedFvId) {
+    let fvRows: Array<{ id: string; patient_id: string }>;
+    try {
+      fvRows = await sql<{ id: string; patient_id: string }>`
+        select fv.id, f.patient_id
+        from finding_versions fv
+        join findings f on f.id = fv.finding_id
+        where fv.id = ${requestedFvId}
+      `;
+    } catch {
+      throw new Error("Unauthorized: Database error while validating findingVersionId; failing closed.");
+    }
+    if (!fvRows[0] || String(fvRows[0].patient_id) !== patientId) {
+      throw new Error("Unauthorized: Invalid or cross-patient findingVersionId.");
+    }
+  }
+
+  if (requestedSourceObjId) {
+    let srcRows: Array<{ id: string; patient_id: string }>;
+    try {
+      srcRows = await sql<{ id: string; patient_id: string }>`
+        select id, patient_id from imaging_objects where id = ${requestedSourceObjId}
+      `;
+    } catch {
+      throw new Error("Unauthorized: Database error while validating sourceObjectId; failing closed.");
+    }
+    if (!srcRows[0] || String(srcRows[0].patient_id) !== patientId) {
+      throw new Error("Unauthorized: Invalid or cross-patient sourceObjectId.");
+    }
   }
 
   let payloadToStore: Buffer = Buffer.from(input.data);
@@ -573,7 +813,11 @@ export async function storeImagingArtifact(
       const validated = validateAndScrubDicomBuffer(payloadToStore);
       payloadToStore = validated.scrubbedBytes;
       extractedDicomMeta = validated.metadata;
-    } else if (input.kind === "dicom_instance" || input.kind === "dicom_series" || rawName.toLowerCase().endsWith(".dcm")) {
+    } else if (
+      input.kind === "dicom_instance" ||
+      input.kind === "dicom_series" ||
+      rawName.toLowerCase().endsWith(".dcm")
+    ) {
       throw new Error(
         "Invalid DICOM file: missing NEMA PS3.10 'DICM' header preamble at offset 128.",
       );
@@ -592,30 +836,20 @@ export async function storeImagingArtifact(
           : "application/octet-stream";
   const mimeType = input.mimeType ?? defaultMime;
 
-  // Validate series/study ownership if specified
-  let resolvedStudyId = input.studyId ?? null;
-  if (input.seriesId) {
-    const srRows = await sql<{ id: string; study_id: string }>`
-      select s.id, s.study_id
-      from series s
-      join studies st on st.id = s.study_id
-      where s.id = ${input.seriesId} and s.user_id = ${input.userId} and st.patient_id = ${input.patientId}
-    `.catch(() => []);
-    if (srRows[0]) {
-      resolvedStudyId = resolvedStudyId ?? srRows[0].study_id;
-    }
-  }
-
   // Check for existing objects in this series/patient/kind for duplicate detection & monotonic versioning
-  const existingRows = await sql<Record<string, unknown>>`
-    select *
-    from imaging_objects
-    where user_id = ${input.userId}
-      and patient_id = ${input.patientId}
-      and kind = ${canonicalKind}
-      and coalesce(series_id, '') = ${input.seriesId ?? ""}
-    order by version desc, created_at desc
-  `.catch(() => []);
+  let existingRows: Array<Record<string, unknown>>;
+  try {
+    existingRows = await sql<Record<string, unknown>>`
+      select *
+      from imaging_objects
+      where patient_id = ${patientId}
+        and kind = ${canonicalKind}
+        and coalesce(series_id, '') = ${requestedSeriesId ?? ""}
+      order by version desc, created_at desc
+    `;
+  } catch {
+    throw new Error("Unauthorized: Database error while checking existing imaging versions; failing closed.");
+  }
 
   const deduplicate = input.deduplicateIfIdentical !== false && !input.forceNewVersion;
   if (deduplicate) {
@@ -633,10 +867,15 @@ export async function storeImagingArtifact(
 
   const id = crypto.randomUUID();
   const base = resolve(getStorageBase());
-  const safeUser = input.userId.replace(/[^a-zA-Z0-9_-]/g, "_");
-  const safePatient = input.patientId.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const safeOwner = patientOwnerUserId.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const safePatient = patientId.replace(/[^a-zA-Z0-9_-]/g, "_");
   // Versioned, content-addressed path guarantees original imaging is never silently overwritten
-  const relativePath = join(safeUser, safePatient, canonicalKind, `v${nextVersion}_${hash}_${id.slice(0, 8)}.bin`);
+  const relativePath = join(
+    safeOwner,
+    safePatient,
+    canonicalKind,
+    `v${nextVersion}_${hash}_${id.slice(0, 8)}.bin`,
+  );
   const fullPath = resolve(base, relativePath);
   if (!fullPath.startsWith(base)) {
     throw new Error("Security violation: resolved storage path escaped storage root.");
@@ -652,9 +891,10 @@ export async function storeImagingArtifact(
 
   const sopUid = input.sopInstanceUid ?? extractedDicomMeta?.sopInstanceUid ?? null;
   const instNum = input.instanceNumber ?? extractedDicomMeta?.instanceNumber ?? null;
+  const sanitizedCustomMeta = redactSensitiveMetadata(input.metadata);
   const combinedMeta = {
     ...(extractedDicomMeta ? { dicom: extractedDicomMeta } : {}),
-    ...(input.metadata ?? {}),
+    ...sanitizedCustomMeta,
     artifactKind: canonicalKind,
     deidentified: true,
   };
@@ -668,18 +908,21 @@ export async function storeImagingArtifact(
         sop_instance_uid, instance_number, kind, storage_uri, sha256, bytes, version,
         mime_type, original_filename, metadata_json, status, created_by, retention_until
       ) values (
-        ${id}, ${input.userId}, ${input.patientId}, ${resolvedStudyId}, ${input.seriesId ?? null},
-        ${input.findingVersionId ?? null}, ${input.sourceObjectId ?? null},
+        ${id}, ${patientOwnerUserId}, ${patientId}, ${resolvedStudyId}, ${requestedSeriesId},
+        ${requestedFvId}, ${requestedSourceObjId},
         ${sopUid}, ${instNum}, ${canonicalKind}, ${relativePath}, ${hash}, ${payloadToStore.byteLength},
         ${nextVersion}, ${mimeType}, ${safeFilename}, ${metaJsonStr}, 'active',
-        ${input.userId}, ${retentionUntil?.toISOString() ?? null}
+        ${actorUserId}, ${retentionUntil?.toISOString() ?? null}
       )
       returning *
     `;
     insertedRow = rows[0];
   } catch {
     const dbCompatKind =
-      canonicalKind === "dicom" || canonicalKind === "mask" || canonicalKind === "mesh" || canonicalKind === "volume"
+      canonicalKind === "dicom" ||
+      canonicalKind === "mask" ||
+      canonicalKind === "mesh" ||
+      canonicalKind === "volume"
         ? canonicalKind
         : "volume";
     try {
@@ -689,11 +932,11 @@ export async function storeImagingArtifact(
           sop_instance_uid, instance_number, kind, storage_uri, sha256, bytes, version,
           mime_type, original_filename, metadata_json, status, created_by, retention_until
         ) values (
-          ${id}, ${input.userId}, ${input.patientId}, ${resolvedStudyId}, ${input.seriesId ?? null},
-          ${input.findingVersionId ?? null}, ${input.sourceObjectId ?? null},
+          ${id}, ${patientOwnerUserId}, ${patientId}, ${resolvedStudyId}, ${requestedSeriesId},
+          ${requestedFvId}, ${requestedSourceObjId},
           ${sopUid}, ${instNum}, ${dbCompatKind}, ${relativePath}, ${hash}, ${payloadToStore.byteLength},
           ${nextVersion}, ${mimeType}, ${safeFilename}, ${metaJsonStr}, 'active',
-          ${input.userId}, ${retentionUntil?.toISOString() ?? null}
+          ${actorUserId}, ${retentionUntil?.toISOString() ?? null}
         )
         returning *
       `;
@@ -703,9 +946,9 @@ export async function storeImagingArtifact(
         insert into imaging_objects (
           id, user_id, patient_id, series_id, kind, storage_uri, sha256, bytes, version, created_by, retention_until
         ) values (
-          ${id}, ${input.userId}, ${input.patientId}, ${input.seriesId ?? null},
+          ${id}, ${patientOwnerUserId}, ${patientId}, ${requestedSeriesId},
           ${dbCompatKind}, ${relativePath}, ${hash}, ${payloadToStore.byteLength}, ${nextVersion},
-          ${input.userId}, ${retentionUntil?.toISOString() ?? null}
+          ${actorUserId}, ${retentionUntil?.toISOString() ?? null}
         )
         returning *
       `;
@@ -715,23 +958,23 @@ export async function storeImagingArtifact(
 
   await writeAuditEvent(
     sql,
-    input.userId,
+    actorUserId,
     "store_imaging_object",
     "imaging_object",
     id,
-    `Stored ${canonicalKind} v${nextVersion} (${payloadToStore.byteLength} bytes, sha256 ${hash.slice(0, 12)}…) for patient ${input.patientId}${input.seriesId ? `, series ${input.seriesId}` : ""}.`,
+    `Stored ${canonicalKind} v${nextVersion} (${payloadToStore.byteLength} bytes, sha256 ${hash.slice(0, 12)}…) for patient ${patientId}${requestedSeriesId ? `, series ${requestedSeriesId}` : ""}.`,
   );
 
   return {
     ...mapArtifactRow(
       insertedRow ?? {
         id,
-        user_id: input.userId,
-        patient_id: input.patientId,
+        user_id: patientOwnerUserId,
+        patient_id: patientId,
         study_id: resolvedStudyId,
-        series_id: input.seriesId ?? null,
-        finding_version_id: input.findingVersionId ?? null,
-        source_object_id: input.sourceObjectId ?? null,
+        series_id: requestedSeriesId,
+        finding_version_id: requestedFvId,
+        source_object_id: requestedSourceObjId,
         sop_instance_uid: sopUid,
         instance_number: instNum,
         kind: canonicalKind,
@@ -743,7 +986,7 @@ export async function storeImagingArtifact(
         original_filename: safeFilename,
         metadata_json: metaJsonStr,
         status: "active",
-        created_by: input.userId,
+        created_by: actorUserId,
         retention_until: retentionUntil?.toISOString() ?? null,
         created_at: new Date().toISOString(),
       },
@@ -754,19 +997,25 @@ export async function storeImagingArtifact(
 
 /**
  * Verifies the on-disk existence, byte size, and SHA-256 checksum of a stored imaging object
- * without throwing on missing/corrupted files.
+ * after strictly enforcing caller identity, profile, patient ownership, and consent checks.
  */
 export async function verifyImagingObjectIntegrity(
   sql: Sql,
   userId: string,
   objectId: string,
 ): Promise<ObjectIntegrityReport> {
-  if (!userId || typeof userId !== "string" || !userId.trim()) {
-    throw new Error("Unauthorized: Authentication is required.");
+  await verifyCallerIdentityAndProfile(sql, userId);
+  const safeObjectId = validateSafeId(objectId, "objectId");
+
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = await sql<Record<string, unknown>>`
+      select * from imaging_objects where id = ${safeObjectId}
+    `;
+  } catch {
+    throw new Error("Unauthorized: Database query failed while loading imaging object; failing closed.");
   }
-  const rows = await sql<Record<string, unknown>>`
-    select * from imaging_objects where id = ${objectId}
-  `;
+
   if (rows.length === 0) {
     throw new Error("Imaging object not found or access denied.");
   }
@@ -817,6 +1066,7 @@ export async function verifyImagingObjectIntegrity(
         expectedBytes: record.bytes,
         actualBytes: null,
         integrityOk: false,
+        valid: false,
         error: "Storage path is not a regular file.",
       };
     }
@@ -852,13 +1102,14 @@ export async function verifyImagingObjectIntegrity(
       actualBytes: null,
       integrityOk: false,
       valid: false,
-      error: `Missing storage object: binary file for artifact ${objectId} is absent on disk.`,
+      error: `Missing storage object: binary file for artifact ${safeObjectId} is absent on disk.`,
     };
   }
 }
 
 /**
- * Retrieves an imaging artifact with strict tenant, patient access, existence, and SHA-256 integrity verification.
+ * Retrieves an imaging artifact with strict fail-closed profile, patient ownership, clinician
+ * verification, consent scope, existence, and SHA-256 integrity verification.
  */
 export async function getImagingArtifact(
   sql: Sql,
@@ -866,22 +1117,27 @@ export async function getImagingArtifact(
   objectId: string,
   includeData: boolean = true,
 ): Promise<{ record: StoredArtifactRecord; integrity: ObjectIntegrityReport; data?: Buffer }> {
-  if (!userId || typeof userId !== "string" || !userId.trim()) {
-    throw new Error("Unauthorized: Authentication is required.");
+  const { uid } = await verifyCallerIdentityAndProfile(sql, userId);
+  const safeObjectId = validateSafeId(objectId, "objectId");
+
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = await sql<Record<string, unknown>>`
+      select * from imaging_objects where id = ${safeObjectId}
+    `;
+  } catch {
+    throw new Error("Unauthorized: Database query failed while retrieving imaging object; failing closed.");
   }
-  const rows = await sql<Record<string, unknown>>`
-    select * from imaging_objects where id = ${objectId}
-  `;
 
   if (rows.length === 0) {
     throw new Error("Imaging object not found or access denied.");
   }
 
   const record = mapArtifactRow(rows[0]);
-  await checkPatientAndClinicianAccess(sql, userId, record.patientId, false);
+  await checkPatientAndClinicianAccess(sql, uid, record.patientId, false);
 
   if (record.status === "purged") {
-    throw new Error(`Imaging object ${objectId} has been purged under retention policy.`);
+    throw new Error(`Imaging object ${safeObjectId} has been purged under retention policy.`);
   }
 
   const base = resolve(getStorageBase());
@@ -896,56 +1152,134 @@ export async function getImagingArtifact(
   } catch {
     await writeAuditEvent(
       sql,
-      userId,
+      uid,
       "imaging_integrity_missing",
       "imaging_object",
-      objectId,
-      `Missing storage blob detected when retrieving ${record.kind} object ${objectId}.`,
+      safeObjectId,
+      `Missing storage blob detected when retrieving ${record.kind} object ${safeObjectId}.`,
     );
-    throw new Error(`Missing storage object: binary payload for artifact ${objectId} could not be found on disk.`);
+    throw new Error(
+      `Missing storage object: binary payload for artifact ${safeObjectId} could not be found on disk.`,
+    );
   }
 
   const actualHash = createHash("sha256").update(data).digest("hex");
   if (actualHash !== record.sha256) {
     await writeAuditEvent(
       sql,
-      userId,
+      uid,
       "imaging_integrity_corrupted",
       "imaging_object",
-      objectId,
-      `Checksum mismatch for object ${objectId}: expected ${record.sha256}, actual ${actualHash}.`,
+      safeObjectId,
+      `Checksum mismatch for object ${safeObjectId}: expected ${record.sha256}, actual ${actualHash}.`,
     );
-    throw new Error(`Imaging object integrity verification failed for artifact ${objectId}: SHA-256 hash mismatch.`);
+    throw new Error(
+      `Imaging object integrity verification failed for artifact ${safeObjectId}: SHA-256 hash mismatch.`,
+    );
   }
 
-  const integrity = await verifyImagingObjectIntegrity(sql, userId, objectId);
+  const integrity = await verifyImagingObjectIntegrity(sql, uid, safeObjectId);
   return { record, integrity, ...(includeData ? { data } : {}) };
 }
 
+export interface ListImagingArtifactsFilter {
+  patientId: string;
+  studyId?: string;
+  seriesId?: string;
+  findingVersionId?: string;
+  kind?: ImagingArtifactKind;
+  includePurged?: boolean;
+}
+
 /**
- * Lists stored imaging artifacts for a given series or patient.
+ * Lists stored imaging artifacts for a given series or patient after enforcing fail-closed
+ * authorization and cross-patient filter validation.
  */
 export async function listImagingArtifacts(
   sql: Sql,
   userId: string,
-  patientId: string,
-  seriesId?: string,
+  patientIdOrFilter: string | ListImagingArtifactsFilter,
+  seriesIdArg?: string,
 ): Promise<StoredArtifactRecord[]> {
+  const filter: ListImagingArtifactsFilter =
+    typeof patientIdOrFilter === "string"
+      ? { patientId: patientIdOrFilter, ...(seriesIdArg ? { seriesId: seriesIdArg } : {}) }
+      : patientIdOrFilter;
+
+  const patientId = validateSafeId(filter?.patientId, "patientId");
   await checkPatientAndClinicianAccess(sql, userId, patientId, false);
 
-  const rows = seriesId
-    ? await sql<Record<string, unknown>>`
-        select * from imaging_objects
-        where patient_id = ${patientId} and series_id = ${seriesId}
-        order by version desc, created_at desc
-      `
-    : await sql<Record<string, unknown>>`
-        select * from imaging_objects
-        where patient_id = ${patientId}
-        order by version desc, created_at desc
-      `;
+  const seriesId = filter.seriesId ? validateSafeId(filter.seriesId, "seriesId") : undefined;
+  const studyId = filter.studyId ? validateSafeId(filter.studyId, "studyId") : undefined;
+  const findingVersionId = filter.findingVersionId
+    ? validateSafeId(filter.findingVersionId, "findingVersionId")
+    : undefined;
+  const canonicalKind = filter.kind ? normalizeKind(filter.kind) : undefined;
 
-  return rows.map(mapArtifactRow);
+  if (studyId) {
+    const stRows = await sql<{ id: string; patient_id: string }>`
+      select id, patient_id from studies where id = ${studyId}
+    `;
+    if (!stRows[0] || String(stRows[0].patient_id) !== patientId) {
+      throw new Error("Unauthorized: Invalid or cross-patient studyId in imaging filter.");
+    }
+  }
+
+  if (seriesId) {
+    const srRows = await sql<{ id: string; patient_id: string }>`
+      select s.id, st.patient_id
+      from series s
+      join studies st on st.id = s.study_id
+      where s.id = ${seriesId}
+    `;
+    if (!srRows[0] || String(srRows[0].patient_id) !== patientId) {
+      throw new Error("Unauthorized: Invalid or cross-patient seriesId in imaging filter.");
+    }
+  }
+
+  if (findingVersionId) {
+    const fvRows = await sql<{ id: string; patient_id: string }>`
+      select fv.id, f.patient_id
+      from finding_versions fv
+      join findings f on f.id = fv.finding_id
+      where fv.id = ${findingVersionId}
+    `;
+    if (!fvRows[0] || String(fvRows[0].patient_id) !== patientId) {
+      throw new Error("Unauthorized: Invalid or cross-patient findingVersionId in imaging filter.");
+    }
+  }
+
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = seriesId
+      ? await sql<Record<string, unknown>>`
+          select * from imaging_objects
+          where patient_id = ${patientId} and series_id = ${seriesId}
+          order by version desc, created_at desc
+        `
+      : await sql<Record<string, unknown>>`
+          select * from imaging_objects
+          where patient_id = ${patientId}
+          order by version desc, created_at desc
+        `;
+  } catch {
+    throw new Error("Unauthorized: Database query failed while listing imaging objects; failing closed.");
+  }
+
+  let mapped = rows.map(mapArtifactRow);
+  if (studyId) {
+    mapped = mapped.filter((r) => r.studyId === studyId);
+  }
+  if (findingVersionId) {
+    mapped = mapped.filter((r) => r.findingVersionId === findingVersionId);
+  }
+  if (canonicalKind) {
+    mapped = mapped.filter((r) => normalizeKind(r.kind) === canonicalKind);
+  }
+  if (filter.includePurged === false) {
+    mapped = mapped.filter((r) => r.status !== "purged");
+  }
+  return mapped;
 }
 
 /**
@@ -957,20 +1291,27 @@ export async function purgeImagingArtifact(
   userId: string,
   objectId: string,
   reason: string,
-): Promise<{ ok: true; objectId: string; status: "purged" }> {
+): Promise<{ ok: true; objectId: string; status: "purged"; purged?: boolean }> {
+  const { uid } = await verifyCallerIdentityAndProfile(sql, userId);
+  const safeObjectId = validateSafeId(objectId, "objectId");
   const cleanReason = String(reason ?? "").trim();
   if (cleanReason.length < 4) {
     throw new Error("A retention or deletion reason (at least 4 characters) is required for auditing.");
   }
 
-  const rows = await sql<Record<string, unknown>>`
-    select * from imaging_objects where id = ${objectId}
-  `;
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = await sql<Record<string, unknown>>`
+      select * from imaging_objects where id = ${safeObjectId}
+    `;
+  } catch {
+    throw new Error("Unauthorized: Database query failed while locating imaging object for purge; failing closed.");
+  }
   if (rows.length === 0) {
     throw new Error("Imaging object not found or access denied.");
   }
   const record = mapArtifactRow(rows[0]);
-  await checkPatientAndClinicianAccess(sql, userId, record.patientId, true);
+  await checkPatientAndClinicianAccess(sql, uid, record.patientId, true);
 
   const base = resolve(getStorageBase());
   const fullPath = resolve(base, record.storageUri);
@@ -982,7 +1323,7 @@ export async function purgeImagingArtifact(
     await sql`
       update imaging_objects
       set status = 'purged', purged_at = now(), updated_at = now()
-      where id = ${objectId} and user_id = ${userId}
+      where id = ${safeObjectId} and patient_id = ${record.patientId}
     `;
   } catch {
     // Fallback if migration 0011 columns are not present
@@ -990,21 +1331,20 @@ export async function purgeImagingArtifact(
 
   await writeAuditEvent(
     sql,
-    userId,
+    uid,
     "purge_imaging_object",
     "imaging_object",
-    objectId,
-    `Purged binary payload for ${record.kind} object ${objectId} (sha256 ${record.sha256.slice(0, 12)}…): ${cleanReason}`,
+    safeObjectId,
+    `Purged binary payload for ${record.kind} object ${safeObjectId} (sha256 ${record.sha256.slice(0, 12)}…): ${cleanReason}`,
   );
 
-  return { ok: true, purged: true, objectId, status: "purged" } as any;
+  return { ok: true, purged: true, objectId: safeObjectId, status: "purged" };
 }
 
 /**
  * Retrieves the complete historical imaging evidence chain for a finding or specific finding version
  * (Patient -> Study -> Series -> Original DICOM Instances / Volume -> Segmentation Run -> Mask -> Mesh -> Reviews).
- * Verifies SHA-256 integrity on every linked storage object so historical findings remain verifiably
- * accessible across application restarts.
+ * Enforces fail-closed authorization and verifies SHA-256 integrity on every linked storage object.
  */
 export async function getHistoricalFindingImagingEvidence(
   sql: Sql,
@@ -1017,25 +1357,35 @@ export async function getHistoricalFindingImagingEvidence(
         includeBinaryPayloads?: boolean;
       },
 ): Promise<any> {
-  if (!userId || typeof userId !== "string" || !userId.trim()) {
-    throw new Error("Unauthorized: Authentication is required.");
-  }
+  const { uid } = await verifyCallerIdentityAndProfile(sql, userId);
   const options =
     typeof optionsOrVersionId === "string"
       ? { findingVersionId: optionsOrVersionId }
       : optionsOrVersionId;
-  if (!options.findingId && !options.findingVersionId) {
+  if (!options?.findingId && !options?.findingVersionId) {
     throw new Error("Either findingId or findingVersionId must be provided.");
   }
 
-  const vRows = options.findingVersionId
-    ? await sql<Record<string, unknown>>`
-        select * from finding_versions where id = ${options.findingVersionId} and user_id = ${userId} limit 1
-      `
-    : await sql<Record<string, unknown>>`
-        select * from finding_versions where finding_id = ${options.findingId!} and user_id = ${userId}
-        order by version_no desc limit 1
-      `;
+  const safeVersionId = options.findingVersionId
+    ? validateSafeId(options.findingVersionId, "findingVersionId")
+    : undefined;
+  const safeFindingId = options.findingId
+    ? validateSafeId(options.findingId, "findingId")
+    : undefined;
+
+  let vRows: Array<Record<string, unknown>>;
+  try {
+    vRows = safeVersionId
+      ? await sql<Record<string, unknown>>`
+          select * from finding_versions where id = ${safeVersionId} limit 1
+        `
+      : await sql<Record<string, unknown>>`
+          select * from finding_versions where finding_id = ${safeFindingId!}
+          order by version_no desc limit 1
+        `;
+  } catch {
+    throw new Error("Unauthorized: Database query failed while loading finding version; failing closed.");
+  }
 
   if (vRows.length === 0) {
     throw new Error("Historical finding version not found or access denied.");
@@ -1044,26 +1394,37 @@ export async function getHistoricalFindingImagingEvidence(
   const findingId = String(v.finding_id);
   const versionId = String(v.id);
 
-  const fRows = await sql<Record<string, unknown>>`
-    select * from findings where id = ${findingId} and user_id = ${userId} limit 1
-  `;
+  // Reject manipulated mismatched findingId + findingVersionId pairs
+  if (safeFindingId && safeFindingId !== findingId) {
+    throw new Error("Unauthorized: Manipulated or mismatched findingId and findingVersionId.");
+  }
+
+  let fRows: Array<Record<string, unknown>>;
+  try {
+    fRows = await sql<Record<string, unknown>>`
+      select * from findings where id = ${findingId} limit 1
+    `;
+  } catch {
+    throw new Error("Unauthorized: Database query failed while loading parent finding; failing closed.");
+  }
   if (fRows.length === 0) {
     throw new Error("Parent finding not found or access denied.");
   }
   const f = fRows[0];
   const patientId = String(f.patient_id);
 
-  await checkPatientAndClinicianAccess(sql, userId, patientId, false);
+  // Enforce fail-closed patient ownership / clinician consent check BEFORE loading any child artifacts
+  await checkPatientAndClinicianAccess(sql, uid, patientId, false);
 
   const studyId = String(v.study_id);
   const studyRows = await sql<Record<string, unknown>>`
-    select * from studies where id = ${studyId} and user_id = ${userId} limit 1
+    select * from studies where id = ${studyId} and patient_id = ${patientId} limit 1
   `;
   const st = studyRows[0] ?? null;
 
   const evRows = await sql<Record<string, unknown>>`
-    select * from evidence_links where finding_version_id = ${versionId} and user_id = ${userId}
-  `.catch(() => []);
+    select * from evidence_links where finding_version_id = ${versionId}
+  `;
 
   const resolvedSeriesId =
     (v.series_id as string | null) ??
@@ -1073,13 +1434,13 @@ export async function getHistoricalFindingImagingEvidence(
   let sr: Record<string, unknown> | null = null;
   if (resolvedSeriesId) {
     const srRows = await sql<Record<string, unknown>>`
-      select * from series where id = ${resolvedSeriesId} and user_id = ${userId} limit 1
-    `.catch(() => []);
+      select * from series where id = ${resolvedSeriesId} limit 1
+    `;
     sr = srRows[0] ?? null;
   } else if (studyId) {
     const srRows = await sql<Record<string, unknown>>`
-      select * from series where study_id = ${studyId} and user_id = ${userId} order by series_number asc limit 1
-    `.catch(() => []);
+      select * from series where study_id = ${studyId} order by series_number asc limit 1
+    `;
     sr = srRows[0] ?? null;
   }
   const effectiveSeriesId = sr ? String(sr.id) : resolvedSeriesId;
@@ -1088,19 +1449,19 @@ export async function getHistoricalFindingImagingEvidence(
   let segRun: Record<string, unknown> | null = null;
   if (segRunId) {
     const runRows = await sql<Record<string, unknown>>`
-      select * from segmentation_runs where id = ${segRunId} and user_id = ${userId} limit 1
-    `.catch(() => []);
+      select * from segmentation_runs where id = ${segRunId} limit 1
+    `;
     segRun = runRows[0] ?? null;
   } else if (effectiveSeriesId) {
     const runRows = await sql<Record<string, unknown>>`
-      select * from segmentation_runs where series_id = ${effectiveSeriesId} and user_id = ${userId}
+      select * from segmentation_runs where series_id = ${effectiveSeriesId}
       order by created_at desc limit 1
-    `.catch(() => []);
+    `;
     segRun = runRows[0] ?? null;
   }
 
   // Gather all imaging_objects associated with this patient and matching series / study / finding_version / segmentation_run
-  const allPatientObjects = await listImagingArtifacts(sql, userId, patientId);
+  const allPatientObjects = await listImagingArtifacts(sql, uid, patientId);
   const linkedObjIds = new Set<string>();
   for (const e of evRows) {
     if (typeof e.imaging_object_id === "string") linkedObjIds.add(e.imaging_object_id);
@@ -1121,10 +1482,10 @@ export async function getHistoricalFindingImagingEvidence(
   async function hydrateObjects(items: StoredArtifactRecord[]) {
     const out: Array<{ record: StoredArtifactRecord; integrity: ObjectIntegrityReport; data?: Buffer }> = [];
     for (const item of items) {
-      const integrity = await verifyImagingObjectIntegrity(sql, userId, item.id);
+      const integrity = await verifyImagingObjectIntegrity(sql, uid, item.id);
       let data: Buffer | undefined;
       if (options.includeBinaryPayloads && integrity.integrityOk) {
-        const loaded = await getImagingArtifact(sql, userId, item.id);
+        const loaded = await getImagingArtifact(sql, uid, item.id);
         data = loaded.data;
       }
       out.push({ ...item, record: item, integrity, ...(data ? { data } : {}) } as any);
@@ -1141,15 +1502,19 @@ export async function getHistoricalFindingImagingEvidence(
   const reviewRows = await sql<Record<string, unknown>>`
     select id, user_id, status, note, created_at
     from reviews
-    where target_type = 'finding_version' and target_id = ${versionId} and user_id = ${userId}
+    where target_type = 'finding_version' and target_id = ${versionId}
     order by created_at desc
-  `.catch(() => []);
+  `;
 
   const parseTriple = (raw: unknown): [number, number, number] | null => {
     if (!raw) return null;
     try {
       const arr = typeof raw === "string" ? JSON.parse(raw) : raw;
-      if (Array.isArray(arr) && arr.length === 3 && arr.every((x) => typeof x === "number" && Number.isFinite(x))) {
+      if (
+        Array.isArray(arr) &&
+        arr.length === 3 &&
+        arr.every((x) => typeof x === "number" && Number.isFinite(x))
+      ) {
         return [arr[0], arr[1], arr[2]];
       }
     } catch {

@@ -86,8 +86,14 @@ async function enforceVerifiedClinicianIfProfileExists(sql: Sql, userId: string)
   if (!userId || typeof userId !== "string" || !userId.trim()) {
     throw new Error("Unauthorized: Authentication is required.");
   }
-  const profileRows = await sql<{ role: string }>`select role from profiles where user_id = ${userId}`.catch(() => []);
-  if (profileRows.length === 0) return;
+  const profileRows = await sql<{ role: string }>`select role from profiles where user_id = ${userId}`;
+  if (profileRows.length === 0) {
+    const anyProfiles = await sql<{ n: number }>`select 1 as n from profiles limit 1`;
+    if (anyProfiles.length > 0) {
+      throw new Error("Unauthorized: User profile not found; access denied.");
+    }
+    return;
+  }
   const role = profileRows[0].role;
   if (role === "admin") return;
   if (role !== "clinician") {

@@ -265,6 +265,8 @@ def _evaluate_records(
             msk_zyx.astype(np.uint8),
             spacing_zyx_mm=spacing_zyx,
             label_map=label_map,
+            case_id=rec.case_id,
+            subject_id=rec.subject_id,
         )
         case_evals.append(ev)
     return aggregate_split_evaluations(case_evals, split_name=split_name, label_map=label_map)
@@ -471,6 +473,9 @@ def run_training_pipeline(
         "model_version": model_version,
         "dataset_version": "UMD-Synthetic-Phantom-v1" if synthetic else "UMD-Figshare-23541312-v1",
         "dataset_provenance": get_umd_provenance(),
+        "dataset_license_reference": "Creative Commons Attribution 4.0 International (CC BY 4.0 — https://creativecommons.org/licenses/by/4.0/)",
+        "external_validation_performed": False,
+        "external_validation_status": "not_performed_single_cohort_only",
         "data_governance": gov_record,
         "training_mode": training_mode,
         "is_clinical_grade": False,

@@ -16,6 +16,8 @@ import {
   purgeImagingArtifact,
   getHistoricalFindingImagingEvidence,
   validateAndScrubDicomBuffer,
+  checkPatientAndClinicianAccess,
+  redactSensitiveMetadata,
 } from "./storage.server.ts";
 import {
   executeStoreImagingArtifact,
@@ -34,6 +36,7 @@ async function createTestStorageDb() {
 
   const pg = new PGlite();
   await pg.exec(readFileSync(new URL("../../../migrations/0002_anatomybridge.sql", import.meta.url), "utf8"));
+  await pg.exec(readFileSync(new URL("../../../migrations/0005_report_ingestion.sql", import.meta.url), "utf8"));
   await pg.exec(readFileSync(new URL("../../../migrations/0008_clinician_verification.sql", import.meta.url), "utf8"));
   await pg.exec(
     readFileSync(
@@ -54,6 +57,15 @@ async function createTestStorageDb() {
     readFileSync(
       new URL(
         "../../../migrations/0011_sprint3_imaging_storage_and_reprotrace.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  await pg.exec(
+    readFileSync(
+      new URL(
+        "../../../migrations/0012_sprint4_collaboration_and_report_intelligence.sql",
         import.meta.url,
       ),
       "utf8",
@@ -479,6 +491,352 @@ test("Historical finding retrieval links finding_versions to source DICOM slices
     assert.equal(
       Buffer.from(maskObj.dataBase64!, "base64").toString("utf8"),
       maskPayload.toString("utf8"),
+    );
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("Security Task 1: Fail-closed authorization across all 12 required scenarios (missing profile, DB error, consent lifecycle, manipulated IDs, and metadata redaction)", async () => {
+  const ctx = await createTestStorageDb();
+  try {
+    await ctx.pg.exec(`
+      insert into profiles (user_id, display_name, role) values
+        ('admin_user', 'Admin User', 'admin'),
+        ('clin_no_consent', 'Dr No Consent', 'clinician');
+      insert into clinician_verifications (id, user_id, licence_no, registry, status) values
+        ('cv_noconsent', 'clin_no_consent', 'LIC-999', 'NMC', 'approved');
+      insert into studies (id, user_id, patient_id, modality, study_date, description, accession, source_note) values
+        ('study_pat_a', 'patient_a', 'pat_a', 'MR', '2026-01-15', 'Pelvic MRI A', 'ACC-A', 'Seed A'),
+        ('study_pat_b', 'patient_b', 'pat_b', 'MR', '2026-01-16', 'Pelvic MRI B', 'ACC-B', 'Seed B');
+      insert into series (id, user_id, study_id, series_number, description, plane, slice_thickness_mm, pixel_spacing_mm, slice_count, quality) values
+        ('series_pat_a', 'patient_a', 'study_pat_a', 1, 'Sagittal T2 A', 'Sagittal', 3.0, '1.0\\\\1.0', 8, 'adequate'),
+        ('series_pat_b', 'patient_b', 'study_pat_b', 1, 'Sagittal T2 B', 'Sagittal', 3.0, '1.0\\\\1.0', 8, 'adequate');
+      insert into findings (id, user_id, patient_id, code, structure, organ, pathway) values
+        ('find_pat_a', 'patient_a', 'pat_a', 'FA1', 'fibroid', 'uterus', 'fibroids'),
+        ('find_pat_b', 'patient_b', 'pat_b', 'FB1', 'fibroid', 'uterus', 'fibroids');
+      insert into finding_versions (
+        id, user_id, finding_id, version_no, study_id, series_id, observed_on, location_label, figo,
+        centroid_mm, axes_mm, longest_mm, measurement_basis, frame, segmentation_source, quality, modality, change_reason
+      ) values
+        ('fv_pat_a', 'patient_a', 'find_pat_a', 1, 'study_pat_a', 'series_pat_a', '2026-01-15', 'FIGO 3', '3', '[0,0,0]', '[20,20,20]', 20, 'caliper', 'dicom_lps', 'manual', 'adequate', 'MR', 'baseline'),
+        ('fv_pat_b', 'patient_b', 'find_pat_b', 1, 'study_pat_b', 'series_pat_b', '2026-01-16', 'FIGO 4', '4', '[0,0,0]', '[25,25,25]', 25, 'caliper', 'dicom_lps', 'manual', 'adequate', 'MR', 'baseline');
+    `);
+
+    const dicomBytes = buildSyntheticMrDicom();
+    const maskBytes = Buffer.from(JSON.stringify({ dims: [16, 16, 4], mask: [1, 1] }), "utf8");
+    const meshBytes = Buffer.from("solid m\nendsolid m", "utf8");
+
+    // Scenario 9: Missing profile MUST fail closed (never return early or grant access)
+    await assert.rejects(
+      () => checkPatientAndClinicianAccess(ctx.sql, "ghost_missing_profile", "pat_a", false),
+      /User profile not found; access denied/,
+    );
+    await assert.rejects(
+      () =>
+        storeImagingArtifact(ctx.sql, {
+          userId: "ghost_missing_profile",
+          patientId: "pat_a",
+          kind: "dicom",
+          data: dicomBytes,
+        }),
+      /User profile not found; access denied/,
+    );
+    await assert.rejects(
+      () => listImagingArtifacts(ctx.sql, "ghost_missing_profile", "pat_a"),
+      /User profile not found; access denied/,
+    );
+
+    // Scenario 10: Database query failure MUST fail closed (never catch and bypass)
+    const failingSql = (async () => {
+      throw new Error("Simulated database connection failure: postgres://secret:pass@db.internal:5432/prod");
+    }) as unknown as Sql;
+
+    await assert.rejects(
+      async () => {
+        try {
+          await checkPatientAndClinicianAccess(failingSql, "clin_verified", "pat_a", false);
+        } catch (err: any) {
+          assert.ok(
+            !String(err.message).includes("secret:pass"),
+            "Database error must not leak connection credentials",
+          );
+          throw err;
+        }
+      },
+      /Database query failed.*failing closed/,
+    );
+
+    // Scenario 3: Approved clinician with active consent (view_imaging + add_annotations) can upload & retrieve DICOM, mask, and mesh for pat_a
+    await ctx.pg.exec(`
+      insert into patient_clinician_consents (
+        id, patient_id, patient_user_id, clinician_user_id, status, permissions_json, scope_note, expires_at
+      ) values (
+        'consent_a_active', 'pat_a', 'patient_a', 'clin_verified', 'active',
+        '["view_demographics","view_imaging","add_annotations","review_ai_findings"]',
+        'Imaging review consent',
+        '2099-12-31T23:59:59Z'
+      );
+    `);
+
+    const storedDicomA = await storeImagingArtifact(ctx.sql, {
+      userId: "clin_verified",
+      patientId: "pat_a",
+      studyId: "study_pat_a",
+      seriesId: "series_pat_a",
+      findingVersionId: "fv_pat_a",
+      kind: "dicom",
+      data: dicomBytes,
+      metadata: {
+        sequence: "T2_SAG",
+        apiKey: "sk-should-be-stripped",
+        password: "secret-password",
+        storageRoot: "/internal/server/path",
+        patientName: "Anya Secret Name",
+      },
+    });
+    const storedMaskA = await storeImagingArtifact(ctx.sql, {
+      userId: "clin_verified",
+      patientId: "pat_a",
+      studyId: "study_pat_a",
+      seriesId: "series_pat_a",
+      findingVersionId: "fv_pat_a",
+      sourceObjectId: storedDicomA.id,
+      kind: "mask",
+      data: maskBytes,
+    });
+    const storedMeshA = await storeImagingArtifact(ctx.sql, {
+      userId: "clin_verified",
+      patientId: "pat_a",
+      studyId: "study_pat_a",
+      seriesId: "series_pat_a",
+      findingVersionId: "fv_pat_a",
+      sourceObjectId: storedMaskA.id,
+      kind: "mesh",
+      data: meshBytes,
+    });
+
+    // Requirement 12: Verify sensitive metadata keys were stripped before persistence
+    const parsedMeta = JSON.parse(storedDicomA.metadataJson);
+    assert.equal(parsedMeta.sequence, "T2_SAG");
+    assert.equal(parsedMeta.apiKey, undefined);
+    assert.equal(parsedMeta.password, undefined);
+    assert.equal(parsedMeta.storageRoot, undefined);
+    assert.equal(parsedMeta.patientName, undefined);
+
+    // Consented clinician can retrieve all 3 artifact types
+    const clinGetDicom = await getImagingArtifact(ctx.sql, "clin_verified", storedDicomA.id, true);
+    const clinGetMask = await getImagingArtifact(ctx.sql, "clin_verified", storedMaskA.id, true);
+    const clinGetMesh = await getImagingArtifact(ctx.sql, "clin_verified", storedMeshA.id, true);
+    assert.equal(clinGetDicom.integrity.valid, true);
+    assert.equal(clinGetMask.integrity.valid, true);
+    assert.equal(clinGetMesh.integrity.valid, true);
+
+    // Scenario 1: Valid patient accessing their own imaging (DICOM, mask, mesh, list, integrity, historical evidence)
+    const patGetDicom = await getImagingArtifact(ctx.sql, "patient_a", storedDicomA.id, true);
+    const patGetMask = await getImagingArtifact(ctx.sql, "patient_a", storedMaskA.id, true);
+    const patGetMesh = await getImagingArtifact(ctx.sql, "patient_a", storedMeshA.id, true);
+    assert.equal(patGetDicom.record.id, storedDicomA.id);
+    assert.equal(patGetMask.record.id, storedMaskA.id);
+    assert.equal(patGetMesh.record.id, storedMeshA.id);
+    const patList = await listImagingArtifacts(ctx.sql, "patient_a", "pat_a");
+    assert.equal(patList.length, 3);
+    const patEvidence = await getHistoricalFindingImagingEvidence(ctx.sql, "patient_a", "fv_pat_a");
+    assert.equal(patEvidence.patientId, "pat_a");
+
+    // Scenario 2: Patient accessing another patient's imaging MUST be denied across all operations
+    await assert.rejects(
+      () => getImagingArtifact(ctx.sql, "patient_b", storedDicomA.id, true),
+      /Unauthorized/,
+    );
+    await assert.rejects(
+      () => getImagingArtifact(ctx.sql, "patient_b", storedMaskA.id, true),
+      /Unauthorized/,
+    );
+    await assert.rejects(
+      () => verifyImagingObjectIntegrity(ctx.sql, "patient_b", storedDicomA.id),
+      /Unauthorized/,
+    );
+    await assert.rejects(
+      () => listImagingArtifacts(ctx.sql, "patient_b", "pat_a"),
+      /Unauthorized/,
+    );
+    await assert.rejects(
+      () => getHistoricalFindingImagingEvidence(ctx.sql, "patient_b", "fv_pat_a"),
+      /Unauthorized/,
+    );
+
+    // Scenario 4: Approved clinician without consent MUST be denied on upload and retrieval
+    await assert.rejects(
+      () => getImagingArtifact(ctx.sql, "clin_no_consent", storedDicomA.id, true),
+      /Unauthorized.*no active patient consent/i,
+    );
+    await assert.rejects(
+      () =>
+        storeImagingArtifact(ctx.sql, {
+          userId: "clin_no_consent",
+          patientId: "pat_a",
+          kind: "mask",
+          data: maskBytes,
+        }),
+      /Unauthorized.*no active patient consent/i,
+    );
+
+    // Consent Scope Enforcement: Consent granting ONLY view_reports (without view_imaging) must be denied for imaging
+    await ctx.pg.exec(`
+      update patient_clinician_consents
+      set permissions_json = '["view_demographics","view_reports"]'
+      where id = 'consent_a_active'
+    `);
+    await assert.rejects(
+      () => getImagingArtifact(ctx.sql, "clin_verified", storedDicomA.id, true),
+      /does not grant 'view_imaging' permission/,
+    );
+
+    // Consent granting view_imaging ONLY (without add_annotations / review_ai_findings) allows read but denies upload/purge
+    await ctx.pg.exec(`
+      update patient_clinician_consents
+      set permissions_json = '["view_demographics","view_imaging"]'
+      where id = 'consent_a_active'
+    `);
+    const readOnlyOk = await getImagingArtifact(ctx.sql, "clin_verified", storedDicomA.id, false);
+    assert.equal(readOnlyOk.record.id, storedDicomA.id);
+    await assert.rejects(
+      () =>
+        storeImagingArtifact(ctx.sql, {
+          userId: "clin_verified",
+          patientId: "pat_a",
+          kind: "mask",
+          data: maskBytes,
+        }),
+      /does not grant 'add_annotations' or 'review_ai_findings'/,
+    );
+    await assert.rejects(
+      () => purgeImagingArtifact(ctx.sql, "clin_verified", storedMeshA.id, "Unauthorized purge attempt"),
+      /does not grant 'add_annotations' or 'review_ai_findings'/,
+    );
+
+    // Restore full permissions for subsequent tests
+    await ctx.pg.exec(`
+      update patient_clinician_consents
+      set permissions_json = '["view_demographics","view_imaging","add_annotations","review_ai_findings"]'
+      where id = 'consent_a_active'
+    `);
+
+    // Scenario 5: Expired consent MUST immediately block access
+    await ctx.pg.exec(`
+      update patient_clinician_consents
+      set expires_at = '2020-01-01T00:00:00Z'
+      where id = 'consent_a_active'
+    `);
+    await assert.rejects(
+      () => getImagingArtifact(ctx.sql, "clin_verified", storedDicomA.id, true),
+      /Unauthorized.*no active patient consent/i,
+    );
+    await assert.rejects(
+      () =>
+        storeImagingArtifact(ctx.sql, {
+          userId: "clin_verified",
+          patientId: "pat_a",
+          kind: "mask",
+          data: maskBytes,
+        }),
+      /Unauthorized.*no active patient consent/i,
+    );
+
+    // Scenario 6: Revoked consent MUST immediately block access
+    await ctx.pg.exec(`
+      update patient_clinician_consents
+      set expires_at = '2099-12-31T23:59:59Z', status = 'revoked', revoked_at = now()
+      where id = 'consent_a_active'
+    `);
+    await assert.rejects(
+      () => getImagingArtifact(ctx.sql, "clin_verified", storedDicomA.id, true),
+      /Unauthorized.*no active patient consent/i,
+    );
+
+    // Re-activate consent to test Scenario 7, 8, and 11
+    await ctx.pg.exec(`
+      update patient_clinician_consents
+      set status = 'active', revoked_at = null
+      where id = 'consent_a_active'
+    `);
+
+    // Scenario 7 & 8: Unverified clinician and Revoked clinician are immediately blocked even if consent row exists
+    await assert.rejects(
+      () => getImagingArtifact(ctx.sql, "clin_unverified", storedDicomA.id, true),
+      /Clinician verification is not approved/,
+    );
+    await assert.rejects(
+      () => getImagingArtifact(ctx.sql, "clin_revoked", storedDicomA.id, true),
+      /Clinician verification is not approved/,
+    );
+
+    // Scenario 11: Invalid or manipulated cross-patient IDs MUST be rejected
+    await assert.rejects(
+      () => getImagingArtifact(ctx.sql, "clin_verified", "../etc/passwd", true),
+      /Invalid or manipulated objectId/,
+    );
+    await assert.rejects(
+      () =>
+        storeImagingArtifact(ctx.sql, {
+          userId: "clin_verified",
+          patientId: "pat_a",
+          studyId: "study_pat_b",
+          kind: "mask",
+          data: maskBytes,
+        }),
+      /Invalid or cross-patient studyId/,
+    );
+    await assert.rejects(
+      () =>
+        storeImagingArtifact(ctx.sql, {
+          userId: "clin_verified",
+          patientId: "pat_a",
+          seriesId: "series_pat_b",
+          kind: "mask",
+          data: maskBytes,
+        }),
+      /Invalid or cross-patient seriesId/,
+    );
+    await assert.rejects(
+      () =>
+        storeImagingArtifact(ctx.sql, {
+          userId: "clin_verified",
+          patientId: "pat_a",
+          findingVersionId: "fv_pat_b",
+          kind: "mask",
+          data: maskBytes,
+        }),
+      /Invalid or cross-patient findingVersionId/,
+    );
+    await assert.rejects(
+      () =>
+        getHistoricalFindingImagingEvidence(ctx.sql, "clin_verified", {
+          findingId: "find_pat_a",
+          findingVersionId: "fv_pat_b",
+        }),
+      /Manipulated or mismatched findingId and findingVersionId/,
+    );
+
+    // Scenario 12: Unauthorized upload/purge by patient and unauthorized cross-user access by admin
+    await assert.rejects(
+      () =>
+        storeImagingArtifact(ctx.sql, {
+          userId: "patient_a",
+          patientId: "pat_a",
+          kind: "mask",
+          data: maskBytes,
+        }),
+      /requires verified clinician credentials/,
+    );
+    await assert.rejects(
+      () => purgeImagingArtifact(ctx.sql, "patient_a", storedMaskA.id, "Patient trying to purge"),
+      /requires verified clinician credentials/,
+    );
+    await assert.rejects(
+      () => getImagingArtifact(ctx.sql, "admin_user", storedDicomA.id, true),
+      /Unauthorized/,
     );
   } finally {
     ctx.cleanup();

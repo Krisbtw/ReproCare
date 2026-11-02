@@ -96,6 +96,7 @@ def save_checkpoint_bundle(
     path: str | Path,
     state_dict: dict[str, Any],
     metadata: dict[str, Any],
+    allow_overwrite: bool = False,
 ) -> dict[str, Any]:
     """Save a SimpleUnet3D checkpoint in a safe, pickle-free portable format with SHA-256 provenance.
 
@@ -105,6 +106,11 @@ def save_checkpoint_bundle(
       2. A human-readable sidecar `<path>.metadata.json` containing full model provenance and SHA-256.
     """
     ckpt_path = Path(path)
+    if ckpt_path.exists() and not allow_overwrite:
+        raise FileExistsError(
+            f"Refusing to silently replace existing checkpoint '{ckpt_path.name}'. "
+            "Write to a new versioned checkpoint path or pass allow_overwrite=True after validation."
+        )
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
     arrays_to_save: dict[str, np.ndarray] = {}
@@ -128,7 +134,89 @@ def save_checkpoint_bundle(
 
     sidecar_path = Path(f"{ckpt_path}.metadata.json")
     sidecar_path.write_text(json.dumps(meta_copy, indent=2, sort_keys=True), encoding="utf-8")
+
+    # Record versioned model artefact in checkpoint_registry.json for lifecycle governance & rollback
+    registry_path = ckpt_path.parent / "checkpoint_registry.json"
+    registry: dict[str, Any] = {"active_checkpoint": None, "history": []}
+    if registry_path.exists():
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        except Exception:
+            registry = {"active_checkpoint": None, "history": []}
+    prev_active = registry.get("active_checkpoint")
+    entry = {
+        "model_version": meta_copy.get("model_version", "1.0.0-experimental"),
+        "checkpoint_filename": ckpt_path.name,
+        "checkpoint_path": str(ckpt_path),
+        "checkpoint_sha256": sha256_hex,
+        "dataset_version": meta_copy.get("dataset_version", "UMD-v1"),
+        "dataset_license": meta_copy.get("dataset_license_reference", "CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)"),
+        "training_mode": meta_copy.get("training_mode", "unknown"),
+        "is_clinical_grade": bool(meta_copy.get("is_clinical_grade", False)),
+        "external_validation_performed": bool(meta_copy.get("external_validation_performed", False)),
+        "trained_at": meta_copy.get("trained_at"),
+        "previous_active_checkpoint": prev_active,
+    }
+    registry.setdefault("history", []).append(entry)
+    registry["active_checkpoint"] = entry
+    registry_path.write_text(json.dumps(registry, indent=2, sort_keys=True), encoding="utf-8")
+
     return meta_copy
+
+
+def rollback_checkpoint(registry_dir: str | Path, target_version_or_sha: str | None = None) -> dict[str, Any]:
+    """Roll back the active checkpoint in `checkpoint_registry.json` to the previous validated checkpoint
+    or a specific `model_version` / `checkpoint_sha256`, verifying on-disk SHA-256 integrity before activating.
+    """
+    reg_dir = Path(registry_dir)
+    registry_path = reg_dir / "checkpoint_registry.json"
+    if not registry_path.exists():
+        raise FileNotFoundError(f"No checkpoint_registry.json found in {reg_dir}")
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    history: list[dict[str, Any]] = registry.get("history", [])
+    if len(history) < 2 and target_version_or_sha is None:
+        raise ValueError("Cannot roll back: fewer than 2 checkpoints recorded in registry history.")
+
+    target: dict[str, Any] | None = None
+    if target_version_or_sha is not None:
+        for item in reversed(history):
+            if (
+                item.get("model_version") == target_version_or_sha
+                or item.get("checkpoint_sha256") == target_version_or_sha
+                or item.get("checkpoint_filename") == target_version_or_sha
+            ):
+                target = item
+                break
+        if target is None:
+            raise ValueError(f"Target checkpoint '{target_version_or_sha}' not found in registry history.")
+    else:
+        target = history[-2]
+
+    target_path = Path(target["checkpoint_path"])
+    if not target_path.exists():
+        target_path = reg_dir / target["checkpoint_filename"]
+    state_dict, meta, actual_sha = load_checkpoint_bundle(target_path)
+    if actual_sha != target["checkpoint_sha256"]:
+        raise ValueError("Rollback aborted: target checkpoint SHA-256 does not match registry record.")
+    ok, errs = validate_state_dict_compatibility(
+        state_dict,
+        in_channels=int(meta.get("in_channels", 1)),
+        out_channels=int(meta.get("out_channels", 5)),
+        base_channels=int(meta.get("base_channels", 16)),
+    )
+    if not ok:
+        raise ValueError(f"Rollback aborted: target checkpoint failed architecture validation ({'; '.join(errs)})")
+
+    registry["active_checkpoint"] = target
+    registry.setdefault("rollback_events", []).append(
+        {
+            "rolled_back_to_version": target.get("model_version"),
+            "rolled_back_to_sha256": actual_sha,
+            "checkpoint_filename": target.get("checkpoint_filename"),
+        }
+    )
+    registry_path.write_text(json.dumps(registry, indent=2, sort_keys=True), encoding="utf-8")
+    return target
 
 
 def load_checkpoint_bundle(path: str | Path) -> tuple[dict[str, np.ndarray], dict[str, Any], str]:

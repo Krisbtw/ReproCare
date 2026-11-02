@@ -97,12 +97,12 @@ async function resolvePatientAccessForReportAction(
 
   const profileRows = await sql<{ role: string }>`
     select role from profiles where user_id = ${uid}
-  `.catch(() => []);
+  `;
 
-  // In minimal unit tests without a profiles table, require direct ownership
   if (profileRows.length === 0) {
-    if (patient.user_id !== uid) {
-      throw new Error("Record not found.");
+    const anyProfiles = await sql<{ n: number }>`select 1 as n from profiles limit 1`;
+    if (anyProfiles.length > 0 || patient.user_id !== uid) {
+      throw new Error("Record not found: Unauthorized (user profile not found; access denied).");
     }
     return { patientOwnerUserId: patient.user_id };
   }

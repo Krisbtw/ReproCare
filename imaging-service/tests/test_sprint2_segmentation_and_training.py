@@ -411,3 +411,66 @@ def test_privacy_guards_block_identifiable_patient_data_and_dicom_phi(tmp_path: 
     prov = dataset_governance.get_umd_provenance()
     assert prov["declared_license"].startswith("Creative Commons Attribution 4.0")
     assert "UNVERIFIED" in prov["unverified_or_restricted_uses"]["regulated_clinical_diagnostic_deployment"]
+
+
+def test_model_lifecycle_non_overwrite_per_patient_failure_analysis_and_rollback(tmp_path: Path):
+    """Verify per-patient metrics, explicit failed_cases reporting, non-overwrite guard, and checkpoint rollback."""
+    ckpt_v1 = tmp_path / "models" / "umd_v1.pt"
+    meta_v1 = run_training_pipeline(
+        data_dir=tmp_path / "synth_lifecycle",
+        output_checkpoint=ckpt_v1,
+        epochs=2,
+        lr=0.015,
+        base_channels=8,
+        seed=42,
+        synthetic=True,
+        synthetic_subjects=7,
+        model_version="1.0.0-exp",
+    )
+
+    test_split = meta_v1["evaluation_splits"]["test"]
+    assert "per_patient" in test_split and len(test_split["per_patient"]) >= 1
+    assert "per_case" in test_split and len(test_split["per_case"]) >= 1
+    assert "failed_cases" in test_split and isinstance(test_split["failed_cases"], list)
+    assert meta_v1["external_validation_performed"] is False
+    assert "CC BY 4.0" in meta_v1["dataset_license_reference"]
+
+    # Attempting to silently overwrite ckpt_v1 without allow_overwrite=True MUST raise FileExistsError
+    with pytest.raises(FileExistsError, match="Refusing to silently replace existing checkpoint"):
+        run_training_pipeline(
+            data_dir=tmp_path / "synth_lifecycle",
+            output_checkpoint=ckpt_v1,
+            epochs=1,
+            lr=0.01,
+            base_channels=8,
+            seed=42,
+            synthetic=False,
+            model_version="1.0.1-exp",
+        )
+
+    # Save version 2 to a distinct path and verify checkpoint_registry.json + rollback_checkpoint
+    ckpt_v2 = tmp_path / "models" / "umd_v2.pt"
+    meta_v2 = run_training_pipeline(
+        data_dir=tmp_path / "synth_lifecycle",
+        output_checkpoint=ckpt_v2,
+        epochs=1,
+        lr=0.01,
+        base_channels=8,
+        seed=42,
+        synthetic=False,
+        resume_from=ckpt_v1,
+        model_version="1.1.0-exp",
+    )
+
+    reg_path = tmp_path / "models" / "checkpoint_registry.json"
+    assert reg_path.exists()
+    reg_data = json.loads(reg_path.read_text(encoding="utf-8"))
+    assert reg_data["active_checkpoint"]["model_version"] == "1.1.0-exp"
+    assert len(reg_data["history"]) == 2
+
+    rolled = models.rollback_checkpoint(tmp_path / "models")
+    assert rolled["model_version"] == "1.0.0-exp"
+    assert rolled["checkpoint_sha256"] == meta_v1["checkpoint_sha256"]
+    reg_after = json.loads(reg_path.read_text(encoding="utf-8"))
+    assert reg_after["active_checkpoint"]["model_version"] == "1.0.0-exp"
+    assert len(reg_after["rollback_events"]) == 1
