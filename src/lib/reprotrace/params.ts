@@ -19,18 +19,27 @@ export interface ReproTraceParameterMeta {
 
 export type CorrespondenceOutcome =
   | "confirmed_match"
+  | "probable_match"
   | "probable_match_review_required"
+  | "possible_match_requiring_review"
+  | "new_finding_candidate"
   | "possible_new_finding"
   | "possible_resolved_finding"
   | "uncertain_correspondence";
 
 export type ChangeAttributionCategory =
   | "genuine_anatomical_change"
+  | "biological_anatomical_change"
   | "protocol_or_spacing_difference"
+  | "acquisition_difference"
+  | "scanner_difference"
   | "segmentation_method_difference"
+  | "segmentation_difference"
   | "registration_error_or_uncertainty"
+  | "registration_error"
   | "image_quality_limitation"
   | "within_measurement_uncertainty"
+  | "measurement_uncertainty"
   | "insufficient_evidence";
 
 export type LongitudinalChangeCategory =

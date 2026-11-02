@@ -1,3 +1,111 @@
+import { spawnSync } from "node:child_process";
+
+/**
+ * Checks whether an image payload starts with a standard PNG, JPEG, TIFF, BMP, or Netpbm (P4/P5/P6) header
+ * and runs local `/usr/bin/tesseract` OCR when available.
+ * Never claims handwriting recognition (`handwritingSupported: false`).
+ */
+export interface OcrRuntimeCapabilities {
+  tesseractInstalled: boolean;
+  tesseractVersion: string | null;
+  englishTrainedDataAvailable: boolean;
+  handwritingSupported: false;
+  ocrAccuracyClaimed: false;
+  warning: string | null;
+}
+
+/**
+ * Inspect whether `/usr/bin/tesseract` (and the `eng` traineddata language pack)
+ * is installed in the current container/host runtime.
+ */
+export function checkOcrRuntimeCapabilities(): OcrRuntimeCapabilities {
+  try {
+    const verRes = spawnSync("tesseract", ["--version"], { timeout: 3000 });
+    if (verRes.status !== 0) {
+      return {
+        tesseractInstalled: false,
+        tesseractVersion: null,
+        englishTrainedDataAvailable: false,
+        handwritingSupported: false,
+        ocrAccuracyClaimed: false,
+        warning:
+          "tesseract-ocr binary is not installed in the runtime environment; scanned PDF/image OCR will fall back to embedded PDF text and bitmap glyph layers only.",
+      };
+    }
+    const verOut = (verRes.stdout?.toString("utf8") || verRes.stderr?.toString("utf8") || "").trim();
+    const firstLine = verOut.split(/\r?\n/)[0]?.trim() || "tesseract";
+    const langRes = spawnSync("tesseract", ["--list-langs"], { timeout: 3000 });
+    const langOut = (langRes.stdout?.toString("utf8") || langRes.stderr?.toString("utf8") || "").toLowerCase();
+    const hasEng = langOut.includes("eng");
+    return {
+      tesseractInstalled: true,
+      tesseractVersion: firstLine,
+      englishTrainedDataAvailable: hasEng,
+      handwritingSupported: false,
+      ocrAccuracyClaimed: false,
+      warning: hasEng
+        ? null
+        : "tesseract-ocr is installed but English language pack (tesseract-ocr-eng) was not detected.",
+    };
+  } catch {
+    return {
+      tesseractInstalled: false,
+      tesseractVersion: null,
+      englishTrainedDataAvailable: false,
+      handwritingSupported: false,
+      ocrAccuracyClaimed: false,
+      warning:
+        "tesseract-ocr binary is not available in the current runtime environment; install tesseract-ocr and tesseract-ocr-eng for scanned image OCR.",
+    };
+  }
+}
+
+export function recognizeImageWithTesseract(imgBytes: Uint8Array): {
+  recognized: boolean;
+  text: string;
+  confidence: number;
+  engine: "tesseract_cli" | "unavailable";
+  handwritingSupported: false;
+} {
+  if (!imgBytes || imgBytes.byteLength < 16) {
+    return { recognized: false, text: "", confidence: 0, engine: "unavailable", handwritingSupported: false };
+  }
+  const isPng = imgBytes[0] === 0x89 && imgBytes[1] === 0x50 && imgBytes[2] === 0x4e && imgBytes[3] === 0x47;
+  const isJpeg = imgBytes[0] === 0xff && imgBytes[1] === 0xd8;
+  const isTiff =
+    (imgBytes[0] === 0x49 && imgBytes[1] === 0x49 && imgBytes[2] === 0x2a && imgBytes[3] === 0x00) ||
+    (imgBytes[0] === 0x4d && imgBytes[1] === 0x4d && imgBytes[2] === 0x00 && imgBytes[3] === 0x2a);
+  const isBmp = imgBytes[0] === 0x42 && imgBytes[1] === 0x4d;
+  const isPnm = imgBytes[0] === 0x50 && (imgBytes[1] === 0x34 || imgBytes[1] === 0x35 || imgBytes[1] === 0x36);
+
+  if (!isPng && !isJpeg && !isTiff && !isBmp && !isPnm) {
+    return { recognized: false, text: "", confidence: 0, engine: "unavailable", handwritingSupported: false };
+  }
+
+  try {
+    const res = spawnSync("tesseract", ["stdin", "stdout", "--psm", "6", "-l", "eng"], {
+      input: Buffer.from(imgBytes.buffer, imgBytes.byteOffset, imgBytes.byteLength),
+      timeout: 8000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    if (res.status === 0 && res.stdout) {
+      const text = res.stdout.toString("utf8").replace(/\f/g, "").trim();
+      if (text.length >= 3) {
+        return {
+          recognized: true,
+          text,
+          confidence: 0.88,
+          engine: "tesseract_cli",
+          handwritingSupported: false,
+        };
+      }
+    }
+  } catch {
+    // Fall through if tesseract binary is not installed in the runtime environment
+  }
+  return { recognized: false, text: "", confidence: 0, engine: "unavailable", handwritingSupported: false };
+}
+
 /**
  * Page-aware OCR and scanned-PDF text recovery (Sprint 4 Task 2B).
  *
@@ -254,6 +362,13 @@ export const defaultOcrPageRecognizer: OcrPageRecognizer = async ({
     if (rasterRes.recognized && rasterRes.text) {
       recognizedParts.push(rasterRes.text);
       totalConfidence += rasterRes.confidence;
+      count += 1;
+      continue;
+    }
+    const tessRes = recognizeImageWithTesseract(imgBytes);
+    if (tessRes.recognized && tessRes.text) {
+      recognizedParts.push(tessRes.text);
+      totalConfidence += tessRes.confidence;
       count += 1;
     }
   }

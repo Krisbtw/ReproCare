@@ -47,6 +47,8 @@ def make_series(
     if n_norm > 0:
         normal_vec = normal_vec / n_norm
 
+    pydicom_major = int(str(getattr(pydicom, "__version__", "2.4.4")).split(".")[0])
+
     for i in range(n):
         if i in drop:
             continue
@@ -57,6 +59,9 @@ def make_series(
             meta.MediaStorageSOPInstanceUID = generate_uid()
             meta.TransferSyntaxUID = ExplicitVRLittleEndian
             ds = FileDataset(None, {}, file_meta=meta, preamble=b"\0" * 128)
+            if pydicom_major < 3:
+                ds.is_little_endian = True
+                ds.is_implicit_VR = False
             ds.SOPClassUID, ds.SOPInstanceUID = MRImageStorage, meta.MediaStorageSOPInstanceUID
             ds.PatientName, ds.PatientID, ds.PatientBirthDate = "Doe^Jane", "SECRET-ID-7", "19900101"
             ds.Modality, ds.SeriesDescription = "MR", "SYNTHETIC T2 sag"

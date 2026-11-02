@@ -899,3 +899,163 @@ test("Sprint 6 Task 2E & 2F: exportDeidentifiedDicomArtifact enforces authorizat
     ctx.cleanup();
   }
 });
+
+import {
+  writeAuditEvent,
+  flushPendingAuditOutbox,
+  readDurableAuditOutbox,
+  createImagingStorageBackup,
+  restoreImagingStorageBackup,
+  reconcileImagingStorageConsistency,
+  validateStorageBackendConfig,
+} from "./storage.server.ts";
+
+test("Workstream 1 & 4: Atomic purge rollback on DB failure, durable audit outbox replay, backup creation, actual backup restoration, and storage consistency monitor", async () => {
+  const ctx = await createTestStorageDb();
+  try {
+    // 1. Validate server-side storage backend configuration rejects public URLs or browser-exposed secrets
+    const validLocalCfg = validateStorageBackendConfig({
+      REPROCARE_STORAGE_BACKEND: "local_durable",
+      REPROCARE_IMAGING_STORAGE_DIR: process.env.REPROCARE_IMAGING_STORAGE_DIR,
+    });
+    assert.equal(validLocalCfg.backend, "local_durable");
+    assert.equal(validLocalCfg.credentialsServerSideOnly, true);
+    assert.equal(validLocalCfg.publicUrlsDisabled, true);
+
+    assert.throws(
+      () =>
+        validateStorageBackendConfig({
+          REPROCARE_ALLOW_PUBLIC_IMAGING_URLS: "true",
+        }),
+      /Security violation: storage credentials and medical-image URLs must remain strictly server-side/,
+    );
+
+    // 2. Store a valid DICOM artifact
+    const dicomBytes = buildSyntheticMrDicom({
+      rows: 16,
+      cols: 16,
+      imagePosition: "5\\10\\15",
+      imageOrientation: "1\\0\\0\\0\\1\\0",
+      pixelSpacing: "1.2\\1.2",
+      sliceThickness: "3.0",
+    });
+    const stored = await storeImagingArtifact(ctx.sql, {
+      userId: "clin_verified",
+      patientId: "pat_clin_1",
+      studyId: "study_1",
+      seriesId: "series_1",
+      kind: "dicom",
+      data: dicomBytes,
+    });
+
+    // 3. Test Atomic Two-Phase Purge Rollback: if the DB UPDATE to 'purged' fails,
+    // the binary file on disk MUST be restored and NEVER left deleted with status='active'!
+    const failingUpdateSql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      const q = strings.join(" ").toLowerCase();
+      if (q.includes("update imaging_objects") && q.includes("purged")) {
+        throw new Error("Simulated database crash during purge status update");
+      }
+      return ctx.sql(strings, ...values);
+    }) as unknown as Sql;
+
+    await assert.rejects(
+      () =>
+        purgeImagingArtifact(
+          failingUpdateSql,
+          "clin_verified",
+          stored.id,
+          "Attempted purge during DB failure",
+        ),
+      /Atomic purge aborted/,
+    );
+
+    // Verify that after the aborted purge, the binary file on disk was rolled back intact and passes SHA-256 verification!
+    const integrityAfterFailedPurge = await verifyImagingObjectIntegrity(
+      ctx.sql,
+      "clin_verified",
+      stored.id,
+    );
+    assert.equal(integrityAfterFailedPurge.valid, true);
+    assert.equal(integrityAfterFailedPurge.exists, true);
+    assert.equal(integrityAfterFailedPurge.actualSha256, stored.sha256);
+
+    // 4. Test Durable Audit Outbox & Replay when audit_events DB insert fails transiently
+    const failingAuditSql = (async () => {
+      throw new Error("Simulated audit_events table lock/unavailable");
+    }) as unknown as Sql;
+
+    const queuedEntry = await writeAuditEvent(
+      failingAuditSql,
+      "clin_verified",
+      "critical_consent_check",
+      "patient_consent",
+      "consent_99",
+      "Verified consent during transient DB audit outage",
+    );
+    assert.equal(queuedEntry.dbPersisted, false);
+    const outboxBefore = await readDurableAuditOutbox();
+    assert.ok(outboxBefore.some((e) => e.id === queuedEntry.id));
+
+    // Replay pending outbox into the working DB
+    const flushed = await flushPendingAuditOutbox(ctx.sql);
+    assert.ok(flushed.replayedCount >= 1);
+    assert.equal(flushed.remainingCount, 0);
+
+    const dbAuditRows = await ctx.sql<{ id: string; action: string }>`
+      select id, action from audit_events where id = ${queuedEntry.id}
+    `;
+    assert.equal(dbAuditRows.length, 1);
+    assert.equal(dbAuditRows[0].action, "critical_consent_check");
+
+    // 5. Test Backup Creation & Actual Backup Restoration
+    const backup = await createImagingStorageBackup(ctx.sql, "clin_verified", {
+      patientId: "pat_clin_1",
+    });
+    assert.equal(backup.manifest.objectCount, 1);
+    assert.equal(backup.manifest.objects[0].id, stored.id);
+    assert.equal(backup.manifest.objects[0].sha256, stored.sha256);
+
+    // Simulate catastrophic loss of the active binary file on disk
+    const baseDir = process.env.REPROCARE_IMAGING_STORAGE_DIR!;
+    const activeFilePath = stored.storagePath;
+    unlinkSync(activeFilePath);
+
+    const consistencyMissing = await reconcileImagingStorageConsistency(ctx.sql, "clin_verified", {
+      patientId: "pat_clin_1",
+      repairStatuses: true,
+    });
+    assert.equal(consistencyMissing.consistent, false);
+    assert.ok(consistencyMissing.missingBlobObjectIds.includes(stored.id));
+
+    // Perform ACTUAL restoration from the verified backup bundle
+    const restored = await restoreImagingStorageBackup(
+      ctx.sql,
+      "clin_verified",
+      backup.backupDir,
+    );
+    assert.equal(restored.restoredCount, 1);
+    assert.equal(restored.verifiedCount, 1);
+    assert.ok(restored.restoredObjectIds.includes(stored.id));
+
+    // Verify the restored binary file is retrievable and passes SHA-256 integrity
+    const retrievedAfterRestore = await getImagingArtifact(
+      ctx.sql,
+      "clin_verified",
+      stored.id,
+      true,
+    );
+    assert.equal(retrievedAfterRestore.integrity.valid, true);
+    assert.equal(retrievedAfterRestore.record.sha256, stored.sha256);
+    assert.ok(retrievedAfterRestore.data && retrievedAfterRestore.data.byteLength === stored.bytes);
+
+    const consistencyHealthy = await reconcileImagingStorageConsistency(ctx.sql, "clin_verified", {
+      patientId: "pat_clin_1",
+    });
+    assert.equal(consistencyHealthy.consistent, true);
+    assert.equal(consistencyHealthy.healthyActiveCount, 1);
+
+    rmSync(backup.backupDir, { recursive: true, force: true });
+  } finally {
+    ctx.cleanup();
+  }
+});

@@ -8,7 +8,7 @@ import {
   type Measure,
   type Proposal,
   type Snap,
-} from "../reprotrace/engine";
+} from "../reprotrace/engine.ts";
 
 export type VersionSeed = {
   key: string;

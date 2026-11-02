@@ -1,42 +1,152 @@
-name: Test and Deploy ReproCare
+name: ReproCare CI & Production Readiness Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: 'Target deployment environment when manually triggered'
+        required: false
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+permissions:
+  contents: read
 
 jobs:
-  test-frontend:
-    runs-on: ubuntu-latest
+  frontend-and-backend-tests:
+    name: TypeScript, Auth Invariants, Unit Tests & Production Build
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Node.js
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install OCR & PDF system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng poppler-utils
+
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-      - name: Install dependencies
-        run: npm ci
-      - name: Run Typecheck
-        run: npm run typecheck
-      - name: Run Application Tests
-        run: npm run test:app
+          node-version: '22'
+          cache: 'npm'
 
-  test-python:
-    runs-on: ubuntu-latest
+      - name: Install Node.js dependencies deterministically
+        run: npm ci
+
+      - name: Verify authentication invariant script
+        run: npm run check:auth || [ $? -eq 2 ]
+
+      - name: Run TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Run application and scaffold test suites
+        run: npm test
+
+      - name: Build production web bundle (decoupled from DB migrations)
+        env:
+          NODE_ENV: production
+          VITE_AUTH_ENABLED: 'true'
+        run: npm run build
+
+      - name: Verify compiled production server output exists
+        run: test -f .output/server/index.mjs
+
+  imaging-service-tests:
+    name: Python Medical Imaging & AI Segmentation Tests
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: Install Python Dependencies
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: imaging-service/requirements.txt
+
+      - name: Install Python imaging-service dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r imaging-service/requirements.txt
-          pip install pytest
-      - name: Run Pytest
+
+      - name: Run pytest suite
+        env:
+          ANATOMYBRIDGE_DEV_NO_AUTH: '1'
         run: |
           cd imaging-service
           python -m pytest tests/ -v --tb=short
 
+  docker-production-build-check:
+    name: Docker Production Image & Compose Validation
+    runs-on: ubuntu-24.04
+    needs: [frontend-and-backend-tests, imaging-service-tests]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml and docker-compose.prod.yml syntax
+        env:
+          DB_PASSWORD: ci-validation-password
+          ANATOMYBRIDGE_SERVICE_API_KEY: ci-validation-service-key
+          GRAFANA_PASSWORD: ci-validation-grafana-password
+        run: |
+          docker compose -f docker-compose.yml config -q
+          docker compose -f docker-compose.prod.yml config -q
+
+      - name: Build production Web Docker image
+        run: docker build -t reprocare-web:ci -f Dockerfile .
+
+      - name: Verify Tesseract OCR and non-root user inside Web Docker image
+        run: |
+          docker run --rm reprocare-web:ci id -u | grep -qx "1000"
+          docker run --rm reprocare-web:ci tesseract --version
+          docker run --rm reprocare-web:ci test -f /app/.output/server/index.mjs
+
+      - name: Build production Imaging Service Docker image
+        run: docker build -t reprocare-imaging:ci -f imaging-service/Dockerfile ./imaging-service
+
+      - name: Verify non-root user inside Imaging Service Docker image
+        run: |
+          docker run --rm reprocare-imaging:ci id -u | grep -qx "1000"
+
+  deploy-release:
+    name: Gated Production / Staging Release Deployment
+    runs-on: ubuntu-24.04
+    needs: [frontend-and-backend-tests, imaging-service-tests, docker-production-build-check]
+    if: github.event_name == 'workflow_dispatch'
+    environment: ${{ inputs.deploy_environment || 'staging' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Execute gated deployment or release dry-run
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          if [ -n "${DEPLOY_HOST:-}" ] && [ -n "${DEPLOY_USER:-}" ] && [ -n "${DEPLOY_SSH_KEY:-}" ]; then
+            echo "Deploying verified commit ${GITHUB_SHA} to ${DEPLOY_HOST}..."
+            mkdir -p ~/.ssh
+            printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+            chmod 600 ~/.ssh/id_ed25519
+            ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+            ssh -i ~/.ssh/id_ed25519 "${DEPLOY_USER}@${DEPLOY_HOST}" \
+              "cd '${DEPLOY_PATH:-/opt/reprocare}' && git fetch origin main && git checkout '${GITHUB_SHA}' && ./scripts/deploy.sh"
+          else
+            echo "No remote SSH deployment secrets configured; validating production deployment scripts in release dry-run mode."
+            bash -n scripts/deploy.sh
+            bash -n scripts/verify_deployment.sh
+            bash -n scripts/backup.sh
+            bash -n scripts/restore.sh
+          fi

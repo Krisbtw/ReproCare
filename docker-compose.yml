@@ -1,4 +1,17 @@
 services:
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["npm", "run", "db:migrate"]
+    environment:
+      - NODE_ENV=development
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-reprocare}:${POSTGRES_PASSWORD:-password}@db:5432/${POSTGRES_DB:-reprocare_db}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
   web:
     build:
       context: .
@@ -6,14 +19,26 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - NODE_ENV=development
+      - NODE_ENV=production
+      - HOST=0.0.0.0
+      - PORT=8080
       - DATABASE_URL=postgresql://${POSTGRES_USER:-reprocare}:${POSTGRES_PASSWORD:-password}@db:5432/${POSTGRES_DB:-reprocare_db}
       - ANATOMYBRIDGE_SERVICE_URL=http://imaging:8100
       - ANATOMYBRIDGE_SERVICE_API_KEY=${ANATOMYBRIDGE_SERVICE_API_KEY:-dev-service-key-change-in-prod}
+      - REPROCARE_IMAGING_STORAGE_DIR=/var/lib/reprocare/imaging
+      - REPROCARE_IMAGING_BACKUP_DIR=/var/lib/reprocare/backups
+      - REPROCARE_STORAGE_BACKEND=${REPROCARE_STORAGE_BACKEND:-local_durable}
       - BOOTSTRAP_ADMIN_EMAILS=${BOOTSTRAP_ADMIN_EMAILS:-}
+    volumes:
+      - imaging_storage_data:/var/lib/reprocare/imaging
+      - imaging_backup_data:/var/lib/reprocare/backups
     depends_on:
-      - db
-      - imaging
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      imaging:
+        condition: service_started
 
   imaging:
     build:
@@ -23,7 +48,11 @@ services:
       - "127.0.0.1:8100:8100"
     environment:
       - ANATOMYBRIDGE_SERVICE_API_KEY=${ANATOMYBRIDGE_SERVICE_API_KEY:-dev-service-key-change-in-prod}
-      - ANATOMYBRIDGE_CORS_ORIGINS=http://localhost:8080,http://127.0.0.1:8080
+      - ANATOMYBRIDGE_CORS_ORIGINS=${ANATOMYBRIDGE_CORS_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+      - ANATOMYBRIDGE_UMD_WEIGHTS=${ANATOMYBRIDGE_UMD_WEIGHTS:-/var/lib/reprocare/models/umd_unet3d.pt}
+    volumes:
+      - imaging_storage_data:/var/lib/reprocare/imaging:ro
+      - model_checkpoints_data:/var/lib/reprocare/models
 
   db:
     image: postgres:15-alpine
@@ -35,6 +64,14 @@ services:
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-reprocare} -d ${POSTGRES_DB:-reprocare_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
   postgres_data:
+  imaging_storage_data:
+  imaging_backup_data:
+  model_checkpoints_data:

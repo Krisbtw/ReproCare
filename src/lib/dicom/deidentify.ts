@@ -915,3 +915,160 @@ export function deidentifyDicomBytes(
 }
 
 export const deidentifyDicomPart10 = deidentifyDicomBytes;
+
+import { gunzipSync, gzipSync } from "node:zlib";
+
+export interface NiftiDeidentificationResult {
+  derivedBytes: Uint8Array;
+  wasGzipped: boolean;
+  originalSha256: string;
+  derivedSha256: string;
+  originalPreserved: boolean;
+  fieldsScrubbed: string[];
+  extensionBytesRemoved: number;
+  geometryPreserved: {
+    dims: number[];
+    pixdimMm: [number, number, number];
+    qformCode: number;
+    sformCode: number;
+    qoffsetMm: [number, number, number];
+    srowX: [number, number, number, number];
+    srowY: [number, number, number, number];
+    srowZ: [number, number, number, number];
+  };
+  claimCompleteAnonymisation: false;
+  manualReviewRequired: boolean;
+  auditNotice: string;
+}
+
+/**
+ * Scrubs identifying metadata (`descrip`, `aux_file`, `intent_name`) and removes embedded
+ * NIfTI-1 header extension blocks (`extension[0] != 0`) from `.nii` and `.nii.gz` buffers
+ * while preserving 3D/4D voxel data and `qform`/`sform` patient-space affine geometry.
+ */
+export function deidentifyNiftiBytes(
+  originalInput: Uint8Array | Buffer,
+  options?: { replacementDescrip?: string },
+): NiftiDeidentificationResult {
+  if (!originalInput || originalInput.byteLength < 18) {
+    throw new Error("Invalid NIfTI input: buffer is smaller than 348-byte NIfTI-1 header.");
+  }
+
+  const originalCopy = new Uint8Array(originalInput.byteLength);
+  originalCopy.set(originalInput);
+  const originalSha256 = createHash("sha256").update(originalCopy).digest("hex");
+
+  const isGzip = originalInput[0] === 0x1f && originalInput[1] === 0x8b;
+  const rawNii = isGzip ? new Uint8Array(gunzipSync(originalCopy)) : new Uint8Array(originalCopy);
+
+  if (rawNii.byteLength < 352) {
+    throw new Error("Invalid NIfTI-1 stream: decompressed buffer is smaller than 352 bytes.");
+  }
+
+  const dv = new DataView(rawNii.buffer, rawNii.byteOffset, rawNii.byteLength);
+  const sizeofHdrLE = dv.getInt32(0, true);
+  const littleEndian = sizeofHdrLE === 348;
+  const sizeofHdr = littleEndian ? sizeofHdrLE : dv.getInt32(0, false);
+  if (sizeofHdr !== 348) {
+    throw new Error(`Invalid NIfTI-1 header: expected sizeof_hdr=348, got ${sizeofHdr}.`);
+  }
+
+  const magic = new TextDecoder("ascii").decode(rawNii.subarray(344, 348));
+  if (magic !== "n+1\0" && magic !== "ni1\0") {
+    throw new Error(`Invalid NIfTI-1 magic '${magic.replace(/\0/g, "")}'.`);
+  }
+
+  const readText = (start: number, len: number) =>
+    new TextDecoder("utf8")
+      .decode(rawNii.subarray(start, start + len))
+      .replace(/\0/g, "")
+      .trim();
+
+  const fieldsScrubbed: string[] = [];
+  if (readText(148, 80).length > 0) fieldsScrubbed.push("descrip");
+  if (readText(228, 24).length > 0) fieldsScrubbed.push("aux_file");
+  if (readText(328, 16).length > 0) fieldsScrubbed.push("intent_name");
+
+  // Zero out descrip (148..228), aux_file (228..252), intent_name (328..344), db_name (14..32)
+  if (readText(14, 18).length > 0) fieldsScrubbed.push("db_name");
+  rawNii.fill(0, 14, 32);
+  rawNii.fill(0, 148, 252);
+  rawNii.fill(0, 328, 344);
+
+  const repDesc = (options?.replacementDescrip ?? "ANON_NIFTI").slice(0, 79);
+  const repBytes = new TextEncoder().encode(repDesc);
+  rawNii.set(repBytes, 148);
+
+  const origVoxOffset = Math.max(352, Math.round(dv.getFloat32(108, littleEndian)));
+  const hasExtension = rawNii[348] !== 0 || origVoxOffset > 352;
+  const extensionBytesRemoved = Math.max(0, origVoxOffset - 352);
+  if (hasExtension) {
+    fieldsScrubbed.push("nifti_extensions");
+  }
+
+  // Clear extension[0..3] bytes at 348..352 and set vox_offset = 352.0
+  rawNii[348] = 0;
+  rawNii[349] = 0;
+  rawNii[350] = 0;
+  rawNii[351] = 0;
+  dv.setFloat32(108, 352.0, littleEndian);
+
+  const voxelPayload = rawNii.subarray(Math.min(origVoxOffset, rawNii.byteLength));
+  const cleanNii = new Uint8Array(352 + voxelPayload.byteLength);
+  cleanNii.set(rawNii.subarray(0, 352), 0);
+  cleanNii.set(voxelPayload, 352);
+
+  // Extract preserved geometry
+  const cleanDv = new DataView(cleanNii.buffer, cleanNii.byteOffset, cleanNii.byteLength);
+  const ndim = cleanDv.getInt16(40, littleEndian);
+  const dims: number[] = [];
+  for (let i = 1; i <= Math.min(7, Math.max(3, ndim)); i++) {
+    dims.push(cleanDv.getInt16(40 + i * 2, littleEndian));
+  }
+  const pixdimMm: [number, number, number] = [
+    Number(cleanDv.getFloat32(76 + 4, littleEndian).toFixed(6)),
+    Number(cleanDv.getFloat32(76 + 8, littleEndian).toFixed(6)),
+    Number(cleanDv.getFloat32(76 + 12, littleEndian).toFixed(6)),
+  ];
+  const qformCode = cleanDv.getInt16(252, littleEndian);
+  const sformCode = cleanDv.getInt16(254, littleEndian);
+  const qoffsetMm: [number, number, number] = [
+    Number(cleanDv.getFloat32(268, littleEndian).toFixed(6)),
+    Number(cleanDv.getFloat32(272, littleEndian).toFixed(6)),
+    Number(cleanDv.getFloat32(276, littleEndian).toFixed(6)),
+  ];
+  const readRow4 = (off: number): [number, number, number, number] => [
+    Number(cleanDv.getFloat32(off, littleEndian).toFixed(6)),
+    Number(cleanDv.getFloat32(off + 4, littleEndian).toFixed(6)),
+    Number(cleanDv.getFloat32(off + 8, littleEndian).toFixed(6)),
+    Number(cleanDv.getFloat32(off + 12, littleEndian).toFixed(6)),
+  ];
+
+  const derivedBytes = isGzip ? new Uint8Array(gzipSync(cleanNii)) : cleanNii;
+  const derivedSha256 = createHash("sha256").update(derivedBytes).digest("hex");
+  const currentOriginalSha = createHash("sha256").update(originalInput).digest("hex");
+
+  return {
+    derivedBytes,
+    wasGzipped: isGzip,
+    originalSha256,
+    derivedSha256,
+    originalPreserved: currentOriginalSha === originalSha256,
+    fieldsScrubbed,
+    extensionBytesRemoved,
+    geometryPreserved: {
+      dims,
+      pixdimMm,
+      qformCode,
+      sformCode,
+      qoffsetMm,
+      srowX: readRow4(280),
+      srowY: readRow4(296),
+      srowZ: readRow4(312),
+    },
+    claimCompleteAnonymisation: false,
+    manualReviewRequired: false,
+    auditNotice:
+      "NIfTI-1 header metadata (db_name, descrip, aux_file, intent_name) and header extension blocks were removed while preserving 3D voxel intensities and qform/sform affine geometry. Header scrubbing alone does not guarantee complete anonymisation if defacing/pixel review is required.",
+  };
+}
