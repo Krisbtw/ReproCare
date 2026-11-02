@@ -623,7 +623,7 @@ test("RBAC 8: Patients cannot access or modify another patient's records on the 
   assert.equal(ws.findings[0].id, "f_self");
   assert.equal(ws.symptoms.length, 1);
   assert.equal(ws.symptoms[0].id, "sym_self");
-  assert.ok(ws.verifications.every((v) => v.user_id === "patient_user"));
+  assert.ok(((ws.verifications ?? []) as any[]).every((v) => v.user_id === "patient_user"));
 
   // 2. Patient can modify their own record (p_pat_self)
   await executeSetActivePatient(sql, "patient_user", "p_pat_self");
@@ -800,7 +800,8 @@ test("RBAC 9: Imaging storage and report store enforce clinician verification an
 
   const fetched = await getImagingArtifact(sql, "approved_clinician", stored.id);
   assert.ok(fetched);
-  assert.equal(fetched.data.byteLength, 4);
+  assert.ok(fetched?.data);
+  assert.equal(fetched?.data?.byteLength, 4);
 
   // Patient cannot list or fetch clinician's artifact or non-self patient artifacts
   await assert.rejects(

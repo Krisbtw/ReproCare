@@ -83,10 +83,6 @@ export type VersionRow = {
   report_longest_mm: number | null;
   change_reason: string;
   created_at: string;
-  review_status?: string;
-  extraction_method?: string;
-  version_no?: number;
-  report_object_id?: string | null;
 };
 
 export type EvidenceRow = {
@@ -333,10 +329,6 @@ export type FibroidAssessmentItem = {
   reviewed_at: string | null;
   review_note: string | null;
   created_at: string;
-  review_status?: string;
-  extraction_method?: string;
-  version_no?: number;
-  report_object_id?: string | null;
 };
 
 export type EndometriosisRecordItem = {
@@ -347,10 +339,6 @@ export type EndometriosisRecordItem = {
   staging_rASRM: string | null;
   imaging_note: string;
   created_at: string;
-  review_status?: string;
-  extraction_method?: string;
-  version_no?: number;
-  report_object_id?: string | null;
 };
 
 export type OvarianCystRecordItem = {

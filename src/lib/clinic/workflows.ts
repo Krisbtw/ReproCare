@@ -611,6 +611,8 @@ export async function recordEndometriosisPathwayAssessment(
     menstrualHistoryNote?: string | null;
     historicalComparisonNote?: string | null;
     evidenceTier?: ConditionEvidenceTier;
+    recordedOn?: string | null;
+    confirmAssessment?: boolean;
   },
 ): Promise<EndometriosisPathwayRecord> {
   const combinedText = `${input.imagingNote ?? ""} ${input.surgicalHistory ?? ""} ${input.historicalComparisonNote ?? ""}`;
@@ -752,6 +754,7 @@ export async function recordOvarianCystPathwayAssessment(
     followUpMonths?: number | null;
     clinicalNote: string;
     evidenceTier?: ConditionEvidenceTier;
+    confirmAssessment?: boolean;
   },
 ): Promise<OvarianCystPathwayRecord> {
   if (!["left", "right", "bilateral"].includes(input.laterality)) {
@@ -919,6 +922,7 @@ export async function recordPcosPathwayAssessment(
     metabolicContext?: PcosMetabolicContext;
     notes: string;
     referenceYear?: number;
+    confirmAssessment?: boolean;
   },
 ): Promise<PcosPathwayRecord> {
   const pRows = await sql<{

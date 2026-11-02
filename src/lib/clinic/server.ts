@@ -2197,6 +2197,8 @@ export async function executeSaveEndometriosisRecord(
     menstrualHistoryNote?: string | null;
     historicalComparisonNote?: string | null;
     evidenceTier?: ConditionEvidenceTier;
+    recordedOn?: string | null;
+    confirmAssessment?: boolean;
   },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "entering endometriosis clinical records");
@@ -2264,6 +2266,7 @@ export async function executeSaveOvarianCystRecord(
     followUpMonths?: number;
     clinicalNote: string;
     evidenceTier?: ConditionEvidenceTier;
+    confirmAssessment?: boolean;
   },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "entering ovarian cyst clinical records");
@@ -2327,6 +2330,7 @@ export async function executeSavePcosAssessment(
     metabolicContext?: PcosMetabolicContext;
     notes: string;
     referenceYear?: number;
+    confirmAssessment?: boolean;
   },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "entering PCOS assessments");
@@ -2602,7 +2606,7 @@ export async function executeGetLongitudinalComparisonProvenance(
   correspondenceId: string,
 ) {
   const userId = requireAuthenticatedUser(rawUserId);
-  const corrRows = await sql<Record<string, unknown>>`
+  const corrRows = await sql<Record<string, any>>`
     select * from correspondences where id = ${correspondenceId}
   `;
   if (!corrRows.length) {
@@ -2630,18 +2634,18 @@ export async function executeGetLongitudinalComparisonProvenance(
 
   const regId = correspondence.registration_id as string | null;
   const regRows = regId
-    ? await sql<Record<string, unknown>>`
+    ? await sql<Record<string, any>>`
         select * from registrations where id = ${regId} and user_id = ${patientOwnerUserId}
       `.catch(() => [])
     : [];
 
-  const decisions = await sql<Record<string, unknown>>`
+  const decisions = await sql<Record<string, any>>`
     select * from correspondence_decisions
     where correspondence_id = ${correspondenceId}
     order by created_at desc
   `.catch(() => []);
 
-  const reviews = await sql<Record<string, unknown>>`
+  const reviews = await sql<Record<string, any>>`
     select * from reviews
     where target_type = 'correspondence' and target_id = ${correspondenceId}
     order by created_at desc
@@ -2649,7 +2653,7 @@ export async function executeGetLongitudinalComparisonProvenance(
 
   const discrepancies =
     fromVersionId && toVersionId
-      ? await sql<Record<string, unknown>>`
+      ? await sql<Record<string, any>>`
           select * from discrepancies
           where user_id = ${patientOwnerUserId}
             and patient_id = ${patientId}
@@ -2659,7 +2663,7 @@ export async function executeGetLongitudinalComparisonProvenance(
         `.catch(() => [])
       : [];
 
-  const auditHistory = await sql<Record<string, unknown>>`
+  const auditHistory = await sql<Record<string, any>>`
     select * from audit_events
     where entity_id = ${correspondenceId}
     order by at desc
@@ -2704,7 +2708,7 @@ export const getLongitudinalComparisonProvenance = createServerFn({ method: "POS
   .validator((correspondenceId: string) => correspondenceId)
   .handler(async ({ context, data: correspondenceId }) => {
     const sql = await getSql();
-    return executeGetLongitudinalComparisonProvenance(sql, context.userId, correspondenceId);
+    return (await executeGetLongitudinalComparisonProvenance(sql, context.userId, correspondenceId)) as any;
   });
 
 
@@ -3201,12 +3205,12 @@ export async function executeGetReportRevisions(
   );
 
   const [revisions, findingReviews] = await Promise.all([
-    sql<Record<string, unknown>>`
+    sql<Record<string, any>>`
       select * from report_extraction_revisions
       where report_id = ${reportId}
       order by revision_no desc
     `.catch(() => []),
-    sql<Record<string, unknown>>`
+    sql<Record<string, any>>`
       select * from report_finding_reviews
       where report_id = ${reportId}
       order by created_at desc
