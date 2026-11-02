@@ -71,6 +71,10 @@ if _ORIGINS:
     )
 
 # Optional Vercel Services path-rewrite prefix normalization:
+# When `imaging-service` is invoked via an internal Vercel Service Binding, requests arrive at root paths
+# (`/health`, `/models`, `/series/inspect`, `/segment/{model_id}`). If a top-level Vercel rewrite prefix
+# such as `/api/imaging-service/(.*)` is configured, Vercel passes the full matched path through as-is;
+# stripping the prefix here allows both internal binding calls and prefixed rewrite calls to hit the same routes.
 _SERVICE_REWRITE_PREFIX = os.environ.get(
     "ANATOMYBRIDGE_ROUTE_PREFIX", "/api/imaging-service"
 ).rstrip("/")
