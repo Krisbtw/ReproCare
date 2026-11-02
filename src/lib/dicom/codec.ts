@@ -1,5 +1,3 @@
-import { createRequire } from "node:module";
-const require = createRequire(import.meta.url);
 /**
  * DICOM Part 10 (NEMA PS3.10) multi-syntax reader, validator, multi-frame extractor,
  * and synthetic test fixture builders (Sprint 5 Task 1A & 1B).
@@ -28,6 +26,19 @@ const require = createRequire(import.meta.url);
 import type { Vec3 } from "../imaging/volume.ts";
 
 const LONG_VR = new Set(["OB", "OW", "OF", "SQ", "UT", "UN", "UC", "UR", "OD", "OL", "OV"]);
+
+
+function getNodeSpawnSync() {
+  if (typeof window !== "undefined") return null;
+  if (typeof process === "undefined" || !process.versions || !process.versions.node) return null;
+  try {
+    if (typeof (process as any).getBuiltinModule === "function") {
+      const cp = (process as any).getBuiltinModule("node:child_process");
+      if (cp && typeof cp.spawnSync === "function") return cp.spawnSync;
+    }
+  } catch (_) {}
+  return null;
+}
 
 export const TRANSFER_SYNTAX_REGISTRY: Record<
   string,
@@ -437,7 +448,8 @@ function decodeEncapsulatedJpegOrJp2Frame(
     }
     if (typeof process !== "undefined" && process.versions?.node) {
       try {
-        const { spawnSync } = require("node:child_process");
+        const spawnSync = getNodeSpawnSync();
+        if (!spawnSync || typeof Buffer === "undefined") throw new Error("Node child_process unavailable");
         const b64In = Buffer.from(fragment).toString("base64");
         const pyRes = spawnSync(
           "python3",
@@ -498,7 +510,8 @@ function decodeEncapsulatedJpegOrJp2Frame(
     }
     if (typeof process !== "undefined" && process.versions?.node) {
       try {
-        const { spawnSync } = require("node:child_process");
+        const spawnSync = getNodeSpawnSync();
+        if (!spawnSync || typeof Buffer === "undefined") throw new Error("Node child_process unavailable");
         const b64In = Buffer.from(fragment).toString("base64");
         const pyRes = spawnSync(
           "python3",
