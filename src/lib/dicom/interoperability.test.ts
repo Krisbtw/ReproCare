@@ -576,8 +576,13 @@ import { spawnSync } from "node:child_process";
 
 test("Sprint 6 Task 2A & 2G: Real Pillow (libjpeg & OpenJPEG) standard JPEG / JPEG 2000 codestreams and real DICOM Part-10 file decoding", async () => {
   // Generate genuine standard ITU-T T.81 JPEG and ISO/IEC 15444-1 JPEG 2000 Lossless codestreams via Pillow
+  const pyBin =
+    process.env.PYTHON_BIN ||
+    (process.platform === "win32"
+      ? (await import("node:path")).default.resolve("./imaging-service/.venv/Scripts/python.exe")
+      : "python3");
   const pyGen = spawnSync(
-    "python3",
+    pyBin,
     [
       "-c",
       "import io, json, base64, numpy as np; from PIL import Image; " +

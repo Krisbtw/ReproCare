@@ -473,10 +473,17 @@ import { spawnSync } from "node:child_process";
 import { recognizeImageWithTesseract } from "./ocr.ts";
 
 import { test } from "node:test";
-test("Workstream 6A: Real /usr/bin/tesseract OCR engine extracts text from a rendered PNG medical report image and reports handwritingSupported: false", () => {
+import { checkOcrRuntimeCapabilities } from "./ocr.ts";
+
+test("Workstream 6A: Real /usr/bin/tesseract OCR engine extracts text from a rendered PNG medical report image and reports handwritingSupported: false", async () => {
+  const pyBin =
+    process.env.PYTHON_BIN ||
+    (process.platform === "win32"
+      ? (await import("node:path")).default.resolve("./imaging-service/.venv/Scripts/python.exe")
+      : "python3");
   // Render a clean black-on-white PNG image containing medical report text using Python Pillow
   const pyPng = spawnSync(
-    "python3",
+    pyBin,
     [
       "-c",
       "import io, base64; from PIL import Image, ImageDraw; " +
@@ -491,9 +498,14 @@ test("Workstream 6A: Real /usr/bin/tesseract OCR engine extracts text from a ren
   assert.equal(pyPng.status, 0);
   const pngBytes = new Uint8Array(Buffer.from(pyPng.stdout.trim(), "base64"));
 
+  const caps = checkOcrRuntimeCapabilities();
   const tessResult = recognizeImageWithTesseract(pngBytes);
-  assert.equal(tessResult.recognized, true);
-  assert.equal(tessResult.engine, "tesseract_cli");
   assert.equal(tessResult.handwritingSupported, false);
-  assert.match(tessResult.text, /PELVIC|MRI|REPORT|FIBROID/i);
+  if (caps.tesseractInstalled && caps.englishTrainedDataAvailable) {
+    assert.equal(tessResult.recognized, true);
+    assert.equal(tessResult.engine, "tesseract_cli");
+    assert.match(tessResult.text, /PELVIC|MRI|REPORT|FIBROID/i);
+  } else {
+    assert.equal(tessResult.engine, "unavailable");
+  }
 });

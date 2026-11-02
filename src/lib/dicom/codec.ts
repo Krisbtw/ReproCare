@@ -40,6 +40,24 @@ function getNodeSpawnSync() {
   return null;
 }
 
+export function getPythonBin(): string {
+  if (typeof process === "undefined") return "python3";
+  if (process.env.PYTHON_BIN) return process.env.PYTHON_BIN;
+  if (process.platform === "win32") {
+    try {
+      if (typeof (process as any).getBuiltinModule === "function") {
+        const fs = (process as any).getBuiltinModule("node:fs");
+        const path = (process as any).getBuiltinModule("node:path");
+        const cwd = process.cwd();
+        const venvPy = path.join(cwd, "imaging-service", ".venv", "Scripts", "python.exe");
+        if (fs.existsSync(venvPy)) return venvPy;
+      }
+    } catch (_) {}
+    return "python";
+  }
+  return "python3";
+}
+
 export const TRANSFER_SYNTAX_REGISTRY: Record<
   string,
   {
@@ -452,12 +470,12 @@ function decodeEncapsulatedJpegOrJp2Frame(
         if (!spawnSync || typeof Buffer === "undefined") throw new Error("Node child_process unavailable");
         const b64In = Buffer.from(fragment).toString("base64");
         const pyRes = spawnSync(
-          "python3",
+          getPythonBin(),
           [
             "-c",
             "import sys, io, base64, numpy as np; from PIL import Image; im = Image.open(io.BytesIO(base64.b64decode(sys.stdin.read()))); arr = np.asarray(im); arr = arr[:, :, 0] if arr.ndim == 3 else arr; sys.stdout.write(base64.b64encode(np.ascontiguousarray(arr).tobytes()).decode('ascii'))",
           ],
-          { input: b64In, encoding: "utf8", timeout: 5000 },
+          { input: b64In, encoding: "utf8", timeout: 20000 },
         );
         if (pyRes.status === 0 && pyRes.stdout) {
           const decodedBuf = new Uint8Array(Buffer.from(pyRes.stdout.trim(), "base64"));
@@ -514,12 +532,12 @@ function decodeEncapsulatedJpegOrJp2Frame(
         if (!spawnSync || typeof Buffer === "undefined") throw new Error("Node child_process unavailable");
         const b64In = Buffer.from(fragment).toString("base64");
         const pyRes = spawnSync(
-          "python3",
+          getPythonBin(),
           [
             "-c",
             "import sys, io, base64, numpy as np; from PIL import Image; im = Image.open(io.BytesIO(base64.b64decode(sys.stdin.read()))); arr = np.asarray(im); arr = arr[:, :, 0] if arr.ndim == 3 else arr; sys.stdout.write(base64.b64encode(np.ascontiguousarray(arr).tobytes()).decode('ascii'))",
           ],
-          { input: b64In, encoding: "utf8", timeout: 5000 },
+          { input: b64In, encoding: "utf8", timeout: 20000 },
         );
         if (pyRes.status === 0 && pyRes.stdout) {
           const decodedBuf = new Uint8Array(Buffer.from(pyRes.stdout.trim(), "base64"));
@@ -1291,8 +1309,14 @@ export function readDicom(byteArray: Uint8Array, parse: (b: Uint8Array) => DataS
     } else {
       try {
         for (let f = 0; f < numberOfFrames; f++) {
+          const frag = fragments[f];
+          const fragBytes =
+            frag.bytes ??
+            (frag.position !== undefined
+              ? data.byteArray.subarray(frag.position, frag.position + frag.length)
+              : new Uint8Array(0));
           const rawDecoded = decodeRleLosslessFrame(
-            fragments[f].bytes,
+            fragBytes,
             rows * cols,
             bytesPerPixel,
           );
@@ -1336,8 +1360,14 @@ export function readDicom(byteArray: Uint8Array, parse: (b: Uint8Array) => DataS
     } else {
       try {
         for (let f = 0; f < Math.min(numberOfFrames, fragments.length); f++) {
+          const frag = fragments[f];
+          const fragBytes =
+            frag.bytes ??
+            (frag.position !== undefined
+              ? data.byteArray.subarray(frag.position, frag.position + frag.length)
+              : new Uint8Array(0));
           const rawDecoded = decodeEncapsulatedJpegOrJp2Frame(
-            fragments[f].bytes,
+            fragBytes,
             transfer,
             rows,
             cols,

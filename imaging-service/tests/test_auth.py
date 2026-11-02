@@ -63,6 +63,10 @@ def test_auth_enforced_when_env_key_is_set(monkeypatch):
     r5 = client.get("/models", headers={"X-API-Key": "secret-token-1234"})
     assert r5.status_code == 200
 
+    # Protected endpoint with correct X-Service-Key header succeeds
+    r6 = client.get("/models", headers={"X-Service-Key": "secret-token-1234"})
+    assert r6.status_code == 200
+
 
 def test_security_headers_present():
     r = client.get("/health")

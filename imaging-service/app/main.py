@@ -65,7 +65,7 @@ if _ORIGINS:
         CORSMiddleware,
         allow_origins=_ORIGINS,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-        allow_headers=["authorization", "content-type", "x-api-key"],
+        allow_headers=["authorization", "content-type", "x-api-key", "x-service-key"],
         allow_credentials=True,
         max_age=86400,
     )
@@ -192,6 +192,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
 def verify_service_auth(
     auth_header: str | None = Header(None, alias="Authorization"),
     api_key_header: str | None = Header(None, alias="X-API-Key"),
+    service_key_header: str | None = Header(None, alias="X-Service-Key"),
 ) -> bool:
     """Verifies service authentication. Fails closed in production if no key is configured."""
     expected = os.environ.get("ANATOMYBRIDGE_SERVICE_API_KEY")
@@ -213,6 +214,8 @@ def verify_service_auth(
         provided = auth_header[7:].strip()
     elif api_key_header:
         provided = api_key_header.strip()
+    elif service_key_header:
+        provided = service_key_header.strip()
 
     if not provided or not hmac.compare_digest(provided, expected):
         raise HTTPException(401, "Unauthorized: valid service API key or Bearer token is required.")
