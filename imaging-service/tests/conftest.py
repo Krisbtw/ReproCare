@@ -80,6 +80,6 @@ def make_series(
             ds.RescaleSlope, ds.RescaleIntercept = 1, 0
             ds.PixelData = vol[i].tobytes()
             buf = io.BytesIO()
-            pydicom.dcmwrite(buf, ds, enforce_file_format=True)
+            pydicom.dcmwrite(buf, ds, write_like_original=False)
             blobs.append(buf.getvalue())
     return blobs

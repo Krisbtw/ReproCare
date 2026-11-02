@@ -111,7 +111,7 @@ def scrub_dicom_phi_bytes(raw_bytes: bytes) -> bytes:
         if tag in ds:
             del ds[tag]
     buf = io.BytesIO()
-    pydicom.dcmwrite(buf, ds, enforce_file_format=True)
+    pydicom.dcmwrite(buf, ds, write_like_original=False)
     return buf.getvalue()
 
 
