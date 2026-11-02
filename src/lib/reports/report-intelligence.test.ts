@@ -468,3 +468,32 @@ describe("Sprint 4 Task 2 — Clinical Report Intelligence, OCR, LLM Grounding &
     }
   });
 });
+
+import { spawnSync } from "node:child_process";
+import { recognizeImageWithTesseract } from "./ocr.ts";
+
+import { test } from "node:test";
+test("Workstream 6A: Real /usr/bin/tesseract OCR engine extracts text from a rendered PNG medical report image and reports handwritingSupported: false", () => {
+  // Render a clean black-on-white PNG image containing medical report text using Python Pillow
+  const pyPng = spawnSync(
+    "python3",
+    [
+      "-c",
+      "import io, base64; from PIL import Image, ImageDraw; " +
+      "im = Image.new('L', (640, 120), color=255); " +
+      "dr = ImageDraw.Draw(im); " +
+      "dr.text((20, 40), 'PELVIC MRI REPORT FIGO 4 FIBROID 32 MM', fill=0); " +
+      "buf = io.BytesIO(); im.save(buf, format='PNG'); " +
+      "print(base64.b64encode(buf.getvalue()).decode())",
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(pyPng.status, 0);
+  const pngBytes = new Uint8Array(Buffer.from(pyPng.stdout.trim(), "base64"));
+
+  const tessResult = recognizeImageWithTesseract(pngBytes);
+  assert.equal(tessResult.recognized, true);
+  assert.equal(tessResult.engine, "tesseract_cli");
+  assert.equal(tessResult.handwritingSupported, false);
+  assert.match(tessResult.text, /PELVIC|MRI|REPORT|FIBROID/i);
+});

@@ -653,3 +653,89 @@ test("Sprint 6 Task 2A & 2G: Real Pillow (libjpeg & OpenJPEG) standard JPEG / JP
     assert.ok(parsed.floatPixels![0] < 20);
   }
 });
+
+import { gzipSync } from "node:zlib";
+import { deidentifyNiftiBytes } from "./deidentify.ts";
+
+test("Workstream 3E: NIfTI-1 (.nii and .nii.gz) metadata and extension block de-identification preserves 3D qform/sform affine geometry and voxel data", () => {
+  // Construct a 3D NIfTI-1 file (4x4x4 uint8 voxels) with PHI in descrip, aux_file, intent_name,
+  // AND a 64-byte extension block at offset 352..416 containing embedded DICOM patient PHI!
+  const extLen = 64;
+  const voxOffset = 352 + extLen;
+  const voxCount = 4 * 4 * 4;
+  const rawNii = new Uint8Array(voxOffset + voxCount);
+  const dv = new DataView(rawNii.buffer);
+
+  dv.setInt32(0, 348, true); // sizeof_hdr
+  rawNii.set(new TextEncoder().encode("DB_PAT_7788"), 14); // db_name
+  dv.setInt16(40, 3, true); // dim[0] = 3D
+  dv.setInt16(42, 4, true); // dim[1] = 4
+  dv.setInt16(44, 4, true); // dim[2] = 4
+  dv.setInt16(46, 4, true); // dim[3] = 4
+  dv.setInt16(70, 2, true); // datatype = UINT8
+  dv.setInt16(72, 8, true); // bitpix = 8
+  dv.setFloat32(80, 1.25, true); // pixdim[1]
+  dv.setFloat32(84, 1.25, true); // pixdim[2]
+  dv.setFloat32(88, 3.0, true); // pixdim[3]
+  dv.setFloat32(108, voxOffset, true); // vox_offset = 416.0
+  rawNii.set(new TextEncoder().encode("PATIENT: MEERA PATEL DOB 1989-04-12 PUNE MRI"), 148); // descrip
+  rawNii.set(new TextEncoder().encode("MRN-554433-SECRET"), 228); // aux_file
+  dv.setInt16(252, 1, true); // qform_code
+  dv.setInt16(254, 1, true); // sform_code
+  dv.setFloat32(268, -12.5, true); // qoffset_x
+  dv.setFloat32(272, 24.0, true); // qoffset_y
+  dv.setFloat32(276, 36.5, true); // qoffset_z
+  // srow_x = [1.25, 0, 0, -12.5]
+  dv.setFloat32(280, 1.25, true);
+  dv.setFloat32(292, -12.5, true);
+  // srow_y = [0, 1.25, 0, 24.0]
+  dv.setFloat32(300, 1.25, true);
+  dv.setFloat32(308, 24.0, true);
+  // srow_z = [0, 0, 3.0, 36.5]
+  dv.setFloat32(320, 3.0, true);
+  dv.setFloat32(324, 36.5, true);
+  rawNii.set(new TextEncoder().encode("INTENT_PHI_99"), 328); // intent_name
+  rawNii.set(new TextEncoder().encode("n+1\0"), 344); // magic
+  rawNii[348] = 1; // extension[0] = 1 (extension present!)
+  rawNii.set(
+    new TextEncoder().encode("<DicomExtension>PatientName=PATEL^MEERA;Accession=ACC99</DicomExtension>"),
+    352,
+  );
+  for (let i = 0; i < voxCount; i++) {
+    rawNii[voxOffset + i] = (i * 3 + 17) % 256;
+  }
+
+  const gzNii = new Uint8Array(gzipSync(rawNii));
+  const snapshotBefore = new Uint8Array(gzNii);
+
+  const res = deidentifyNiftiBytes(gzNii);
+  assert.equal(res.wasGzipped, true);
+  assert.equal(res.originalPreserved, true);
+  assert.deepEqual(gzNii, snapshotBefore);
+  assert.equal(res.claimCompleteAnonymisation, false);
+  assert.equal(res.extensionBytesRemoved, 64);
+  assert.ok(res.fieldsScrubbed.includes("descrip"));
+  assert.ok(res.fieldsScrubbed.includes("aux_file"));
+  assert.ok(res.fieldsScrubbed.includes("intent_name"));
+  assert.ok(res.fieldsScrubbed.includes("nifti_extensions"));
+
+  // Verify geometry is 100% preserved
+  assert.deepEqual(res.geometryPreserved.dims, [4, 4, 4]);
+  assert.deepEqual(res.geometryPreserved.pixdimMm, [1.25, 1.25, 3.0]);
+  assert.deepEqual(res.geometryPreserved.qoffsetMm, [-12.5, 24.0, 36.5]);
+  assert.deepEqual(res.geometryPreserved.srowX, [1.25, 0, 0, -12.5]);
+  assert.deepEqual(res.geometryPreserved.srowY, [0, 1.25, 0, 24.0]);
+  assert.deepEqual(res.geometryPreserved.srowZ, [0, 0, 3.0, 36.5]);
+
+  // Verify de-identified uncompressed NIfTI has zero secret strings and exact voxel payload at offset 352
+  const resUncompressed = deidentifyNiftiBytes(rawNii);
+  const textAfter = new TextDecoder().decode(resUncompressed.derivedBytes);
+  for (const secret of ["MEERA PATEL", "1989-04-12", "MRN-554433-SECRET", "INTENT_PHI_99", "DB_PAT_7788", "DicomExtension"]) {
+    assert.equal(textAfter.includes(secret), false, `Derived NIfTI must not contain ${secret}`);
+  }
+  assert.equal(resUncompressed.derivedBytes.byteLength, 352 + voxCount);
+  assert.deepEqual(
+    resUncompressed.derivedBytes.subarray(352),
+    rawNii.subarray(voxOffset),
+  );
+});

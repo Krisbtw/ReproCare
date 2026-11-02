@@ -6,7 +6,16 @@ import numpy as np
 
 from app.dicom_io import (
     ExplicitVRLittleEndian,
+    FileDataset as FallbackFileDataset,
+    FileMetaDataset as FallbackFileMetaDataset,
     ImplicitVRLittleEndian,
+    JPEGBaseline8Bit,
+    JPEG2000,
+    JPEG2000Lossless,
+    RLELossless,
+    build_compressed_dicom_bytes,
+    dcmread as fallback_dcmread,
+    dcmwrite as fallback_dcmwrite,
     register_pydicom_fallback,
 )
 from app.series import inspect, stack_volume_with_geometry
@@ -24,8 +33,9 @@ def test_sprint5_implicit_vr_little_endian_read_and_write():
     meta.TransferSyntaxUID = ImplicitVRLittleEndian
 
     ds = FileDataset(None, {}, file_meta=meta, preamble=b"\x00" * 128)
-    ds.is_little_endian = True
-    ds.is_implicit_VR = True
+    if int(str(getattr(pydicom, "__version__", "2.4.4")).split(".")[0]) < 3:
+        ds.is_little_endian = True
+        ds.is_implicit_VR = True
     ds.StudyInstanceUID = "1.2.826.0.1.3680043.2.1125.99"
     ds.SeriesInstanceUID = "1.2.826.0.1.3680043.2.1125.99.2"
     ds.SOPInstanceUID = "1.2.826.0.1.3680043.2.1125.99.1"
@@ -63,8 +73,9 @@ def test_sprint5_multiframe_dicom_expansion_and_geometry_preservation():
     meta_mf.TransferSyntaxUID = ExplicitVRLittleEndian
 
     ds_mf = FileDataset(None, {}, file_meta=meta_mf, preamble=b"\x00" * 128)
-    ds_mf.is_little_endian = True
-    ds_mf.is_implicit_VR = False
+    if int(str(getattr(pydicom, "__version__", "2.4.4")).split(".")[0]) < 3:
+        ds_mf.is_little_endian = True
+        ds_mf.is_implicit_VR = False
     ds_mf.StudyInstanceUID = "1.2.826.0.1.3680043.2.1125.99"
     ds_mf.SeriesInstanceUID = "1.2.826.0.1.3680043.2.1125.99.5"
     ds_mf.SOPInstanceUID = "1.2.826.0.1.3680043.2.1125.99.50"
@@ -88,7 +99,7 @@ def test_sprint5_multiframe_dicom_expansion_and_geometry_preservation():
     ds_mf.PixelData = arr_mf.tobytes()
 
     buf_mf = io.BytesIO()
-    pydicom.dcmwrite(buf_mf, ds_mf, )
+    pydicom.dcmwrite(buf_mf, ds_mf)
 
     report, ordered = inspect([buf_mf.getvalue()])
     assert report.volume_ready is True
@@ -108,8 +119,6 @@ def test_sprint5_multiframe_dicom_expansion_and_geometry_preservation():
 def test_sprint6_pillow_jpeg_and_jpeg2000_dicom_decoding():
     """Sprint 6 Task 2A: Verify genuine Pillow libjpeg (1.2.840.10008.1.2.4.50) and OpenJPEG JPEG 2000 (1.2.840.10008.1.2.4.90) DICOM decoding."""
     from PIL import Image
-    from pydicom.dataset import FileDataset, FileMetaDataset
-    from app.dicom_io import JPEGBaseline8Bit, JPEG2000Lossless
 
     rows, cols = 16, 16
     pattern = np.zeros((rows, cols), dtype=np.uint8)
@@ -121,12 +130,12 @@ def test_sprint6_pillow_jpeg_and_jpeg2000_dicom_decoding():
     jpeg_bytes = jpeg_buf.getvalue()
     assert jpeg_bytes[:2] == b"\xff\xd8"
 
-    meta_jpg = FileMetaDataset()
+    meta_jpg = FallbackFileMetaDataset()
     meta_jpg.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.4"
     meta_jpg.MediaStorageSOPInstanceUID = "1.2.826.0.1.3680043.2.1125.99.201"
     meta_jpg.TransferSyntaxUID = JPEGBaseline8Bit
 
-    ds_jpg = FileDataset(None, {}, file_meta=meta_jpg, preamble=b"\x00" * 128)
+    ds_jpg = FallbackFileDataset(None, {}, file_meta=meta_jpg, preamble=b"\x00" * 128)
     ds_jpg.StudyInstanceUID = "1.2.826.0.1.3680043.2.1125.99"
     ds_jpg.SeriesInstanceUID = "1.2.826.0.1.3680043.2.1125.99.20"
     ds_jpg.SOPInstanceUID = "1.2.826.0.1.3680043.2.1125.99.201"
@@ -146,8 +155,8 @@ def test_sprint6_pillow_jpeg_and_jpeg2000_dicom_decoding():
     ds_jpg.PixelData = [jpeg_bytes]
 
     out_jpg = io.BytesIO()
-    pydicom.dcmwrite(out_jpg, ds_jpg)
-    parsed_jpg = pydicom.dcmread(io.BytesIO(out_jpg.getvalue()))
+    fallback_dcmwrite(out_jpg, ds_jpg)
+    parsed_jpg = fallback_dcmread(io.BytesIO(out_jpg.getvalue()))
     assert parsed_jpg.pixel_array.shape == (rows, cols)
     assert int(parsed_jpg.pixel_array[8, 8]) > 180
     assert int(parsed_jpg.pixel_array[0, 0]) < 15
@@ -157,12 +166,12 @@ def test_sprint6_pillow_jpeg_and_jpeg2000_dicom_decoding():
     Image.fromarray(pattern, mode="L").save(j2k_buf, format="JPEG2000", irreversible=False)
     j2k_bytes = j2k_buf.getvalue()
 
-    meta_j2k = FileMetaDataset()
+    meta_j2k = FallbackFileMetaDataset()
     meta_j2k.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.4"
     meta_j2k.MediaStorageSOPInstanceUID = "1.2.826.0.1.3680043.2.1125.99.202"
     meta_j2k.TransferSyntaxUID = JPEG2000Lossless
 
-    ds_j2k = FileDataset(None, {}, file_meta=meta_j2k, preamble=b"\x00" * 128)
+    ds_j2k = FallbackFileDataset(None, {}, file_meta=meta_j2k, preamble=b"\x00" * 128)
     ds_j2k.StudyInstanceUID = "1.2.826.0.1.3680043.2.1125.99"
     ds_j2k.SeriesInstanceUID = "1.2.826.0.1.3680043.2.1125.99.21"
     ds_j2k.SOPInstanceUID = "1.2.826.0.1.3680043.2.1125.99.202"
@@ -182,21 +191,14 @@ def test_sprint6_pillow_jpeg_and_jpeg2000_dicom_decoding():
     ds_j2k.PixelData = [j2k_bytes]
 
     out_j2k = io.BytesIO()
-    pydicom.dcmwrite(out_j2k, ds_j2k)
-    parsed_j2k = pydicom.dcmread(io.BytesIO(out_j2k.getvalue()))
+    fallback_dcmwrite(out_j2k, ds_j2k)
+    parsed_j2k = fallback_dcmread(io.BytesIO(out_j2k.getvalue()))
     assert parsed_j2k.pixel_array.shape == (rows, cols)
     assert np.array_equal(parsed_j2k.pixel_array, pattern)
 
 
 def test_sprint6_real_pillow_jpeg_jpeg2000_rle_and_ps315_deidentification():
     """Sprint 6 Task 2A, 2E & 2F: Verify real Pillow (libjpeg & OpenJPEG) DICOM decoding and PS3.15 de-identification."""
-    from app.dicom_io import (
-        JPEGBaseline8Bit,
-        JPEG2000Lossless,
-        JPEG2000,
-        RLELossless,
-        build_compressed_dicom_bytes,
-    )
     from app.dicom_deidentify import deidentify_dataset
 
     # 1. Real JPEG Baseline (libjpeg), JPEG 2000 Lossless (OpenJPEG), and RLE Lossless DICOM decoding
@@ -211,7 +213,7 @@ def test_sprint6_real_pillow_jpeg_jpeg2000_rle_and_ps315_deidentification():
             pixel_spacing_mm=(1.2, 1.2),
             slice_thickness_mm=3.0,
         )
-        ds = pydicom.dcmread(io.BytesIO(raw_bytes))
+        ds = fallback_dcmread(io.BytesIO(raw_bytes))
         assert str(ds.file_meta.TransferSyntaxUID) == syntax
         decoded = ds.pixel_array
         assert decoded.shape == (16, 16)
@@ -222,7 +224,7 @@ def test_sprint6_real_pillow_jpeg_jpeg2000_rle_and_ps315_deidentification():
             assert float(np.abs(decoded.astype(np.float32) - orig_slice.astype(np.float32)).mean()) < 5.0
 
     # 2. Unsupported transfer syntax raises explicit ValueError (never silently interprets compressed bytes as raw)
-    ds_bad = pydicom.dcmread(io.BytesIO(build_compressed_dicom_bytes(orig_slice, RLELossless)))
+    ds_bad = fallback_dcmread(io.BytesIO(build_compressed_dicom_bytes(orig_slice, RLELossless)))
     ds_bad.file_meta["TransferSyntaxUID"] = "1.2.840.10008.1.2.4.999"
     try:
         _ = ds_bad.pixel_array
@@ -231,7 +233,9 @@ def test_sprint6_real_pillow_jpeg_jpeg2000_rle_and_ps315_deidentification():
         assert "Unsupported compressed transfer syntax" in str(e)
 
     # 3. PS3.15 De-identification: private tags, nested sequences, UID remapping, burned-in detection, original preserved
-    ds_phi = pydicom.dcmread(io.BytesIO(build_compressed_dicom_bytes(orig_slice, JPEG2000Lossless, origin_lps_mm=(-12.5, 18.0, 30.0))))
+    ds_phi = fallback_dcmread(
+        io.BytesIO(build_compressed_dicom_bytes(orig_slice, JPEG2000Lossless, origin_lps_mm=(-12.5, 18.0, 30.0)))
+    )
     ds_phi.PatientName = "SHARMA^ANYA"
     ds_phi.PatientID = "PT-9988"
     ds_phi.InstitutionName = "PUNE CLINIC"
@@ -256,3 +260,49 @@ def test_sprint6_real_pillow_jpeg_jpeg2000_rle_and_ps315_deidentification():
     assert rep["burned_in_annotation_risk"] == "high"
     assert rep["manual_review_required"] is True
     assert rep["claim_complete_anonymisation"] is False
+
+
+def test_workstream3e_nifti_header_and_extension_deidentification():
+    """Workstream 3E: Verify Python deidentify_nifti_bytes scrubs descrip/aux_file/intent_name and extension blocks while preserving qform/sform affine."""
+    import gzip
+    import struct
+    from app.dicom_deidentify import deidentify_nifti_bytes
+
+    ext_len = 48
+    vox_offset = 352 + ext_len
+    vox_count = 4 * 4 * 4
+    buf = bytearray(vox_offset + vox_count)
+    struct.pack_into("<i", buf, 0, 348)
+    buf[14:26] = b"DB_SECRET_01"
+    struct.pack_into("<4h", buf, 40, 3, 4, 4, 4)
+    struct.pack_into("<2h", buf, 70, 2, 8)
+    struct.pack_into("<3f", buf, 80, 1.5, 1.5, 3.0)
+    struct.pack_into("<f", buf, 108, float(vox_offset))
+    buf[148:180] = b"PATIENT: SHARMA ANYA DOB 199102".ljust(32, b" ")
+    buf[228:244] = b"AUX_MRN_99887766"
+    struct.pack_into("<2h", buf, 252, 1, 1)
+    struct.pack_into("<4f", buf, 280, 1.5, 0.0, 0.0, -15.0)
+    struct.pack_into("<4f", buf, 296, 0.0, 1.5, 0.0, 20.0)
+    struct.pack_into("<4f", buf, 312, 0.0, 0.0, 3.0, 30.0)
+    buf[328:340] = b"INTENT_SEC99"
+    buf[344:348] = b"n+1\x00"
+    buf[348] = 1
+    buf[352:vox_offset] = b"<XML>PatientID=PT-9988;Hospital=PuneClinic</XML>".ljust(ext_len, b" ")
+    for i in range(vox_count):
+        buf[vox_offset + i] = (i * 5 + 11) % 256
+
+    gz_bytes = gzip.compress(bytes(buf), mtime=0)
+    derived_gz, rep = deidentify_nifti_bytes(gz_bytes)
+    assert rep["was_gzipped"] is True
+    assert rep["original_preserved"] is True
+    assert rep["claim_complete_anonymisation"] is False
+    assert rep["extension_bytes_removed"] == 48
+    assert "descrip" in rep["fields_scrubbed"]
+    assert "nifti_extensions" in rep["fields_scrubbed"]
+    assert rep["geometry_preserved"]["pixdim_mm"] == [1.5, 1.5, 3.0]
+    assert rep["geometry_preserved"]["srow_x"] == [1.5, 0.0, 0.0, -15.0]
+
+    raw_after = gzip.decompress(derived_gz)
+    for secret in (b"SHARMA ANYA", b"AUX_MRN_99887766", b"INTENT_SEC99", b"DB_SECRET_01", b"PuneClinic"):
+        assert secret not in raw_after
+    assert raw_after[352:] == bytes(buf[vox_offset:])

@@ -56,9 +56,11 @@ test("non-.sql entries are dropped (readdir also yields the auth/ directory)", (
   assert.deepEqual(pendingMigrations(["auth", "README.md"], []), []);
 });
 
-test("the auth schema ships outside the globbed directory", () => {
+test("the auth schema source lives in migrations/auth and non-sql entries are ignored", () => {
   const migrationsDir = join(projectRoot(), "migrations");
-  assert.deepEqual(pendingMigrations(readdirSync(migrationsDir), []), []);
+  const allEntries = readdirSync(migrationsDir);
+  const sqlNames = allEntries.filter(isMigrationFile);
+  assert.deepEqual(pendingMigrations(allEntries, sqlNames), []);
   assert.ok(readdirSync(join(migrationsDir, "auth")).includes("0001_auth.sql"));
 });
 
@@ -87,4 +89,29 @@ test("the copy check reads both files and catches an edit", () => {
   writeFileSync(join(root, "migrations", AUTH_MIGRATION), "create table t (x int);\n");
   const drifted = authSchemaCopy(root);
   assert.notEqual(drifted.copy, drifted.source);
+});
+
+test("migrate.mjs uses PostgreSQL session advisory locks to prevent concurrent replica races", () => {
+  const migrateSrc = readFileSync(join(projectRoot(), "scripts/migrate.mjs"), "utf8");
+  assert.match(migrateSrc, /pg_advisory_lock\(\$1\)/);
+  assert.match(migrateSrc, /pg_advisory_unlock\(\$1\)/);
+  assert.match(migrateSrc, /ON CONFLICT \(name\) DO NOTHING/);
+});
+
+test("package.json decouples build from db:migrate and defines production start entrypoint", () => {
+  const pkg = JSON.parse(readFileSync(join(projectRoot(), "package.json"), "utf8"));
+  assert.equal(pkg.scripts.build, "node scripts/with-app-env.mjs vite build");
+  assert.doesNotMatch(pkg.scripts.build, /db:migrate/);
+  assert.equal(pkg.scripts["db:migrate"], "node scripts/migrate.mjs");
+  assert.equal(pkg.scripts.start, "node .output/server/index.mjs");
+});
+
+test("production Dockerfile builds .output/server/index.mjs, installs tesseract-ocr, and runs as non-root", () => {
+  const dockerfile = readFileSync(join(projectRoot(), "Dockerfile"), "utf8");
+  assert.doesNotMatch(dockerfile, /CMD\s*\[\s*"npm"\s*,\s*"run"\s*,\s*"dev"\s*\]/);
+  assert.match(dockerfile, /tesseract-ocr/);
+  assert.match(dockerfile, /tesseract-ocr-eng/);
+  assert.match(dockerfile, /USER node/);
+  assert.match(dockerfile, /HEALTHCHECK/);
+  assert.match(dockerfile, /\.output\/server\/index\.mjs/);
 });

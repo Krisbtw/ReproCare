@@ -1,13 +1,14 @@
 """DICOM series inspection, multi-frame expansion, and 3D volume assembly with full spatial geometry preservation (Sprint 5 Task 1B, 1C, 1D)."""
 from __future__ import annotations
 
+import copy
 import io
 from dataclasses import asdict, dataclass, field
 from typing import Iterable
 
 import numpy as np
 
-from .dicom_io import register_pydicom_fallback
+from .dicom_io import dcmread as fallback_dcmread, register_pydicom_fallback
 
 pydicom = register_pydicom_fallback()
 
@@ -104,7 +105,13 @@ class SeriesReport:
 def _strip_phi(ds: pydicom.Dataset) -> None:
     for kw in _PHI_KEYWORDS:
         if kw in ds:
-            del ds[kw]
+            if isinstance(ds, dict):
+                del ds[kw]
+            else:
+                try:
+                    delattr(ds, kw)
+                except Exception:
+                    pass
 
 
 def _normal(iop: Iterable[float]) -> np.ndarray:
@@ -142,11 +149,15 @@ def inspect(raw_files: list[bytes], stop_before_pixels: bool = True) -> tuple[Se
     unreadable = 0
     for b in raw_files:
         try:
-            ds = pydicom.dcmread(io.BytesIO(b), stop_before_pixels=stop_before_pixels, force=False)
+            try:
+                ds = pydicom.dcmread(io.BytesIO(b), stop_before_pixels=stop_before_pixels, force=False)
+            except Exception:
+                ds = fallback_dcmread(io.BytesIO(b), stop_before_pixels=stop_before_pixels, force=False)
             if "SOPClassUID" not in ds and "Modality" not in ds and "Rows" not in ds:
                 unreadable += 1
                 continue
             _strip_phi(ds)
+            object.__setattr__(ds, "_raw_bytes", b)
             readable.append(ds)
         except Exception:
             unreadable += 1
@@ -200,18 +211,20 @@ def inspect(raw_files: list[bytes], stop_before_pixels: bool = True) -> tuple[Se
             sbs = ds.get("SpacingBetweenSlices")
             if gfov is not None and isinstance(gfov, (list, tuple)) and len(gfov) == num_frames:
                 for f_idx, off in enumerate(gfov):
-                    f_ds = pydicom.dataset.FileDataset(None, dict(ds), file_meta=getattr(ds, "file_meta", None))
-                    f_ds["_frame_index"] = f_idx
+                    f_ds = copy.deepcopy(ds)
+                    object.__setattr__(f_ds, "_frame_index", f_idx)
+                    object.__setattr__(f_ds, "_raw_bytes", getattr(ds, "_raw_bytes", None))
                     f_ipp = base_ipp + float(off) * n
-                    f_ds["ImagePositionPatient"] = [float(f_ipp[0]), float(f_ipp[1]), float(f_ipp[2])]
+                    f_ds.ImagePositionPatient = [float(f_ipp[0]), float(f_ipp[1]), float(f_ipp[2])]
                     positioned.append((float(np.dot(f_ipp, n)), iop_arr, f_ds))
             elif sbs is not None and float(sbs) > 0:
                 step = float(sbs)
                 for f_idx in range(num_frames):
-                    f_ds = pydicom.dataset.FileDataset(None, dict(ds), file_meta=getattr(ds, "file_meta", None))
-                    f_ds["_frame_index"] = f_idx
+                    f_ds = copy.deepcopy(ds)
+                    object.__setattr__(f_ds, "_frame_index", f_idx)
+                    object.__setattr__(f_ds, "_raw_bytes", getattr(ds, "_raw_bytes", None))
                     f_ipp = base_ipp + (f_idx * step) * n
-                    f_ds["ImagePositionPatient"] = [float(f_ipp[0]), float(f_ipp[1]), float(f_ipp[2])]
+                    f_ds.ImagePositionPatient = [float(f_ipp[0]), float(f_ipp[1]), float(f_ipp[2])]
                     positioned.append((float(np.dot(f_ipp, n)), iop_arr, f_ds))
             else:
                 missing_geom += 1
@@ -284,7 +297,11 @@ def inspect(raw_files: list[bytes], stop_before_pixels: bool = True) -> tuple[Se
     dir_cosines = _direction_tuple(ref_iop)
     for_uid = str(ds0.get("FrameOfReferenceUID", "")).strip() or None
     pat_pos = str(ds0.get("PatientPosition", "")).strip() or None
-    ts_uid = str(getattr(ds0, "file_meta", {}).get("TransferSyntaxUID", "")).strip() or None
+    fmeta = getattr(ds0, "file_meta", None)
+    ts_raw = getattr(fmeta, "TransferSyntaxUID", None) if fmeta is not None else None
+    if ts_raw is None and isinstance(fmeta, dict):
+        ts_raw = fmeta.get("TransferSyntaxUID")
+    ts_uid = str(ts_raw or "").strip() or None
 
     report = SeriesReport(
         n_files=len(raw_files),
@@ -316,8 +333,16 @@ def stack_volume(raw_files: list[bytes]) -> tuple[np.ndarray, tuple[float, float
 
     planes = []
     for _, ds in ordered:
-        arr = ds.pixel_array.astype(np.float32)
-        f_idx = ds.get("_frame_index")
+        try:
+            arr = ds.pixel_array.astype(np.float32)
+        except Exception:
+            raw_b = getattr(ds, "_raw_bytes", None)
+            if raw_b is None:
+                raise
+            arr = fallback_dcmread(io.BytesIO(raw_b), stop_before_pixels=False).pixel_array.astype(np.float32)
+        f_idx = getattr(ds, "_frame_index", None)
+        if f_idx is None and isinstance(ds, dict):
+            f_idx = ds.get("_frame_index")
         if f_idx is not None and arr.ndim == 3:
             arr = arr[int(f_idx)]
         slope = float(getattr(ds, "RescaleSlope", 1.0) or 1.0)

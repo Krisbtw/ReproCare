@@ -8,9 +8,9 @@
 import {
   buildVoxelToPatientAffine4x4,
   type DirectionCosines9,
-   Vec3,
-  Volume,
-  VolumePatientGeometry,
+  type Vec3,
+  type Volume,
+  type VolumePatientGeometry,
 } from "./volume.ts";
 import type { DicomRead } from "../dicom/codec.ts";
 

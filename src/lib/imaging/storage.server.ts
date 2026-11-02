@@ -22,7 +22,7 @@
  * 8. Error messages and stored metadata never leak internal filesystem roots, credentials, or PHI.
  */
 import { createHash } from "node:crypto";
-import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { Sql } from "../db.ts";
 
@@ -449,21 +449,142 @@ function sanitizeFilename(raw: string): string {
   return base.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) || "artifact.bin";
 }
 
-async function writeAuditEvent(
+export interface DurableAuditOutboxEntry {
+  id: string;
+  userId: string;
+  action: string;
+  entityType: string;
+  entityId: string;
+  detail: string;
+  createdAt: string;
+  dbPersisted: boolean;
+  entrySha256: string;
+}
+
+/**
+ * Writes an audit event to PostgreSQL `audit_events` AND to a durable append-only server-side
+ * audit outbox (`<storageBase>/.audit/audit-outbox.jsonl`). If the database insert fails, the
+ * event is persisted to `<storageBase>/.audit/pending-outbox.jsonl` so critical security,
+ * consent, clinician-verification, and imaging-deletion audit events never silently disappear.
+ */
+export async function writeAuditEvent(
   sql: Sql,
   userId: string,
   action: string,
   entityType: string,
   entityId: string,
   detail: string,
-): Promise<void> {
+): Promise<DurableAuditOutboxEntry> {
+  const id = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+  const safeDetail = redactSensitiveMetadata({ detail }).detail as string;
+  const payloadForHash = JSON.stringify({ id, userId, action, entityType, entityId, detail: safeDetail, createdAt });
+  const entrySha256 = createHash("sha256").update(payloadForHash).digest("hex");
+
+  let dbPersisted = false;
   try {
     await sql`
       insert into audit_events (id, user_id, action, entity_type, entity_id, detail)
-      values (${crypto.randomUUID()}, ${userId}, ${action}, ${entityType}, ${entityId}, ${detail})
+      values (${id}, ${userId}, ${action}, ${entityType}, ${entityId}, ${safeDetail})
     `;
+    dbPersisted = true;
   } catch {
-    // Do not fail primary operation if audit table is unavailable in minimal unit mocks
+    dbPersisted = false;
+  }
+
+  const entry: DurableAuditOutboxEntry = {
+    id,
+    userId,
+    action,
+    entityType,
+    entityId,
+    detail: safeDetail,
+    createdAt,
+    dbPersisted,
+    entrySha256,
+  };
+
+  try {
+    const auditDir = resolve(getStorageBase(), ".audit");
+    await mkdir(auditDir, { recursive: true });
+    const line = JSON.stringify(entry) + "\n";
+    await appendFile(join(auditDir, "audit-outbox.jsonl"), line, "utf8");
+    if (!dbPersisted) {
+      await appendFile(join(auditDir, "pending-outbox.jsonl"), line, "utf8");
+    }
+  } catch {
+    // If both DB and local disk outbox fail on a critical security/deletion event, fail closed
+    if (!dbPersisted && /purge|delete|consent|verif|deidentify/i.test(action)) {
+      throw new Error("Audit persistence failure: unable to record critical security event to database or durable outbox.");
+    }
+  }
+
+  return entry;
+}
+
+/**
+ * Replays any pending durable audit outbox entries (`pending-outbox.jsonl`) into PostgreSQL
+ * `audit_events` after a transient database failure, clearing replayed entries once committed.
+ */
+export async function flushPendingAuditOutbox(
+  sql: Sql,
+): Promise<{ replayedCount: number; remainingCount: number }> {
+  const auditDir = resolve(getStorageBase(), ".audit");
+  const pendingPath = join(auditDir, "pending-outbox.jsonl");
+  let raw = "";
+  try {
+    raw = await readFile(pendingPath, "utf8");
+  } catch {
+    return { replayedCount: 0, remainingCount: 0 };
+  }
+
+  const lines = raw
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return { replayedCount: 0, remainingCount: 0 };
+  }
+
+  const remaining: string[] = [];
+  let replayedCount = 0;
+
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line) as DurableAuditOutboxEntry;
+      await sql`
+        insert into audit_events (id, user_id, action, entity_type, entity_id, detail)
+        values (${entry.id}, ${entry.userId}, ${entry.action}, ${entry.entityType}, ${entry.entityId}, ${entry.detail})
+        on conflict (id) do nothing
+      `;
+      replayedCount += 1;
+    } catch {
+      remaining.push(line);
+    }
+  }
+
+  await writeFile(
+    pendingPath,
+    remaining.length > 0 ? remaining.join("\n") + "\n" : "",
+    "utf8",
+  );
+  return { replayedCount, remainingCount: remaining.length };
+}
+
+/**
+ * Reads all durable audit outbox records stored in `<storageBase>/.audit/audit-outbox.jsonl`.
+ */
+export async function readDurableAuditOutbox(): Promise<DurableAuditOutboxEntry[]> {
+  const outboxPath = resolve(getStorageBase(), ".audit", "audit-outbox.jsonl");
+  try {
+    const raw = await readFile(outboxPath, "utf8");
+    return raw
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as DurableAuditOutboxEntry);
+  } catch {
+    return [];
   }
 }
 
@@ -1315,18 +1436,60 @@ export async function purgeImagingArtifact(
 
   const base = resolve(getStorageBase());
   const fullPath = resolve(base, record.storageUri);
-  if (fullPath.startsWith(base)) {
-    await unlink(fullPath).catch(() => undefined);
+  if (!fullPath.startsWith(base)) {
+    throw new Error("Security violation: invalid storage URI.");
   }
 
+  // Two-phase atomic purge: stage the binary file before updating DB status.
+  // If the DB status update fails, restore the staged file so binary storage and DB status never diverge.
+  const stagedPath = `${fullPath}.purging-${crypto.randomUUID().slice(0, 8)}`;
+  let fileWasStaged = false;
   try {
-    await sql`
+    await rename(fullPath, stagedPath);
+    fileWasStaged = true;
+  } catch {
+    fileWasStaged = false;
+  }
+
+  let dbUpdated = false;
+  try {
+    const updatedRows = await sql<{ id: string }>`
       update imaging_objects
       set status = 'purged', purged_at = now(), updated_at = now()
       where id = ${safeObjectId} and patient_id = ${record.patientId}
+      returning id
     `;
+    dbUpdated = updatedRows.length > 0;
   } catch {
-    // Fallback if migration 0011 columns are not present
+    try {
+      const fallbackRows = await sql<{ id: string }>`
+        update imaging_objects
+        set status = 'purged'
+        where id = ${safeObjectId} and patient_id = ${record.patientId}
+        returning id
+      `;
+      dbUpdated = fallbackRows.length > 0;
+    } catch (dbErr) {
+      if (fileWasStaged) {
+        await rename(stagedPath, fullPath).catch(() => undefined);
+      }
+      throw new Error(
+        `Atomic purge aborted: failed to update database status for imaging object ${safeObjectId}; binary file was preserved intact (${dbErr instanceof Error ? dbErr.message : "DB error"}).`,
+      );
+    }
+  }
+
+  if (!dbUpdated) {
+    if (fileWasStaged) {
+      await rename(stagedPath, fullPath).catch(() => undefined);
+    }
+    throw new Error(
+      `Atomic purge aborted: imaging object ${safeObjectId} status could not be updated in database; binary file was preserved intact.`,
+    );
+  }
+
+  if (fileWasStaged) {
+    await unlink(stagedPath).catch(() => undefined);
   }
 
   await writeAuditEvent(
@@ -1710,5 +1873,495 @@ export async function exportDeidentifiedDicomArtifact(
     sourceObjectId: loaded.record.id,
     derivedBase64: Buffer.from(derivedBytes).toString("base64"),
     clinicianReviewedBurnedInPixels: reviewed,
+  };
+}
+
+/**
+ * Workstream 4 — Production Storage Adapter Configuration, Backup, Actual Restoration,
+ * and Storage Consistency Monitoring.
+ */
+export interface StorageBackendConfig {
+  backend: "local_durable" | "s3_compatible";
+  storageBaseDir: string;
+  backupBaseDir: string;
+  s3Endpoint?: string | null;
+  s3Bucket?: string | null;
+  s3Region?: string | null;
+  credentialsServerSideOnly: true;
+  publicUrlsDisabled: true;
+}
+
+export function validateStorageBackendConfig(
+  env: Record<string, string | undefined> = process.env,
+): StorageBackendConfig {
+  const rawBackend = (env.REPROCARE_STORAGE_BACKEND || "local_durable").trim().toLowerCase();
+  const backend = rawBackend === "s3_compatible" ? "s3_compatible" : "local_durable";
+  const storageBaseDir = resolve(
+    env.REPROCARE_IMAGING_STORAGE_DIR || env.IMAGING_STORAGE_PATH || DEFAULT_STORAGE_PATH,
+  );
+  const backupBaseDir = resolve(
+    env.REPROCARE_IMAGING_BACKUP_DIR || join(storageBaseDir, "..", "imaging-backups"),
+  );
+
+  // Reject any configuration that attempts to expose public medical-image bucket URLs to the browser
+  if (
+    env.VITE_S3_SECRET_ACCESS_KEY ||
+    env.VITE_IMAGING_PUBLIC_BUCKET_URL ||
+    env.REPROCARE_ALLOW_PUBLIC_IMAGING_URLS === "true"
+  ) {
+    throw new Error(
+      "Security violation: storage credentials and medical-image URLs must remain strictly server-side and never be exposed publicly.",
+    );
+  }
+
+  if (backend === "s3_compatible") {
+    if (!env.REPROCARE_S3_BUCKET || !env.REPROCARE_S3_ACCESS_KEY_ID || !env.REPROCARE_S3_SECRET_ACCESS_KEY) {
+      throw new Error(
+        "Invalid S3-compatible storage configuration: REPROCARE_S3_BUCKET, REPROCARE_S3_ACCESS_KEY_ID, and REPROCARE_S3_SECRET_ACCESS_KEY are required on the server.",
+      );
+    }
+  }
+
+  return {
+    backend,
+    storageBaseDir,
+    backupBaseDir,
+    s3Endpoint: env.REPROCARE_S3_ENDPOINT || null,
+    s3Bucket: env.REPROCARE_S3_BUCKET || null,
+    s3Region: env.REPROCARE_S3_REGION || "ap-south-1",
+    credentialsServerSideOnly: true,
+    publicUrlsDisabled: true,
+  };
+}
+
+export interface ImagingBackupManifest {
+  backupId: string;
+  createdAt: string;
+  createdBy: string;
+  patientIdFilter: string | null;
+  objectCount: number;
+  totalBytes: number;
+  manifestSha256: string;
+  objects: Array<{
+    id: string;
+    patientId: string;
+    userId: string;
+    studyId: string | null;
+    seriesId: string | null;
+    findingVersionId: string | null;
+    sourceObjectId: string | null;
+    kind: string;
+    storageUri: string;
+    backupBlobRelativePath: string;
+    sha256: string;
+    bytes: number;
+    version: number;
+    mimeType: string | null;
+    originalFilename: string | null;
+    metadataJson: string;
+    status: string;
+    retentionUntil: string | null;
+  }>;
+  auditOutboxCount: number;
+}
+
+/**
+ * Creates a verified, checksum-manifested backup of active medical imaging artifacts
+ * (`manifest.json` + `blobs/*` + `audit-outbox.jsonl`).
+ */
+export async function createImagingStorageBackup(
+  sql: Sql,
+  userId: string,
+  options?: {
+    patientId?: string;
+    backupDir?: string;
+  },
+): Promise<{ backupDir: string; manifestPath: string; manifest: ImagingBackupManifest }> {
+  const { uid, role } = await verifyCallerIdentityAndProfile(sql, userId);
+  const patientIdFilter = options?.patientId ? validateSafeId(options.patientId, "patientId") : null;
+
+  if (patientIdFilter) {
+    await checkPatientAndClinicianAccess(sql, uid, patientIdFilter, false);
+  } else if (role !== "admin") {
+    throw new Error("Unauthorized: Full-system imaging backup requires administrator privileges or a specific authorized patientId.");
+  }
+
+  const base = resolve(getStorageBase());
+  const defaultBackupRoot =
+    process.env.REPROCARE_IMAGING_BACKUP_DIR || join(base, "..", "reprocare-backups");
+  const backupId = `bkp-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+  const targetBackupDir = resolve(options?.backupDir || join(defaultBackupRoot, backupId));
+  const blobsDir = join(targetBackupDir, "blobs");
+  await mkdir(blobsDir, { recursive: true });
+
+  const rows = patientIdFilter
+    ? await sql<Record<string, unknown>>`
+        select * from imaging_objects
+        where patient_id = ${patientIdFilter} and coalesce(status, 'active') = 'active'
+        order by created_at asc
+      `
+    : await sql<Record<string, unknown>>`
+        select * from imaging_objects
+        where coalesce(status, 'active') = 'active'
+        order by created_at asc
+      `;
+
+  const manifestObjects: ImagingBackupManifest["objects"] = [];
+  let totalBytes = 0;
+
+  for (const row of rows) {
+    const rec = mapArtifactRow(row);
+    const srcPath = resolve(base, rec.storageUri);
+    if (!srcPath.startsWith(base)) {
+      throw new Error(`Security violation: invalid storageUri during backup for object ${rec.id}.`);
+    }
+    const data = await readFile(srcPath);
+    const actualSha = createHash("sha256").update(data).digest("hex");
+    if (actualSha !== rec.sha256) {
+      throw new Error(
+        `Backup aborted: active imaging object ${rec.id} failed SHA-256 verification before backup.`,
+      );
+    }
+
+    const blobRel = `${rec.id}_${rec.sha256.slice(0, 16)}.bin`;
+    const dstPath = join(blobsDir, blobRel);
+    await writeFile(dstPath, data);
+
+    // Verify written backup blob checksum
+    const verifyData = await readFile(dstPath);
+    const verifySha = createHash("sha256").update(verifyData).digest("hex");
+    if (verifySha !== rec.sha256) {
+      throw new Error(`Backup verification failed for object ${rec.id}.`);
+    }
+
+    totalBytes += data.byteLength;
+    manifestObjects.push({
+      id: rec.id,
+      patientId: rec.patientId,
+      userId: rec.userId,
+      studyId: rec.studyId,
+      seriesId: rec.seriesId,
+      findingVersionId: rec.findingVersionId,
+      sourceObjectId: rec.sourceObjectId,
+      kind: rec.kind,
+      storageUri: rec.storageUri,
+      backupBlobRelativePath: `blobs/${blobRel}`,
+      sha256: rec.sha256,
+      bytes: rec.bytes,
+      version: rec.version,
+      mimeType: rec.mimeType,
+      originalFilename: rec.originalFilename,
+      metadataJson: JSON.stringify(rec.metadata ?? {}),
+      status: "active",
+      retentionUntil: rec.retentionUntil,
+    });
+  }
+
+  const outboxEntries = await readDurableAuditOutbox();
+  if (outboxEntries.length > 0) {
+    await writeFile(
+      join(targetBackupDir, "audit-outbox-backup.jsonl"),
+      outboxEntries.map((e) => JSON.stringify(e)).join("\n") + "\n",
+      "utf8",
+    );
+  }
+
+  const createdAt = new Date().toISOString();
+  const manifestCore = {
+    backupId,
+    createdAt,
+    createdBy: uid,
+    patientIdFilter,
+    objectCount: manifestObjects.length,
+    totalBytes,
+    objects: manifestObjects,
+    auditOutboxCount: outboxEntries.length,
+  };
+  const manifestSha256 = createHash("sha256").update(JSON.stringify(manifestCore)).digest("hex");
+  const manifest: ImagingBackupManifest = {
+    ...manifestCore,
+    manifestSha256,
+  };
+
+  const manifestPath = join(targetBackupDir, "manifest.json");
+  await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+  await writeAuditEvent(
+    sql,
+    uid,
+    "create_imaging_backup",
+    "imaging_backup",
+    backupId,
+    `Created verified imaging storage backup ${backupId} (${manifest.objectCount} objects, ${manifest.totalBytes} bytes, sha256 ${manifestSha256.slice(0, 12)}…).`,
+  );
+
+  return { backupDir: targetBackupDir, manifestPath, manifest };
+}
+
+/**
+ * Restores medical imaging binary artifacts and database metadata from a verified backup bundle,
+ * validating every restored binary file's SHA-256 checksum after restoration.
+ */
+export async function restoreImagingStorageBackup(
+  sql: Sql,
+  userId: string,
+  backupDir: string,
+): Promise<{
+  backupId: string;
+  restoredCount: number;
+  verifiedCount: number;
+  restoredObjectIds: string[];
+}> {
+  const { uid, role } = await verifyCallerIdentityAndProfile(sql, userId);
+  const resolvedBackupDir = resolve(backupDir);
+  const manifestPath = join(resolvedBackupDir, "manifest.json");
+
+  const rawManifest = await readFile(manifestPath, "utf8");
+  const manifest = JSON.parse(rawManifest) as ImagingBackupManifest;
+
+  const { manifestSha256, ...manifestCore } = manifest;
+  const expectedManifestSha = createHash("sha256").update(JSON.stringify(manifestCore)).digest("hex");
+  if (expectedManifestSha !== manifestSha256) {
+    throw new Error("Backup restoration aborted: backup manifest.json checksum verification failed.");
+  }
+
+  if (manifest.patientIdFilter) {
+    await checkPatientAndClinicianAccess(sql, uid, manifest.patientIdFilter, true);
+  } else if (role !== "admin") {
+    throw new Error("Unauthorized: Full-system backup restoration requires administrator privileges.");
+  }
+
+  const base = resolve(getStorageBase());
+  const restoredObjectIds: string[] = [];
+  let verifiedCount = 0;
+
+  for (const obj of manifest.objects) {
+    if (!manifest.patientIdFilter && role !== "admin") {
+      await checkPatientAndClinicianAccess(sql, uid, obj.patientId, true);
+    }
+    const backupBlobPath = resolve(resolvedBackupDir, obj.backupBlobRelativePath);
+    if (!backupBlobPath.startsWith(resolvedBackupDir)) {
+      throw new Error(`Security violation: invalid backup blob path for object ${obj.id}.`);
+    }
+
+    const blobBytes = await readFile(backupBlobPath);
+    const blobSha = createHash("sha256").update(blobBytes).digest("hex");
+    if (blobSha !== obj.sha256) {
+      throw new Error(
+        `Backup restoration aborted: backup blob for object ${obj.id} is corrupted (expected ${obj.sha256}, got ${blobSha}).`,
+      );
+    }
+
+    const dstPath = resolve(base, obj.storageUri);
+    if (!dstPath.startsWith(base)) {
+      throw new Error(`Security violation: invalid destination storageUri for object ${obj.id}.`);
+    }
+
+    await mkdir(dirname(dstPath), { recursive: true });
+    await writeFile(dstPath, blobBytes);
+
+    // Verify restored file on disk
+    const restoredDiskBytes = await readFile(dstPath);
+    const restoredDiskSha = createHash("sha256").update(restoredDiskBytes).digest("hex");
+    if (restoredDiskSha !== obj.sha256 || restoredDiskBytes.byteLength !== obj.bytes) {
+      throw new Error(`Restoration post-write verification failed for object ${obj.id}.`);
+    }
+    verifiedCount += 1;
+
+    // Ensure database row exists and is marked 'active'
+    const existingRows = await sql<{ id: string }>`
+      select id from imaging_objects where id = ${obj.id}
+    `;
+    if (existingRows.length > 0) {
+      try {
+        await sql`
+          update imaging_objects
+          set status = 'active', sha256 = ${obj.sha256}, bytes = ${obj.bytes}, updated_at = now()
+          where id = ${obj.id}
+        `;
+      } catch {
+        await sql`
+          update imaging_objects
+          set status = 'active', sha256 = ${obj.sha256}, bytes = ${obj.bytes}
+          where id = ${obj.id}
+        `;
+      }
+    } else {
+      const dbCompatKind =
+        obj.kind === "dicom" || obj.kind === "mask" || obj.kind === "mesh" || obj.kind === "volume"
+          ? obj.kind
+          : "volume";
+      try {
+        await sql`
+          insert into imaging_objects (
+            id, user_id, patient_id, study_id, series_id, finding_version_id, source_object_id,
+            kind, storage_uri, sha256, bytes, version, mime_type, original_filename,
+            metadata_json, status, created_by, retention_until
+          ) values (
+            ${obj.id}, ${obj.userId}, ${obj.patientId}, ${obj.studyId}, ${obj.seriesId},
+            ${obj.findingVersionId}, ${obj.sourceObjectId}, ${dbCompatKind}, ${obj.storageUri},
+            ${obj.sha256}, ${obj.bytes}, ${obj.version}, ${obj.mimeType}, ${obj.originalFilename},
+            ${obj.metadataJson}, 'active', ${uid}, ${obj.retentionUntil}
+          )
+        `;
+      } catch {
+        await sql`
+          insert into imaging_objects (
+            id, user_id, patient_id, series_id, kind, storage_uri, sha256, bytes, version, created_by, retention_until
+          ) values (
+            ${obj.id}, ${obj.userId}, ${obj.patientId}, ${obj.seriesId},
+            ${dbCompatKind}, ${obj.storageUri}, ${obj.sha256}, ${obj.bytes}, ${obj.version},
+            ${uid}, ${obj.retentionUntil}
+          )
+        `;
+      }
+    }
+
+    restoredObjectIds.push(obj.id);
+  }
+
+  await flushPendingAuditOutbox(sql);
+  await writeAuditEvent(
+    sql,
+    uid,
+    "restore_imaging_backup",
+    "imaging_backup",
+    manifest.backupId,
+    `Restored and verified ${restoredObjectIds.length} imaging object(s) from backup ${manifest.backupId}.`,
+  );
+
+  return {
+    backupId: manifest.backupId,
+    restoredCount: restoredObjectIds.length,
+    verifiedCount,
+    restoredObjectIds,
+  };
+}
+
+export interface StorageConsistencyReport {
+  checkedAt: string;
+  totalDbObjects: number;
+  healthyActiveCount: number;
+  purgedConsistentCount: number;
+  missingBlobObjectIds: string[];
+  corruptedBlobObjectIds: string[];
+  purgedWithLingeringFileObjectIds: string[];
+  repairedCount: number;
+  consistent: boolean;
+}
+
+/**
+ * Scans database `imaging_objects` rows against physical storage to detect and optionally
+ * reconcile missing blobs, checksum corruption, or lingering files on purged records.
+ */
+export async function reconcileImagingStorageConsistency(
+  sql: Sql,
+  userId: string,
+  options?: {
+    patientId?: string;
+    repairStatuses?: boolean;
+  },
+): Promise<StorageConsistencyReport> {
+  const { uid, role } = await verifyCallerIdentityAndProfile(sql, userId);
+  const patientIdFilter = options?.patientId ? validateSafeId(options.patientId, "patientId") : null;
+  if (patientIdFilter) {
+    await checkPatientAndClinicianAccess(sql, uid, patientIdFilter, Boolean(options?.repairStatuses));
+  } else if (role !== "admin") {
+    throw new Error("Unauthorized: System-wide storage consistency reconciliation requires administrator privileges or a specific patientId.");
+  }
+
+  const rows = patientIdFilter
+    ? await sql<Record<string, unknown>>`
+        select * from imaging_objects where patient_id = ${patientIdFilter} order by created_at asc
+      `
+    : await sql<Record<string, unknown>>`
+        select * from imaging_objects order by created_at asc
+      `;
+
+  const base = resolve(getStorageBase());
+  let healthyActiveCount = 0;
+  let purgedConsistentCount = 0;
+  let repairedCount = 0;
+  const missingBlobObjectIds: string[] = [];
+  const corruptedBlobObjectIds: string[] = [];
+  const purgedWithLingeringFileObjectIds: string[] = [];
+
+  for (const row of rows) {
+    const rec = mapArtifactRow(row);
+    const fullPath = resolve(base, rec.storageUri);
+    let fileExists = false;
+    let fileBytes: Buffer | null = null;
+    if (fullPath.startsWith(base)) {
+      try {
+        fileBytes = await readFile(fullPath);
+        fileExists = true;
+      } catch {
+        fileExists = false;
+      }
+    }
+
+    if (rec.status === "purged") {
+      if (fileExists) {
+        purgedWithLingeringFileObjectIds.push(rec.id);
+        if (options?.repairStatuses && fullPath.startsWith(base)) {
+          await unlink(fullPath).catch(() => undefined);
+          repairedCount += 1;
+        }
+      } else {
+        purgedConsistentCount += 1;
+      }
+      continue;
+    }
+
+    if (!fileExists || !fileBytes) {
+      missingBlobObjectIds.push(rec.id);
+      if (options?.repairStatuses) {
+        await sql`
+          update imaging_objects set status = 'missing' where id = ${rec.id}
+        `.catch(() => undefined);
+        repairedCount += 1;
+      }
+      continue;
+    }
+
+    const actualSha = createHash("sha256").update(fileBytes).digest("hex");
+    if (actualSha !== rec.sha256 || fileBytes.byteLength !== rec.bytes) {
+      corruptedBlobObjectIds.push(rec.id);
+      if (options?.repairStatuses) {
+        await sql`
+          update imaging_objects set status = 'corrupted' where id = ${rec.id}
+        `.catch(() => undefined);
+        repairedCount += 1;
+      }
+      continue;
+    }
+
+    healthyActiveCount += 1;
+  }
+
+  const consistent =
+    missingBlobObjectIds.length === 0 &&
+    corruptedBlobObjectIds.length === 0 &&
+    purgedWithLingeringFileObjectIds.length === 0;
+
+  await writeAuditEvent(
+    sql,
+    uid,
+    "reconcile_imaging_storage",
+    "imaging_storage",
+    patientIdFilter ?? "system",
+    `Storage consistency check complete: ${healthyActiveCount} healthy active, ${purgedConsistentCount} purged, ${missingBlobObjectIds.length} missing, ${corruptedBlobObjectIds.length} corrupted, ${purgedWithLingeringFileObjectIds.length} lingering purged files (repaired: ${repairedCount}).`,
+  );
+
+  return {
+    checkedAt: new Date().toISOString(),
+    totalDbObjects: rows.length,
+    healthyActiveCount,
+    purgedConsistentCount,
+    missingBlobObjectIds,
+    corruptedBlobObjectIds,
+    purgedWithLingeringFileObjectIds,
+    repairedCount,
+    consistent,
   };
 }

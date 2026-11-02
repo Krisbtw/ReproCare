@@ -321,6 +321,10 @@ export function attributeLongitudinalChange(input: {
   currentMethod?: string | null;
   priorModality?: string | null;
   currentModality?: string | null;
+  priorScanner?: string | null;
+  currentScanner?: string | null;
+  priorFieldStrengthT?: number | null;
+  currentFieldStrengthT?: number | null;
   registrationQualityScore?: number | null;
   registrationResidualMm?: number | null;
   registrationDegraded?: boolean;
@@ -429,6 +433,27 @@ export function attributeLongitudinalChange(input: {
       alert: deltaRatio >= 0.2,
       confidence: "moderate",
       explanation: `Measurements were produced by different segmentation methods ('${input.priorMethod}' vs '${input.currentMethod}'); boundary definition differences may account for part of the ${deltaPercent.toFixed(1)}% volume change.`,
+      factors,
+      volumeDeltaMm3: deltaMm3,
+      volumeDeltaPercent: deltaPercent,
+      combinedUncertaintyMm3,
+    };
+  }
+
+  if (
+    (input.priorScanner && input.currentScanner && input.priorScanner.trim().toLowerCase() !== input.currentScanner.trim().toLowerCase()) ||
+    (input.priorFieldStrengthT != null && input.currentFieldStrengthT != null && Math.abs(input.priorFieldStrengthT - input.currentFieldStrengthT) >= 0.25)
+  ) {
+    const scanDesc =
+      input.priorFieldStrengthT != null && input.currentFieldStrengthT != null && Math.abs(input.priorFieldStrengthT - input.currentFieldStrengthT) >= 0.25
+        ? `${input.priorFieldStrengthT}T->${input.currentFieldStrengthT}T`
+        : `${input.priorScanner}->${input.currentScanner}`;
+    factors.push(`scanner_difference(${scanDesc})`);
+    return {
+      category: "scanner_difference",
+      alert: deltaRatio >= 0.2,
+      confidence: "moderate",
+      explanation: `Examinations were acquired on different MRI scanners or field strengths (${scanDesc}); tissue contrast and gradient linearity differences may contribute to the ${deltaPercent.toFixed(1)}% volume difference.`,
       factors,
       volumeDeltaMm3: deltaMm3,
       volumeDeltaPercent: deltaPercent,
