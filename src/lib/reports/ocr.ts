@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
  * and runs local `/usr/bin/tesseract` OCR when available.
  * Never claims handwriting recognition (`handwritingSupported: false`).
  */
-export interface OcrRuntimeCapabilities {
+<export interface OcrRuntimeCapabilities {
   tesseractInstalled: boolean;
   tesseractVersion: string | null;
   englishTrainedDataAvailable: boolean;
