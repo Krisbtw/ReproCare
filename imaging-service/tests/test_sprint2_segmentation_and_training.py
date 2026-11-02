@@ -474,3 +474,39 @@ def test_model_lifecycle_non_overwrite_per_patient_failure_analysis_and_rollback
     reg_after = json.loads(reg_path.read_text(encoding="utf-8"))
     assert reg_after["active_checkpoint"]["model_version"] == "1.0.0-exp"
     assert len(reg_after["rollback_events"]) == 1
+
+
+def test_sprint6_gradient_verification_and_no_silent_numpy_fallback(tmp_path: Path):
+    """Sprint 6 Task 1A: Verify all 50 trainable parameter tensors receive gradients and update,
+    and that run_training_pipeline refuses silent NumPy fallback when allow_numpy_fallback=False.
+    """
+    from train_umd import verify_parameter_gradients_and_optimizer_updates
+
+    # 1. Refuses silent fallback when PyTorch is not installed and allow_numpy_fallback=False
+    if not unet.HAS_TORCH:
+        with pytest.raises(RuntimeError, match="Refusing to silently fall back"):
+            run_training_pipeline(
+                data_dir=tmp_path / "no_silent_fallback",
+                output_checkpoint=tmp_path / "ckpt.pt",
+                epochs=1,
+                synthetic=True,
+                allow_numpy_fallback=False,
+            )
+
+    # 2. All 50 trainable parameter tensors across all encoder/decoder blocks receive gradients and update
+    grad_report = verify_parameter_gradients_and_optimizer_updates(
+        in_channels=1,
+        out_channels=5,
+        base_channels=4,
+        lr=1e-2,
+        seed=42,
+        allow_numpy_fallback=True,
+    )
+    assert grad_report["all_parameters_differentiable_and_updated"] is True
+    assert grad_report["total_trainable_parameter_tensors"] == 50
+    assert grad_report["parameters_with_nonzero_gradients"] == 50
+    assert grad_report["updated_parameters_count"] == 50
+    assert grad_report["missing_gradients"] == []
+    assert grad_report["zero_gradients"] == []
+    assert grad_report["unchanged_parameters"] == []
+    assert grad_report["loss_decreased"] is True

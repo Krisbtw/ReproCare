@@ -24,15 +24,38 @@ import numpy as np
 
 ExplicitVRLittleEndian = "1.2.840.10008.1.2.1"
 ImplicitVRLittleEndian = "1.2.840.10008.1.2"
+ExplicitVRBigEndian = "1.2.840.10008.1.2.2"
 DeflatedExplicitVRLittleEndian = "1.2.840.10008.1.2.1.99"
 RLELossless = "1.2.840.10008.1.2.5"
+JPEGBaseline8Bit = "1.2.840.10008.1.2.4.50"
+JPEGLosslessP14 = "1.2.840.10008.1.2.4.57"
+JPEGLosslessSV1 = "1.2.840.10008.1.2.4.70"
+JPEG2000Lossless = "1.2.840.10008.1.2.4.90"
+JPEG2000 = "1.2.840.10008.1.2.4.91"
 MRImageStorage = "1.2.840.10008.5.1.4.1.1.4"
+
+SUPPORTED_COMPRESSED_SYNTAXES = {
+    RLELossless,
+    JPEGBaseline8Bit,
+    JPEGLosslessP14,
+    JPEGLosslessSV1,
+    JPEG2000Lossless,
+    JPEG2000,
+}
 
 TAG_TO_KEYWORD: dict[tuple[int, int], tuple[str, str]] = {
     (0x0002, 0x0002): ("MediaStorageSOPClassUID", "UI"),
     (0x0002, 0x0003): ("MediaStorageSOPInstanceUID", "UI"),
     (0x0002, 0x0010): ("TransferSyntaxUID", "UI"),
     (0x0008, 0x0016): ("SOPClassUID", "UI"),
+    (0x0008, 0x0008): ("ImageType", "CS"),
+    (0x0018, 0x1000): ("DeviceSerialNumber", "LO"),
+    (0x0018, 0x1030): ("ProtocolName", "LO"),
+    (0x0020, 0x4000): ("ImageComments", "LT"),
+    (0x0028, 0x0301): ("BurnedInAnnotation", "CS"),
+    (0x0028, 0x0302): ("RecognizableVisualFeatures", "CS"),
+    (0x5200, 0x9229): ("SharedFunctionalGroupsSequence", "SQ"),
+    (0x5200, 0x9230): ("PerFrameFunctionalGroupsSequence", "SQ"),
     (0x0008, 0x0018): ("SOPInstanceUID", "UI"),
     (0x0008, 0x0020): ("StudyDate", "DA"),
     (0x0008, 0x0030): ("StudyTime", "TM"),
@@ -195,6 +218,14 @@ class FileDataset(dict):
             return super().get(kw, default)
         return super().get(key, default)
 
+    def remove_private_tags(self) -> list[str]:
+        removed: list[str] = []
+        for k in list(self.keys()):
+            if isinstance(k, tuple) and len(k) == 2 and (k[0] % 2 == 1) and k[0] > 0x0007 and k[0] != 0x7FE0:
+                removed.append(f"{k[0]:04x},{k[1]:04x}")
+                del self[k]
+        return sorted(set(removed))
+
     @property
     def pixel_array(self) -> np.ndarray:
         raw = self.get("PixelData")
@@ -229,6 +260,25 @@ class FileDataset(dict):
                     for frag in raw[:num_frames]
                 ]
                 raw = b"".join(decoded_frames)
+            elif ts_uid in (JPEGBaseline8Bit, JPEGLosslessP14, JPEGLosslessSV1, JPEG2000Lossless, JPEG2000):
+                if len(raw) < num_frames:
+                    raise ValueError(f"Compressed fragments ({len(raw)}) fewer than NumberOfFrames ({num_frames})")
+                from PIL import Image
+                decoded_arrays = []
+                for frag in raw[:num_frames]:
+                    try:
+                        with Image.open(io.BytesIO(frag)) as im:
+                            frame_arr = np.asarray(im)
+                            if frame_arr.ndim == 3:
+                                frame_arr = frame_arr[:, :, 0]
+                            if frame_arr.shape != (rows, cols):
+                                raise ValueError(f"Decoded compressed frame shape {frame_arr.shape} != expected {(rows, cols)}")
+                            decoded_arrays.append(frame_arr.astype(dtype))
+                    except Exception as e:
+                        raise ValueError(f"Corrupted or unreadable compressed DICOM frame for syntax {ts_uid}: {e}") from e
+                if num_frames > 1:
+                    return np.stack(decoded_arrays, axis=0)
+                return decoded_arrays[0]
             else:
                 raise ValueError(f"Unsupported compressed transfer syntax '{ts_uid}' for pixel decoding")
 
@@ -246,6 +296,16 @@ def _encode_element(group: int, elem: int, vr: str, val: Any, implicit: bool = F
         payload = struct.pack("<H", int(val))
     elif vr == "SS":
         payload = struct.pack("<h", int(val))
+    elif vr in ("OB", "OW", "UN") and isinstance(val, list):
+        # Encapsulated PixelData fragments: Basic Offset Table (empty item) + fragment items + Sequence Delimitation Item
+        items = [struct.pack("<HHI", 0xFFFE, 0xE000, 0)]
+        for frag in val:
+            fb = bytes(frag)
+            if len(fb) % 2 == 1:
+                fb += b"\x00"
+            items.append(struct.pack("<HHI", 0xFFFE, 0xE000, len(fb)) + fb)
+        items.append(struct.pack("<HHI", 0xFFFE, 0xE0DD, 0))
+        return struct.pack("<HH2sHI", group, elem, b"OB", 0, 0xFFFFFFFF) + b"".join(items)
     elif vr in ("OB", "OW", "UN"):
         payload = bytes(val)
         if len(payload) % 2 == 1:
@@ -621,3 +681,90 @@ def register_torch_pickle_guard_fallback() -> None:
         mod.save = _save  # type: ignore[attr-defined]
         mod.load = _load  # type: ignore[attr-defined]
         sys.modules.setdefault("torch", mod)
+
+
+def encode_rle_lossless_frame(raw_frame: bytes, bytes_per_pixel: int = 1) -> bytes:
+    """Encode a single frame into NEMA PS3.5 Annex G RLE Lossless format."""
+    n_pixels = len(raw_frame) // bytes_per_pixel
+    segments: list[bytes] = []
+    for s in range(bytes_per_pixel):
+        offset = bytes_per_pixel - 1 - s
+        plane = bytes(raw_frame[i * bytes_per_pixel + offset] for i in range(n_pixels))
+        # PackBits literal encoding in 128-byte chunks
+        out = bytearray()
+        idx = 0
+        while idx < len(plane):
+            chunk = plane[idx : idx + 128]
+            out.append(len(chunk) - 1)
+            out.extend(chunk)
+            idx += len(chunk)
+        if len(out) % 2 == 1:
+            out.append(0x80)
+        segments.append(bytes(out))
+
+    offsets = [0] * 15
+    curr = 64
+    for i, seg in enumerate(segments):
+        offsets[i] = curr
+        curr += len(seg)
+    header = struct.pack("<16I", bytes_per_pixel, *offsets)
+    return header + b"".join(segments)
+
+
+def build_compressed_dicom_bytes(
+    arr_2d: np.ndarray,
+    transfer_syntax_uid: str = JPEGBaseline8Bit,
+    origin_lps_mm: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    pixel_spacing_mm: tuple[float, float] = (1.0, 1.0),
+    slice_thickness_mm: float = 3.0,
+) -> bytes:
+    """Build a genuine encapsulated compressed DICOM Part-10 file using Pillow (libjpeg / openjpeg) or RLE Lossless."""
+    from PIL import Image
+
+    arr_u8 = np.asarray(arr_2d, dtype=np.uint8)
+    rows, cols = arr_u8.shape
+    if transfer_syntax_uid in (JPEGBaseline8Bit, JPEGLosslessP14, JPEGLosslessSV1):
+        buf = io.BytesIO()
+        Image.fromarray(arr_u8, mode="L").save(buf, format="JPEG", quality=100, subsampling=0)
+        frag = buf.getvalue()
+    elif transfer_syntax_uid in (JPEG2000Lossless, JPEG2000):
+        buf = io.BytesIO()
+        Image.fromarray(arr_u8, mode="L").save(
+            buf,
+            format="JPEG2000",
+            irreversible=(transfer_syntax_uid == JPEG2000),
+        )
+        frag = buf.getvalue()
+    elif transfer_syntax_uid == RLELossless:
+        frag = encode_rle_lossless_frame(arr_u8.tobytes(), bytes_per_pixel=1)
+    else:
+        raise ValueError(f"Unsupported compressed syntax for builder: {transfer_syntax_uid}")
+
+    meta = FileMetaDataset()
+    meta.MediaStorageSOPClassUID = MRImageStorage
+    meta.MediaStorageSOPInstanceUID = generate_uid()
+    meta.TransferSyntaxUID = transfer_syntax_uid
+
+    ds = FileDataset(file_meta=meta)
+    ds.SOPClassUID = MRImageStorage
+    ds.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
+    ds.StudyInstanceUID = "1.2.826.0.1.3680043.8.498.100"
+    ds.SeriesInstanceUID = "1.2.826.0.1.3680043.8.498.200"
+    ds.Modality = "MR"
+    ds.Rows = rows
+    ds.Columns = cols
+    ds.BitsAllocated = 8
+    ds.BitsStored = 8
+    ds.HighBit = 7
+    ds.PixelRepresentation = 0
+    ds.SamplesPerPixel = 1
+    ds.PhotometricInterpretation = "MONOCHROME2"
+    ds.PixelSpacing = [float(pixel_spacing_mm[0]), float(pixel_spacing_mm[1])]
+    ds.SliceThickness = float(slice_thickness_mm)
+    ds.ImagePositionPatient = [float(origin_lps_mm[0]), float(origin_lps_mm[1]), float(origin_lps_mm[2])]
+    ds.ImageOrientationPatient = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    ds.PixelData = [frag]
+
+    out = io.BytesIO()
+    dcmwrite(out, ds)
+    return out.getvalue()

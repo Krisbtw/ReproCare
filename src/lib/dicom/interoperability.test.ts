@@ -325,3 +325,331 @@ test("Sprint 5 Task 1D & 1E: End-to-end DICOM LPS patient-space geometry preserv
   assert.equal(objValidation.format, "obj");
   assert.ok(objValidation.maxCoordinateErrorMm <= 1e-2);
 });
+
+import {
+  deidentifyDicomBytes,
+  detectBurnedInAnnotationRisk,
+  remapDicomUid,
+  shiftDicomDate,
+} from "./deidentify.ts";
+import { concat, element, u16, u32 } from "./codec.ts";
+import { applyAffine4x4, buildVoxelToPatientAffine4x4, voxelToPatientLps } from "../imaging/volume.ts";
+
+test("Sprint 6 Task 2B & 2D: Multi-frame PerFrameFunctionalGroupsSequence validation (inconsistent frame orientation/spacing rejection) and 4x4 patient-space affine consistency", async () => {
+  // 1. Multi-frame DICOM with consistent PerFrameFunctionalGroupsSequence positions
+  const consistentMf = buildSyntheticMultiFrameDicom({
+    numberOfFrames: 4,
+    rows: 16,
+    cols: 16,
+    originMm: [10, 20, 30],
+    orientation: [1, 0, 0, 0, 1, 0],
+    perFramePositionsMm: [
+      [10, 20, 30],
+      [10, 20, 33],
+      [10, 20, 36],
+      [10, 20, 39],
+    ],
+    perFrameOrientations: [
+      [1, 0, 0, 0, 1, 0],
+      [1, 0, 0, 0, 1, 0],
+      [1, 0, 0, 0, 1, 0],
+      [1, 0, 0, 0, 1, 0],
+    ],
+    perFramePixelSpacings: [
+      [1.2, 1.2],
+      [1.2, 1.2],
+      [1.2, 1.2],
+      [1.2, 1.2],
+    ],
+  });
+  const parsedConsistent = await readDicomBytes(consistentMf);
+  assert.equal(parsedConsistent.multiFrameVolumetricReady, true);
+  assert.equal(parsedConsistent.perFrameMetadata?.length, 4);
+
+  const expandedConsistent = expandMultiFrameDicomToSeries("mf-fg-ok", parsedConsistent);
+  const reportOk = analyzeSeries(expandedConsistent.slices);
+  assert.equal(reportOk.volumeReady, true);
+  const volOk = buildVolume(reportOk, expandedConsistent.pixelsById);
+  assert.ok(volOk.geometry?.affine4x4, "Volume geometry includes 4x4 patient-space affine matrix");
+
+  // Verify 4x4 affine maps voxel (5, 7, 2) to exact same DICOM LPS coordinate as origin + steps
+  const ptViaAffine = applyAffine4x4(volOk.geometry!.affine4x4!, [5, 7, 2]);
+  const ptViaHelper = voxelToPatientLps([5, 7, 2], volOk.spacingMm, volOk.geometry);
+  assert.deepEqual(ptViaAffine, [10 + 5 * 1.2, 20 + 7 * 1.2, 30 + 2 * 3.0]);
+  assert.deepEqual(ptViaHelper, ptViaAffine);
+
+  // 2. Multi-frame DICOM where frame 2 has conflicting orientation in PerFrameFunctionalGroupsSequence -> MUST be rejected!
+  const mixedOriMf = buildSyntheticMultiFrameDicom({
+    numberOfFrames: 3,
+    rows: 16,
+    cols: 16,
+    originMm: [0, 0, 0],
+    perFramePositionsMm: [
+      [0, 0, 0],
+      [0, 0, 3],
+      [0, 0, 6],
+    ],
+    perFrameOrientations: [
+      [1, 0, 0, 0, 1, 0],
+      [0, 1, 0, 0, 0, 1], // rotated sagittal frame mixed into axial frames!
+      [1, 0, 0, 0, 1, 0],
+    ],
+  });
+  const parsedMixedOri = await readDicomBytes(mixedOriMf);
+  assert.equal(parsedMixedOri.multiFrameVolumetricReady, false);
+  const expandedMixedOri = expandMultiFrameDicomToSeries("mf-fg-bad", parsedMixedOri);
+  const reportBad = analyzeSeries(expandedMixedOri.slices);
+  assert.equal(reportBad.volumeReady, false);
+  assert.ok(reportBad.issues.some((i) => i.code === "mixed_orientation"));
+});
+
+test("Sprint 6 Task 2E & 2F: DICOM PS3.15 de-identification (standard tags, odd-group private tags, nested SQ sequences, UID remapping, burned-in pixel detection, and original preservation)", async () => {
+  // Build a DICOM slice containing standard PHI, odd-group private tags (0009,0010 & 0009,1001),
+  // a nested sequence (0008,1140 ReferencedImageSequence with nested 0008,1155 ReferencedSOPInstanceUID and private tag),
+  // and a bright high-contrast burned-in text pattern in the top border rows!
+  const rows = 24;
+  const cols = 24;
+  const pixels = new Uint8Array(rows * cols).fill(20);
+  // Burn alternating high-contrast glyph strokes (240 vs 20) into top border rows 1..2
+  for (let r = 1; r <= 2; r++) {
+    for (let c = 2; c < cols - 2; c++) {
+      pixels[r * cols + c] = c % 2 === 0 ? 245 : 20;
+    }
+  }
+
+  const sopClass = "1.2.840.10008.5.1.4.1.1.4";
+  const origSopUid = "1.2.826.0.1.3680043.10.543.9001";
+  const origStudyUid = "1.2.826.0.1.3680043.10.543.9002";
+  const origSeriesUid = "1.2.826.0.1.3680043.10.543.9003";
+  const origFrameUid = "1.2.826.0.1.3680043.10.543.9004";
+  const origRefSopUid = "1.2.826.0.1.3680043.10.543.8888";
+
+  const metaBody = concat([
+    element(0x0002, 0x0001, "OB", Uint8Array.from([0, 1])),
+    element(0x0002, 0x0002, "UI", sopClass),
+    element(0x0002, 0x0003, "UI", origSopUid),
+    element(0x0002, 0x0010, "UI", "1.2.840.10008.1.2.1"),
+  ]);
+  const preamble = new Uint8Array(132);
+  preamble.set(new TextEncoder().encode("DICM"), 128);
+
+  // Nested SQ item inside ReferencedImageSequence (0008,1140) containing ReferencedSOPInstanceUID (0008,1155),
+  // ReferringPhysicianName (0008,0090), and a nested private tag (0009,1099)
+  const sqItemContent = concat([
+    element(0x0008, 0x0090, "PN", "DR^NESTED^SECRET"),
+    element(0x0008, 0x1155, "UI", origRefSopUid),
+    element(0x0009, 0x1099, "LO", "NESTED_VENDOR_PRIVATE_PHI"),
+  ]);
+  const sqItem = concat([u16(0xfffe), u16(0xe000), u32(sqItemContent.length), sqItemContent]);
+  const sqElem = concat([
+    u16(0x0008),
+    u16(0x1140),
+    new TextEncoder().encode("SQ"),
+    u16(0),
+    u32(sqItem.length),
+    sqItem,
+  ]);
+
+  const rawWithPhi = concat([
+    preamble,
+    element(0x0002, 0x0000, "UL", u32(metaBody.length)),
+    metaBody,
+    element(0x0008, 0x0016, "UI", sopClass),
+    element(0x0008, 0x0018, "UI", origSopUid),
+    element(0x0008, 0x0020, "DA", "20250615"),
+    element(0x0008, 0x0030, "TM", "142310.000000"),
+    element(0x0008, 0x0050, "SH", "ACC-SECRET-99"),
+    element(0x0008, 0x0060, "CS", "MR"),
+    element(0x0008, 0x0080, "LO", "PUNE METRO HOSPITAL"),
+    element(0x0008, 0x0090, "PN", "DR^SHARMA^PRIYA"),
+    sqElem,
+    element(0x0009, 0x0010, "LO", "VENDOR_PRIVATE_CREATOR"),
+    element(0x0009, 0x1001, "LO", "PRIVATE_PATIENT_MRN_778899"),
+    element(0x0010, 0x0010, "PN", "PATEL^MEERA"),
+    element(0x0010, 0x0020, "LO", "MRN-554433"),
+    element(0x0010, 0x0030, "DA", "19890412"),
+    element(0x0010, 0x1040, "LO", "12 MG ROAD PUNE"),
+    element(0x0018, 0x0050, "DS", "3.0"),
+    element(0x0018, 0x1000, "LO", "SN-scanner-9988"),
+    element(0x0018, 0x5100, "CS", "HFS"),
+    element(0x0020, 0x000d, "UI", origStudyUid),
+    element(0x0020, 0x000e, "UI", origSeriesUid),
+    element(0x0020, 0x0010, "SH", "STUDY-SECRET-1"),
+    element(0x0020, 0x0013, "IS", "1"),
+    element(0x0020, 0x0032, "DS", "-25.5\\-40.0\\18.25"),
+    element(0x0020, 0x0037, "DS", "1\\0\\0\\0\\1\\0"),
+    element(0x0020, 0x0052, "UI", origFrameUid),
+    element(0x0028, 0x0002, "US", u16(1)),
+    element(0x0028, 0x0004, "CS", "MONOCHROME2"),
+    element(0x0028, 0x0010, "US", u16(rows)),
+    element(0x0028, 0x0011, "US", u16(cols)),
+    element(0x0028, 0x0030, "DS", "1.25\\1.25"),
+    element(0x0028, 0x0100, "US", u16(8)),
+    element(0x0028, 0x0101, "US", u16(8)),
+    element(0x0028, 0x0102, "US", u16(7)),
+    element(0x0028, 0x0103, "US", u16(0)),
+    element(0x7fe0, 0x0010, "OB", pixels),
+  ]);
+
+  const snapshotBefore = Uint8Array.from(rawWithPhi);
+  const deid = deidentifyDicomBytes(rawWithPhi, {
+    uidSalt: "test-salt-sprint6",
+    dateShiftDays: -365,
+    patientIdReplacement: "ANON-PT-001",
+  });
+
+  // 1. Original buffer is untouched
+  assert.equal(deid.originalPreserved, true);
+  assert.deepEqual(rawWithPhi, snapshotBefore);
+  assert.notEqual(deid.derivedSha256, deid.originalSha256);
+
+  // 2. Private tags (0009,0010, 0009,1001, and nested 0009,1099) are completely removed
+  assert.ok(deid.privateTagsRemoved.includes("0009,0010"));
+  assert.ok(deid.privateTagsRemoved.includes("0009,1001"));
+  assert.ok(deid.privateTagsRemoved.includes("0009,1099"));
+
+  // 3. Nested sequence tags (0008,0090 and 0008,1155) were scrubbed/remapped
+  assert.ok(deid.nestedSequenceTagsScrubbed.includes("0008,0090"));
+  assert.ok(deid.nestedSequenceTagsScrubbed.includes("0008,1155"));
+
+  // 4. None of the secret strings appear anywhere in the derived binary buffer
+  const derivedText = new TextDecoder().decode(deid.derivedBytes);
+  for (const secret of [
+    "PATEL^MEERA",
+    "MRN-554433",
+    "19890412",
+    "12 MG ROAD PUNE",
+    "PUNE METRO HOSPITAL",
+    "DR^SHARMA^PRIYA",
+    "ACC-SECRET-99",
+    "SN-scanner-9988",
+    "PRIVATE_PATIENT_MRN_778899",
+    "NESTED_VENDOR_PRIVATE_PHI",
+    "DR^NESTED^SECRET",
+    origSopUid,
+    origStudyUid,
+    origSeriesUid,
+    origRefSopUid,
+  ]) {
+    assert.equal(
+      derivedText.includes(secret),
+      false,
+      `Derived DICOM must not contain '${secret}'`,
+    );
+  }
+
+  // 5. Consistent UID remapping: remapping the same StudyInstanceUID produces the exact same 2.25.* UID
+  assert.equal(
+    deid.uidRemappingTable[origStudyUid],
+    remapDicomUid(origStudyUid, "test-salt-sprint6"),
+  );
+  assert.equal(
+    deid.uidRemappingTable[origRefSopUid],
+    remapDicomUid(origRefSopUid, "test-salt-sprint6"),
+  );
+  assert.match(deid.uidRemappingTable[origStudyUid], /^2\.25\.\d+$/);
+
+  // 6. Patient-space geometry is preserved identically in the derived DICOM
+  assert.deepEqual(deid.geometryPreserved.imagePositionPatient, [-25.5, -40.0, 18.25]);
+  assert.deepEqual(deid.geometryPreserved.imageOrientationPatient, [1, 0, 0, 0, 1, 0]);
+  assert.deepEqual(deid.geometryPreserved.pixelSpacingMm, [1.25, 1.25]);
+  assert.equal(deid.geometryPreserved.sliceThicknessMm, 3.0);
+  assert.equal(deid.geometryPreserved.patientPosition, "HFS");
+
+  const parsedDerived = await readDicomBytes(deid.derivedBytes);
+  assert.equal(parsedDerived.decodeStatus, "ok");
+  assert.equal(parsedDerived.rows, 24);
+  assert.equal(parsedDerived.cols, 24);
+  assert.equal(parsedDerived.metadata["Study date"], shiftDicomDate("20250615", -365));
+
+  // 7. Burned-in pixel annotation detector catches the top-border glyph strokes and requires manual review!
+  assert.equal(deid.burnedInReport.burnedInAnnotationDetected, true);
+  assert.equal(deid.burnedInReport.riskLevel, "high");
+  assert.equal(deid.manualReviewRequired, true);
+  assert.equal(
+    deid.anonymisationStatus,
+    "metadata_deidentified_manual_pixel_review_required",
+  );
+});
+
+import { spawnSync } from "node:child_process";
+
+test("Sprint 6 Task 2A & 2G: Real Pillow (libjpeg & OpenJPEG) standard JPEG / JPEG 2000 codestreams and real DICOM Part-10 file decoding", async () => {
+  // Generate genuine standard ITU-T T.81 JPEG and ISO/IEC 15444-1 JPEG 2000 Lossless codestreams via Pillow
+  const pyGen = spawnSync(
+    "python3",
+    [
+      "-c",
+      "import io, json, base64, numpy as np; from PIL import Image; " +
+      "arr = np.zeros((16, 16), dtype=np.uint8); arr[4:12, 4:12] = 180; " +
+      "im = Image.fromarray(arr, mode='L'); " +
+      "b_jpg = io.BytesIO(); im.save(b_jpg, format='JPEG', quality=100); " +
+      "b_j2k = io.BytesIO(); im.save(b_j2k, format='JPEG2000', irreversible=False); " +
+      "print(json.dumps({'jpg': base64.b64encode(b_jpg.getvalue()).decode(), 'j2k': base64.b64encode(b_j2k.getvalue()).decode()}))",
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(pyGen.status, 0);
+  const streams = JSON.parse(pyGen.stdout.trim()) as { jpg: string; j2k: string };
+  const realJpgStream = new Uint8Array(Buffer.from(streams.jpg, "base64"));
+  const realJ2kStream = new Uint8Array(Buffer.from(streams.j2k, "base64"));
+
+  // Wrap the real ITU-T T.81 JPEG and ISO/IEC 15444-1 JPEG 2000 codestreams in encapsulated DICOM Part-10 objects
+  const sopClass = "1.2.840.10008.5.1.4.1.1.4";
+  for (const [syntax, codestream] of [
+    ["1.2.840.10008.1.2.4.50", realJpgStream],
+    ["1.2.840.10008.1.2.4.90", realJ2kStream],
+  ] as const) {
+    const metaBody = concat([
+      element(0x0002, 0x0001, "OB", Uint8Array.from([0, 1])),
+      element(0x0002, 0x0002, "UI", sopClass),
+      element(0x0002, 0x0003, "UI", "1.2.826.0.1.3680043.10.543.501"),
+      element(0x0002, 0x0010, "UI", syntax),
+    ]);
+    const preamble = new Uint8Array(132);
+    preamble.set(new TextEncoder().encode("DICM"), 128);
+    const botItem = concat([u16(0xfffe), u16(0xe000), u32(0)]);
+    const paddedStream = codestream.length % 2 === 1 ? concat([codestream, Uint8Array.from([0])]) : codestream;
+    const fragItem = concat([u16(0xfffe), u16(0xe000), u32(paddedStream.length), paddedStream]);
+    const seqDelim = concat([u16(0xfffe), u16(0xe0dd), u32(0)]);
+    const pixelElem = concat([
+      u16(0x7fe0),
+      u16(0x0010),
+      new TextEncoder().encode("OB"),
+      u16(0),
+      u32(0xffffffff),
+      botItem,
+      fragItem,
+      seqDelim,
+    ]);
+    const dcmBytes = concat([
+      preamble,
+      element(0x0002, 0x0000, "UL", u32(metaBody.length)),
+      metaBody,
+      element(0x0008, 0x0016, "UI", sopClass),
+      element(0x0008, 0x0060, "CS", "MR"),
+      element(0x0020, 0x0032, "DS", "-10\\-20\\30"),
+      element(0x0020, 0x0037, "DS", "1\\0\\0\\0\\1\\0"),
+      element(0x0028, 0x0002, "US", u16(1)),
+      element(0x0028, 0x0004, "CS", "MONOCHROME2"),
+      element(0x0028, 0x0010, "US", u16(16)),
+      element(0x0028, 0x0011, "US", u16(16)),
+      element(0x0028, 0x0030, "DS", "1.0\\1.0"),
+      element(0x0028, 0x0100, "US", u16(8)),
+      element(0x0028, 0x0101, "US", u16(8)),
+      element(0x0028, 0x0102, "US", u16(7)),
+      element(0x0028, 0x0103, "US", u16(0)),
+      pixelElem,
+    ]);
+
+    const parsed = await readDicomBytes(dcmBytes);
+    assert.equal(parsed.decodeStatus, "ok");
+    assert.equal(parsed.transferSyntax, syntax);
+    assert.equal(parsed.rows, 16);
+    assert.equal(parsed.cols, 16);
+    assert.ok(parsed.floatPixels && parsed.floatPixels.length === 256);
+    // Center pixel at (8,8) should be ~180, corner pixel at (0,0) should be ~0
+    assert.ok(parsed.floatPixels![8 * 16 + 8] > 150);
+    assert.ok(parsed.floatPixels![0] < 20);
+  }
+});

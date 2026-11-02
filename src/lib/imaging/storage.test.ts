@@ -842,3 +842,60 @@ test("Security Task 1: Fail-closed authorization across all 12 required scenario
     ctx.cleanup();
   }
 });
+
+import { exportDeidentifiedDicomArtifact } from "./storage.server.ts";
+
+test("Sprint 6 Task 2E & 2F: exportDeidentifiedDicomArtifact enforces authorization, manual review gate for burned-in risk, original file immutability, and audit logging", async () => {
+  const ctx = await createTestStorageDb();
+  try {
+    const dicomBytes = buildSyntheticMrDicom({
+      rows: 16,
+      cols: 16,
+      imagePosition: "-10\\-20\\30",
+      imageOrientation: "1\\0\\0\\0\\1\\0",
+      pixelSpacing: "1.0\\1.0",
+      sliceThickness: "3.0",
+    });
+    const stored = await storeImagingArtifact(ctx.sql, {
+      userId: "clin_verified",
+      patientId: "pat_clin_1",
+      studyId: "study_1",
+      seriesId: "series_1",
+      kind: "dicom",
+      data: dicomBytes,
+    });
+
+    // 1. Unauthorized user is rejected fail-closed
+    await assert.rejects(
+      () => exportDeidentifiedDicomArtifact(ctx.sql, "clin_unverified", stored.id),
+      /Unauthorized/,
+    );
+
+    // 2. Because BurnedInAnnotation (0028,0301) is not explicitly 'NO', manualReviewRequired is true;
+    // exporting without clinicianReviewedBurnedInPixels: true is blocked and audited
+    await assert.rejects(
+      () => exportDeidentifiedDicomArtifact(ctx.sql, "clin_verified", stored.id),
+      /Manual pixel review required before export/,
+    );
+
+    // 3. Exporting with clinicianReviewedBurnedInPixels: true succeeds, preserves the original file on disk, and returns de-identified bytes
+    const exported = await exportDeidentifiedDicomArtifact(ctx.sql, "clin_verified", stored.id, {
+      uidSalt: "storage-export-salt",
+      dateShiftDays: -90,
+      patientIdReplacement: "ANON-PAT-01",
+      clinicianReviewedBurnedInPixels: true,
+    });
+    assert.equal(exported.sourceObjectId, stored.id);
+    assert.equal(exported.originalPreserved, true);
+    assert.equal(exported.claimCompleteAnonymisation, false);
+    assert.equal(exported.clinicianReviewedBurnedInPixels, true);
+    assert.ok(exported.derivedBase64.length > 100);
+
+    // Verify original stored object on disk still passes SHA-256 integrity verification
+    const integrityAfter = await verifyImagingObjectIntegrity(ctx.sql, "clin_verified", stored.id);
+    assert.equal(integrityAfter.valid, true);
+    assert.equal(integrityAfter.actualSha256, stored.sha256);
+  } finally {
+    ctx.cleanup();
+  }
+});

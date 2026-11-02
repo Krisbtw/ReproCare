@@ -1631,3 +1631,84 @@ export async function getHistoricalFindingImagingEvidence(
     })),
   };
 }
+
+import { deidentifyDicomBytes, type DeidentificationOptions, type DeidentificationResult } from "../dicom/deidentify.ts";
+
+export interface ExportDeidentifiedDicomOptions extends DeidentificationOptions {
+  /** Must be explicitly true to export when potential burned-in pixel annotations require manual review. */
+  clinicianReviewedBurnedInPixels?: boolean;
+  /** Optional clinician note documenting visual verification of image pixels. */
+  clinicianReviewNote?: string;
+}
+
+/**
+ * Exports a DICOM PS3.15 de-identified derived copy of a stored DICOM artifact while keeping
+ * the protected original file on disk unchanged (Sprint 6 Task 2E & 2F).
+ *
+ * Enforces:
+ * 1. Fail-closed authorization (`checkPatientAndClinicianAccess`).
+ * 2. Original file immutability (`originalPreserved === true`).
+ * 3. Burned-in pixel annotation gate: if `burnedInReport.manualReviewRequired` is true and
+ *    `clinicianReviewedBurnedInPixels` is not true, throws an explicit manual-review required error
+ *    rather than claiming complete anonymisation.
+ * 4. Audit trail (`deidentify_dicom_object`) without exposing patient identifiers or filesystem paths.
+ */
+export async function exportDeidentifiedDicomArtifact(
+  sql: Sql,
+  userId: string,
+  objectId: string,
+  options?: ExportDeidentifiedDicomOptions,
+): Promise<
+  Omit<DeidentificationResult, "derivedBytes"> & {
+    sourceObjectId: string;
+    derivedBase64: string;
+    clinicianReviewedBurnedInPixels: boolean;
+  }
+> {
+  const loaded = await getImagingArtifact(sql, userId, objectId, true);
+  if (!loaded.data) {
+    throw new Error("De-identification failed: binary payload is unavailable.");
+  }
+
+  const deid = deidentifyDicomBytes(loaded.data, {
+    uidSalt: options?.uidSalt,
+    dateShiftDays: options?.dateShiftDays,
+    patientIdReplacement: options?.patientIdReplacement,
+  });
+
+  if (!deid.originalPreserved) {
+    throw new Error("Security violation: original DICOM buffer was modified during de-identification.");
+  }
+
+  const reviewed = Boolean(options?.clinicianReviewedBurnedInPixels);
+  if (deid.manualReviewRequired && !reviewed) {
+    await writeAuditEvent(
+      sql,
+      userId,
+      "deidentify_dicom_blocked_manual_review",
+      "imaging_object",
+      loaded.record.id,
+      `Blocked unreviewed de-identified export for object ${loaded.record.id}: potential burned-in pixel annotations (${deid.burnedInReport.riskLevel}) require manual clinician review.`,
+    );
+    throw new Error(
+      `Manual pixel review required before export: metadata tags were de-identified, but potential burned-in pixel identifiers were detected (${deid.burnedInReport.reasons.join(" ") || "BurnedInAnnotation not verified as NO"}). Pass clinicianReviewedBurnedInPixels: true after visual inspection.`,
+    );
+  }
+
+  await writeAuditEvent(
+    sql,
+    userId,
+    "deidentify_dicom_object",
+    "imaging_object",
+    loaded.record.id,
+    `Exported PS3.15 de-identified derived copy for object ${loaded.record.id} (derived sha256 ${deid.derivedSha256.slice(0, 12)}…, standard tags scrubbed: ${deid.standardTagsScrubbed.length}, private tags removed: ${deid.privateTagsRemoved.length}, nested tags scrubbed: ${deid.nestedSequenceTagsScrubbed.length}, burned-in risk: ${deid.burnedInReport.riskLevel}, manual review confirmed: ${reviewed}).`,
+  );
+
+  const { derivedBytes, ...rest } = deid;
+  return {
+    ...rest,
+    sourceObjectId: loaded.record.id,
+    derivedBase64: Buffer.from(derivedBytes).toString("base64"),
+    clinicianReviewedBurnedInPixels: reviewed,
+  };
+}

@@ -5,8 +5,9 @@
  * Works on plain per-slice records so it does not depend on a parser.
  * Nothing here resamples or invents slices: a series with gaps is reported, not silently repaired.
  */
-import type {
-  DirectionCosines9,
+import {
+  buildVoxelToPatientAffine4x4,
+  type DirectionCosines9,
    Vec3,
   Volume,
   VolumePatientGeometry,
@@ -156,7 +157,11 @@ export function expandMultiFrameDicomToSeries(
   const count = Math.max(1, read.numberOfFrames);
   for (let f = 0; f < count; f++) {
     const frameId = count === 1 ? idPrefix : `${idPrefix}#frame-${f + 1}`;
-    const framePos = read.framePositionsMm[f] ?? (f === 0 ? baseGeom.positionMm : null);
+    const pf = read.perFrameMetadata?.[f];
+    const framePos = pf?.positionMm ?? read.framePositionsMm[f] ?? (f === 0 ? baseGeom.positionMm : null);
+    const frameOri = pf?.orientation ?? baseGeom.orientation;
+    const framePs = pf?.pixelSpacingMm ?? baseGeom.pixelSpacingMm;
+    const frameThick = pf?.sliceThicknessMm ?? baseGeom.sliceThicknessMm;
     slices.push({
       ...baseGeom,
       id: frameId,
@@ -166,6 +171,9 @@ export function expandMultiFrameDicomToSeries(
           : baseGeom.sopInstanceUid,
       instanceNumber: count > 1 ? f + 1 : baseGeom.instanceNumber,
       positionMm: framePos,
+      orientation: frameOri,
+      pixelSpacingMm: framePs,
+      sliceThicknessMm: frameThick,
     });
     const frameBuf = read.frameFloatPixels[f];
     if (frameBuf) {
@@ -483,10 +491,17 @@ export function buildVolume(
     data.set(px, z * nx * ny);
   });
   // PixelSpacing is [between rows (y step), between columns (x step)].
+  const spacingMm: Vec3 = [report.pixelSpacingMm[1], report.pixelSpacingMm[0], report.sliceSpacingMm];
+  const geometryWithAffine: VolumePatientGeometry | undefined = report.geometry
+    ? {
+        ...report.geometry,
+        affine4x4: buildVoxelToPatientAffine4x4(report.geometry, spacingMm),
+      }
+    : undefined;
   return {
     dims: [nx, ny, nz],
-    spacingMm: [report.pixelSpacingMm[1], report.pixelSpacingMm[0], report.sliceSpacingMm],
+    spacingMm,
     data,
-    ...(report.geometry ? { geometry: report.geometry } : {}),
+    ...(geometryWithAffine ? { geometry: geometryWithAffine } : {}),
   };
 }

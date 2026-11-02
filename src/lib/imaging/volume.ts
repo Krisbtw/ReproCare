@@ -1,5 +1,5 @@
 /**
- * Shared voxel containers and physical DICOM patient-coordinate geometry (Sprint 5 Task 1D).
+ * Shared voxel containers and physical DICOM patient-coordinate geometry (Sprint 5 & Sprint 6 Task 2D).
  * Index order is x + nx * (y + ny * z). Spacing is millimetres per voxel step along x, y, z.
  */
 
@@ -9,6 +9,17 @@ export type DirectionCosines9 = [
   number, number, number,
   number, number, number,
   number, number, number,
+];
+
+/**
+ * Row-major 4×4 homogeneous affine matrix mapping voxel coordinates `[vx, vy, vz, 1]`
+ * directly to physical DICOM LPS patient coordinates `[L_mm, P_mm, S_mm, 1]`.
+ */
+export type Affine4x4 = [
+  number, number, number, number,
+  number, number, number, number,
+  number, number, number, number,
+  number, number, number, number,
 ];
 
 export type VolumePatientGeometry = {
@@ -22,6 +33,8 @@ export type VolumePatientGeometry = {
   normalCosines: Vec3;
   /** Flattened 9-element direction cosine matrix [rowX, rowY, rowZ, colX, colY, colZ, normX, normY, normZ]. */
   directionCosines: DirectionCosines9;
+  /** Optional 4×4 voxel-to-patient LPS affine transformation matrix. */
+  affine4x4?: Affine4x4;
   /** PatientPosition (0018,5100), e.g., HFS, FFS, HFP, FFP. */
   patientPosition?: string | null;
   /** FrameOfReferenceUID (0020,0052). */
@@ -87,6 +100,36 @@ export function sameGrid(a: { dims: Vec3; spacingMm: Vec3 }, b: { dims: Vec3; sp
 }
 
 /**
+ * Builds the 4×4 row-major voxel-to-patient (DICOM LPS mm) affine transformation matrix:
+ * `[L, P, S, 1]^T = A * [vx, vy, vz, 1]^T`.
+ */
+export function buildVoxelToPatientAffine4x4(
+  geometry: Pick<VolumePatientGeometry, "originMm" | "rowCosines" | "colCosines" | "normalCosines">,
+  spacingMm: Vec3,
+): Affine4x4 {
+  const [sx, sy, sz] = spacingMm;
+  const { originMm, rowCosines: r, colCosines: c, normalCosines: n } = geometry;
+  return [
+    r[0] * sx, c[0] * sy, n[0] * sz, originMm[0],
+    r[1] * sx, c[1] * sy, n[1] * sz, originMm[1],
+    r[2] * sx, c[2] * sy, n[2] * sz, originMm[2],
+    0, 0, 0, 1,
+  ];
+}
+
+/**
+ * Applies a 4×4 row-major affine matrix to a 3D point `[x, y, z]`.
+ */
+export function applyAffine4x4(affine: Affine4x4, pt: Vec3): Vec3 {
+  const [x, y, z] = pt;
+  return [
+    affine[0] * x + affine[1] * y + affine[2] * z + affine[3],
+    affine[4] * x + affine[5] * y + affine[6] * z + affine[7],
+    affine[8] * x + affine[9] * y + affine[10] * z + affine[11],
+  ];
+}
+
+/**
  * Converts an image-index coordinate `(xMm, yMm, zMm) = (x * sx, y * sy, z * sz)` into
  * physical DICOM LPS patient coordinates `(L, P, S)` using `VolumePatientGeometry`.
  */
@@ -112,6 +155,9 @@ export function voxelToPatientLps(
   spacingMm: Vec3,
   geometry?: VolumePatientGeometry | null,
 ): Vec3 {
+  if (geometry?.affine4x4) {
+    return applyAffine4x4(geometry.affine4x4, voxel);
+  }
   return imageMmToPatientLps(
     [voxel[0] * spacingMm[0], voxel[1] * spacingMm[1], voxel[2] * spacingMm[2]],
     geometry,
@@ -150,3 +196,6 @@ export function ellipsoidMask(
   }
   return mask;
 }
+
+export const computePatientAffine4x4 = buildVoxelToPatientAffine4x4;
+export const applyPatientAffine4x4 = applyAffine4x4;

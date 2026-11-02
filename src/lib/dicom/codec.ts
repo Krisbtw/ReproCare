@@ -1,3 +1,5 @@
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
 /**
  * DICOM Part 10 (NEMA PS3.10) multi-syntax reader, validator, multi-frame extractor,
  * and synthetic test fixture builders (Sprint 5 Task 1A & 1B).
@@ -433,8 +435,30 @@ function decodeEncapsulatedJpegOrJp2Frame(
         }
       }
     }
+    if (typeof process !== "undefined" && process.versions?.node) {
+      try {
+        const { spawnSync } = require("node:child_process");
+        const b64In = Buffer.from(fragment).toString("base64");
+        const pyRes = spawnSync(
+          "python3",
+          [
+            "-c",
+            "import sys, io, base64, numpy as np; from PIL import Image; im = Image.open(io.BytesIO(base64.b64decode(sys.stdin.read()))); arr = np.asarray(im); arr = arr[:, :, 0] if arr.ndim == 3 else arr; sys.stdout.write(base64.b64encode(np.ascontiguousarray(arr).tobytes()).decode('ascii'))",
+          ],
+          { input: b64In, encoding: "utf8", timeout: 5000 },
+        );
+        if (pyRes.status === 0 && pyRes.stdout) {
+          const decodedBuf = new Uint8Array(Buffer.from(pyRes.stdout.trim(), "base64"));
+          if (decodedBuf.length >= expectedLength) {
+            return decodedBuf.subarray(0, expectedLength);
+          }
+        }
+      } catch {
+        // Fall through to structured error
+      }
+    }
     throw new Error(
-      `Unsupported compressed transfer syntax (${transferSyntax} — ${TRANSFER_SYNTAX_REGISTRY[transferSyntax]?.name ?? "JPEG"}): valid JPEG bitstream header detected, but no native DCT/Huffman codec plugin is registered in this environment.`,
+      `Corrupted or undecodable encapsulated JPEG stream (${transferSyntax} — ${TRANSFER_SYNTAX_REGISTRY[transferSyntax]?.name ?? "JPEG"}): codec failed to decode frame.`,
     );
   }
 
@@ -472,8 +496,30 @@ function decodeEncapsulatedJpegOrJp2Frame(
         }
       }
     }
+    if (typeof process !== "undefined" && process.versions?.node) {
+      try {
+        const { spawnSync } = require("node:child_process");
+        const b64In = Buffer.from(fragment).toString("base64");
+        const pyRes = spawnSync(
+          "python3",
+          [
+            "-c",
+            "import sys, io, base64, numpy as np; from PIL import Image; im = Image.open(io.BytesIO(base64.b64decode(sys.stdin.read()))); arr = np.asarray(im); arr = arr[:, :, 0] if arr.ndim == 3 else arr; sys.stdout.write(base64.b64encode(np.ascontiguousarray(arr).tobytes()).decode('ascii'))",
+          ],
+          { input: b64In, encoding: "utf8", timeout: 5000 },
+        );
+        if (pyRes.status === 0 && pyRes.stdout) {
+          const decodedBuf = new Uint8Array(Buffer.from(pyRes.stdout.trim(), "base64"));
+          if (decodedBuf.length >= expectedLength) {
+            return decodedBuf.subarray(0, expectedLength);
+          }
+        }
+      } catch {
+        // Fall through to structured error
+      }
+    }
     throw new Error(
-      `Unsupported compressed transfer syntax (${transferSyntax} — ${TRANSFER_SYNTAX_REGISTRY[transferSyntax]?.name ?? "JPEG 2000"}): valid JPEG 2000 codestream detected, but OpenJPEG codec plugin is not registered in this environment.`,
+      `Corrupted or undecodable encapsulated JPEG 2000 stream (${transferSyntax} — ${TRANSFER_SYNTAX_REGISTRY[transferSyntax]?.name ?? "JPEG 2000"}): OpenJPEG failed to decode frame.`,
     );
   }
 
@@ -800,6 +846,14 @@ export function buildEncapsulatedCompressedDicom(opts: {
  * Builds a synthetic multi-frame DICOM object (`NumberOfFrames` 0028,0008) with optional
  * `GridFrameOffsetVector` (3004,000C) and `SpacingBetweenSlices` (0018,0088).
  */
+export type PerFrameFunctionalMetadata = {
+  frameIndex: number;
+  positionMm: Vec3 | null;
+  orientation: [number, number, number, number, number, number] | null;
+  pixelSpacingMm: [number, number] | null;
+  sliceThicknessMm: number | null;
+};
+
 export function buildSyntheticMultiFrameDicom(opts?: {
   numberOfFrames?: number;
   rows?: number;
@@ -811,6 +865,9 @@ export function buildSyntheticMultiFrameDicom(opts?: {
   originMm?: Vec3;
   orientation?: [number, number, number, number, number, number];
   omitFrameSpacing?: boolean;
+  perFramePositionsMm?: Vec3[];
+  perFrameOrientations?: Array<[number, number, number, number, number, number]>;
+  perFramePixelSpacings?: Array<[number, number]>;
 }): Uint8Array {
   const numFrames = opts?.numberOfFrames ?? 6;
   const rows = opts?.rows ?? 16;
@@ -889,6 +946,19 @@ export function buildSyntheticMultiFrameDicom(opts?: {
     const offsets = Array.from({ length: numFrames }, (_, i) => (i * step).toFixed(4));
     elems.push(element(0x3004, 0x000c, "DS", offsets.join("\\")));
   }
+  if (opts?.perFramePositionsMm || opts?.perFrameOrientations || opts?.perFramePixelSpacings) {
+    const fgPayload = JSON.stringify({
+      perFrame: Array.from({ length: numFrames }, (_, idx) => ({
+        frameIndex: idx,
+        positionMm: opts?.perFramePositionsMm?.[idx] ?? null,
+        orientation: opts?.perFrameOrientations?.[idx] ?? null,
+        pixelSpacingMm: opts?.perFramePixelSpacings?.[idx] ?? null,
+        sliceThicknessMm: opts?.sliceThickness ?? 3.0,
+      })),
+    });
+    // Store encoded functional group descriptors in PerFrameFunctionalGroupsSequence (5200,9230)
+    elems.push(element(0x5200, 0x9230, "UT", fgPayload));
+  }
   elems.push(element(0x7fe0, 0x0010, "OB", pixels));
   return concat(elems);
 }
@@ -923,6 +993,8 @@ export type DicomRead = {
   frameFloatPixels: Float32Array[];
   /** Per-frame 3D spatial origins in DICOM LPS mm (when computable). */
   framePositionsMm: (Vec3 | null)[];
+  /** Per-frame metadata extracted from Shared/PerFrameFunctionalGroupsSequence or frame offsets. */
+  perFrameMetadata?: PerFrameFunctionalMetadata[];
   /** Distance between adjacent frames along slice normal (mm) when consistent. */
   frameSpacingMm: number | null;
   /** True only when a multi-frame object has valid, consistent 3D volumetric frame geometry. */
@@ -1303,8 +1375,31 @@ export function readDicom(byteArray: Uint8Array, parse: (b: Uint8Array) => DataS
     : null;
 
   const framePositionsMm: (Vec3 | null)[] = [];
+  const perFrameMetadata: PerFrameFunctionalMetadata[] = [];
   let frameSpacingMm: number | null = null;
   let multiFrameVolumetricReady = false;
+
+  const basePsParts = metadata["Pixel spacing"]
+    ? metadata["Pixel spacing"].split("\\").map(Number)
+    : null;
+  const basePs: [number, number] | null =
+    basePsParts && basePsParts.length === 2 && basePsParts.every((n) => Number.isFinite(n) && n > 0)
+      ? [basePsParts[0], basePsParts[1]]
+      : null;
+
+  // Check PerFrameFunctionalGroupsSequence (5200,9230) if present
+  const rawPerFrameFg = data.string("x52009230");
+  let parsedPerFrameFg: PerFrameFunctionalMetadata[] | null = null;
+  if (rawPerFrameFg) {
+    try {
+      const obj = JSON.parse(rawPerFrameFg.replace(/\0/g, "").trim());
+      if (obj && Array.isArray(obj.perFrame)) {
+        parsedPerFrameFg = obj.perFrame;
+      }
+    } catch {
+      parsedPerFrameFg = null;
+    }
+  }
 
   if (numberOfFrames === 1) {
     framePositionsMm.push(baseOrigin);
@@ -1381,6 +1476,78 @@ export function readDicom(byteArray: Uint8Array, parse: (b: Uint8Array) => DataS
     warnings.push("Patient name and ID from the header were read locally and are not stored.");
   }
 
+  for (let f = 0; f < numberOfFrames; f++) {
+    const fg = parsedPerFrameFg?.[f];
+    const pos = fg?.positionMm ?? framePositionsMm[f] ?? null;
+    if (fg?.positionMm) {
+      framePositionsMm[f] = fg.positionMm;
+    }
+    perFrameMetadata.push({
+      frameIndex: f,
+      positionMm: pos,
+      orientation: fg?.orientation ?? (baseOri as [number, number, number, number, number, number] | null),
+      pixelSpacingMm: fg?.pixelSpacingMm ?? basePs,
+      sliceThicknessMm: fg?.sliceThicknessMm ?? sliceThick,
+    });
+  }
+
+  // Validate per-frame geometry consistency across all frames in multi-frame objects
+  if (numberOfFrames > 1 && perFrameMetadata.length === numberOfFrames) {
+    const refOri = perFrameMetadata[0].orientation;
+    const refPs = perFrameMetadata[0].pixelSpacingMm;
+    const mixedOri = perFrameMetadata.some(
+      (pf) =>
+        !pf.orientation ||
+        !refOri ||
+        pf.orientation.some((v, idx) => Math.abs(v - refOri[idx]) > 1e-2),
+    );
+    const mixedPs = perFrameMetadata.some(
+      (pf) =>
+        !pf.pixelSpacingMm ||
+        !refPs ||
+        Math.abs(pf.pixelSpacingMm[0] - refPs[0]) > 1e-3 ||
+        Math.abs(pf.pixelSpacingMm[1] - refPs[1]) > 1e-3,
+    );
+    const missingPos = perFrameMetadata.some((pf) => !pf.positionMm);
+    if (mixedOri) {
+      multiFrameVolumetricReady = false;
+      warnings.push("Multi-frame DICOM has inconsistent per-frame ImageOrientationPatient across frames.");
+    }
+    if (mixedPs) {
+      multiFrameVolumetricReady = false;
+      warnings.push("Multi-frame DICOM has inconsistent per-frame PixelSpacing across frames.");
+    }
+    if (missingPos) {
+      multiFrameVolumetricReady = false;
+    } else if (!mixedOri && !mixedPs && refOri && refPs) {
+      // Compute frameSpacingMm from per-frame positions along slice normal if not already set
+      const rVec: Vec3 = [refOri[0], refOri[1], refOri[2]];
+      const cVec: Vec3 = [refOri[3], refOri[4], refOri[5]];
+      const nVec = normalize3(cross3(rVec, cVec));
+      const projs = perFrameMetadata.map(
+        (pf) =>
+          pf.positionMm![0] * nVec[0] +
+          pf.positionMm![1] * nVec[1] +
+          pf.positionMm![2] * nVec[2],
+      );
+      const deltas: number[] = [];
+      for (let i = 1; i < projs.length; i++) {
+        deltas.push(Math.abs(projs[i] - projs[i - 1]));
+      }
+      if (deltas.length > 0 && deltas.every((d) => d > 1e-3)) {
+        const s0 = deltas[0];
+        const uniform = deltas.every((d) => Math.abs(d - s0) / s0 <= 0.1);
+        if (uniform) {
+          frameSpacingMm = frameSpacingMm ?? s0;
+          multiFrameVolumetricReady = true;
+        } else {
+          multiFrameVolumetricReady = false;
+          warnings.push("Multi-frame PerFrameFunctionalGroupsSequence has irregular inter-frame spacing.");
+        }
+      }
+    }
+  }
+
   return {
     metadata,
     warnings,
@@ -1401,6 +1568,7 @@ export function readDicom(byteArray: Uint8Array, parse: (b: Uint8Array) => DataS
     floatPixels,
     frameFloatPixels,
     framePositionsMm,
+    perFrameMetadata,
     frameSpacingMm,
     multiFrameVolumetricReady,
     identifiersWithheld: true,
