@@ -575,7 +575,7 @@ export async function interpretReportWithLlm(input: {
       start: f.sentence.start,
       end: f.sentence.end,
       certainty,
-      uncertain: f.uncertain,
+      uncertain: Boolean(f.uncertain),
       negated: f.negated,
       provenance: "llm_generated",
       clinicianReviewed: Boolean(input.clinicianReviewed),

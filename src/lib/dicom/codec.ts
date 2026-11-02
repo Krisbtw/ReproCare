@@ -562,6 +562,8 @@ function decodeEncapsulatedJpegOrJp2Frame(
 export function buildSyntheticMrDicom(opts?: {
   rows?: number;
   cols?: number;
+  patientName?: string;
+  patientId?: string;
   bitsAllocated?: 8 | 16;
   pixelSpacing?: string;
   sliceThickness?: string;
@@ -1034,9 +1036,10 @@ export type DicomRead = {
 };
 
 type EncapsulatedFragment = {
-  offset: number;
+  offset?: number;
+  position?: number;
   length: number;
-  bytes: Uint8Array;
+  bytes?: Uint8Array;
 };
 
 type ElementLike = {

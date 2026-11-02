@@ -188,9 +188,9 @@ function ExtractionSummary({
         </div>
         <p>
           Modality: <b>{x.modality ?? "not stated"}</b>{" "}
-          <ProvenanceBadge provenance={x.modalityProvenance} /> · Date:{" "}
+          <ProvenanceBadge provenance={x.modalityProvenance ?? undefined} /> · Date:{" "}
           <b>{x.examDate ?? "not found"}</b>{" "}
-          <ProvenanceBadge provenance={x.examDateProvenance} />
+          <ProvenanceBadge provenance={x.examDateProvenance ?? undefined} />
         </p>
         <p className="text-xs text-muted">
           Region: {x.anatomicalRegion ?? "pelvis"} · Method: {x.extractionMethod ?? "plain_text"} · Pages:{" "}

@@ -337,7 +337,7 @@ const UNCERTAINTY =
 
 export function extractReport(
   text: string,
-  options?: { ocrUsed?: boolean; rawTextForMetadata?: string; pages?: any[]; pageCount?: number },
+  options?: { ocrUsed?: boolean; rawTextForMetadata?: string; pages?: any[]; pageCount?: number; extractionMethod?: string },
 ): Extraction {
   const notes: string[] = [];
   const sents = sentences(text);

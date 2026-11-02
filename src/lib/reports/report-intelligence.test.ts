@@ -64,7 +64,7 @@ const MIGRATION_FILES = [
 ];
 
 function wrap(pg: PGlite): Sql {
-  return async <T = Record<string, unknown>>(
+  const fn = async <T = Record<string, unknown>>(
     strings: TemplateStringsArray,
     ...values: unknown[]
   ): Promise<T[]> => {
@@ -75,6 +75,14 @@ function wrap(pg: PGlite): Sql {
     const res = await pg.query<T>(text, values);
     return res.rows;
   };
+  (fn as unknown as Sql).query = async <T = Record<string, unknown>>(
+    text: string,
+    params: unknown[] = [],
+  ) => {
+    const res = await pg.query<T>(text, params);
+    return res.rows;
+  };
+  return fn as unknown as Sql;
 }
 
 async function setupDb(): Promise<{ pg: PGlite; sql: Sql }> {
@@ -91,7 +99,7 @@ function sha256(bytes: Uint8Array): string {
 
 describe("Sprint 4 Task 2 — Clinical Report Intelligence, OCR, LLM Grounding & Clinician Review", () => {
   it("1. Native-text PDF, DOCX, and TXT extraction record accurate method and page metadata", async () => {
-    const pdfBytes = await buildPdf(SAMPLE_REPORT_LINES, true);
+    const pdfBytes = await buildPdf(SAMPLE_REPORT_LINES, { uncompressed: true });
     const pdfRes = await extractReportText("report.pdf", pdfBytes);
     assert.equal(pdfRes.usable, true);
     assert.equal(pdfRes.extractionMethod, "native_pdf_text");
@@ -123,7 +131,7 @@ describe("Sprint 4 Task 2 — Clinical Report Intelligence, OCR, LLM Grounding &
       "Impression: Intramural uterine fibroid.",
       "Recommendation: Follow-up MRI in 6 months.",
     ];
-    const scannedBytes = await buildScannedPdf([scannedLines], false);
+    const scannedBytes = await buildScannedPdf([scannedLines]);
     const res = await extractReportText("scanned-mri.pdf", scannedBytes);
 
     assert.equal(res.usable, true);
@@ -176,20 +184,20 @@ describe("Sprint 4 Task 2 — Clinical Report Intelligence, OCR, LLM Grounding &
       pages: res.pages,
     });
 
-    assert.equal(ext.uterineMeasurements.length, 1);
-    assert.equal(ext.uterineMeasurements[0].pageNumber, 1);
-    assert.equal(ext.fibroidMeasurements.length, 1);
-    assert.equal(ext.fibroidMeasurements[0].pageNumber, 2);
-    assert.equal(ext.ovarianCystMeasurements.length, 1);
-    assert.equal(ext.ovarianCystMeasurements[0].pageNumber, 2);
+    assert.equal(ext.uterineMeasurements?.length, 1);
+    assert.equal(ext.uterineMeasurements?.[0].pageNumber, 1);
+    assert.equal(ext.fibroidMeasurements?.length, 1);
+    assert.equal(ext.fibroidMeasurements?.[0].pageNumber, 2);
+    assert.equal(ext.ovarianCystMeasurements?.length, 1);
+    assert.equal(ext.ovarianCystMeasurements?.[0].pageNumber, 2);
 
     // Simulate a page where OCR fails -> page must still be preserved in `pages` with method: "failed"
     const failedPageRes = await extractReportText("failed-ocr.pdf", hybridBytes, {
-      ocrRecognizer: () => ({
+      ocrRecognizer: async () => ({
         text: "",
         confidence: 0,
-        engine: "failing-ocr-stub",
-        warnings: ["Simulated OCR engine timeout on page 2"],
+        failed: true,
+        warning: "Simulated OCR engine timeout on page 2",
       }),
     });
     assert.equal(failedPageRes.pageCount, 2);
@@ -228,7 +236,7 @@ describe("Sprint 4 Task 2 — Clinical Report Intelligence, OCR, LLM Grounding &
     assert.ok(cystFinding);
     assert.equal(cystFinding.negated, true);
     // Negated or uncertain findings must never be promoted to confirmed fibroid/cyst measurement lists
-    assert.equal(ext.ovarianCystMeasurements.length, 0);
+    assert.equal(ext.ovarianCystMeasurements?.length ?? 0, 0);
   });
 
   it("5. Source-grounded LLM interpreter validates structured output, enforces privacy gates, cites exact offsets, and refuses unsupported questions", async () => {
@@ -349,7 +357,7 @@ describe("Sprint 4 Task 2 — Clinical Report Intelligence, OCR, LLM Grounding &
         "Impression: Enlarging posterior wall intramural fibroid.",
         "Recommendation: Gynaecology follow-up in 6 months.",
       ];
-      const pdfBytes = await buildPdf(reportLines, true);
+      const pdfBytes = await buildPdf(reportLines, { uncompressed: true });
       const parsed = await extractReportText("followup-s2.pdf", pdfBytes);
       const deid = deidentify(parsed.text);
 

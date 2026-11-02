@@ -907,7 +907,7 @@ test("Phase E & G — Local-to-Supabase Storage Migration and Full 11-Step Synth
       description: "SYNTHETIC E2E MRI",
     });
 
-    const storedSliceRecords = [];
+    const storedSliceRecords: any[] = [];
     for (let i = 0; i < syntheticSlices.length; i++) {
       const rec = await storeImagingArtifact(ctx.sql, {
         userId: "clin_verified",

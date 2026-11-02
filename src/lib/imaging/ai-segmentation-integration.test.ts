@@ -175,7 +175,8 @@ test("extractClassMaskFromVolume extracts individual UMD structures, preserves g
   assert.ok(Math.abs(measurement.volumeMl - (expectedMyomaVoxels * 3.0) / 1000) < 1e-4);
 
   const builtMesh = meshFromMask(myomaRes.mask, { blurIterations: 1, taubinIterations: 5 });
-  assert.ok(builtMesh.mesh.indices.length > 0);
+  assert.ok(builtMesh);
+  assert.ok(builtMesh!.mesh.indices.length > 0);
 
   const patientFrame = createPatientFrame(
     [-50, -60, 10],
@@ -184,8 +185,8 @@ test("extractClassMaskFromVolume extracts individual UMD structures, preserves g
     [-50, -60, 13],
     "1.2.826.0.1.3680043.8.498.777777",
   );
-  const lpsMesh = transformMeshToPatient(builtMesh.mesh, patientFrame);
-  assert.equal(lpsMesh.positions.length, builtMesh.mesh.positions.length);
+  const lpsMesh = transformMeshToPatient(builtMesh!.mesh, patientFrame);
+  assert.equal(lpsMesh.positions.length, builtMesh!.mesh.positions.length);
   const patientCentroid = imageMmToPatient(measurement.centroidMm!, patientFrame);
   assert.ok(Math.abs(patientCentroid[0] - (measurement.centroidMm![0] - 50)) < 1e-4);
 
