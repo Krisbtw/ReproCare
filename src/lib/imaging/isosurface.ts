@@ -1,16 +1,18 @@
 /**
- * Marching tetrahedra isosurface on an anisotropic grid.
- * Chosen over a 256-case Marching Cubes table because the Kuhn six-tetrahedra split is face-consistent between
- * neighbouring cells, so closed objects come out watertight without ambiguous-case patches. Triangles are oriented
- * so normals point out of the region where value > iso.
+ * Marching tetrahedra isosurface on an anisotropic grid, preserving physical DICOM
+ * patient geometry across padding, smoothing, and surface extraction (Sprint 5 Task 1D).
  */
-import type { Mask, Vec3, Volume } from "./volume.ts";
+import type { Mask, Vec3, Volume, VolumePatientGeometry } from "./volume.ts";
 import { vIndex } from "./volume.ts";
 
 export type Mesh = {
-  /** x,y,z in millimetres in image-index space (voxel index × spacing). */
+  /** x,y,z in millimetres (image-index space by default, or physical patient LPS space when transformed). */
   positions: Float32Array;
   indices: Uint32Array;
+  /** Physical DICOM patient geometry inherited from the source volume/mask. */
+  geometry?: VolumePatientGeometry;
+  /** Coordinate space of `positions`. Defaults to "image_index_mm". */
+  coordinateSpace?: "image_index_mm" | "patient_lps_mm";
 };
 
 const CORNERS: Vec3[] = [
@@ -59,7 +61,12 @@ export function boxBlur(volume: Volume, iterations: number): Volume {
     }
     src = dst;
   }
-  return { dims: volume.dims, spacingMm: volume.spacingMm, data: src };
+  return {
+    dims: volume.dims,
+    spacingMm: volume.spacingMm,
+    data: src,
+    ...(volume.geometry ? { geometry: volume.geometry } : {}),
+  };
 }
 
 /** Pads a mask with one empty voxel on every side so surfaces close at the grid boundary. */
@@ -74,7 +81,15 @@ export function padMask(mask: Mask): { volume: Volume; offsetVoxels: Vec3 } {
       }
     }
   }
-  return { volume: { dims, spacingMm: mask.spacingMm, data }, offsetVoxels: [1, 1, 1] };
+  return {
+    volume: {
+      dims,
+      spacingMm: mask.spacingMm,
+      data,
+      ...(mask.geometry ? { geometry: mask.geometry } : {}),
+    },
+    offsetVoxels: [1, 1, 1],
+  };
 }
 
 export function extractIsosurface(volume: Volume, iso: number): Mesh {
@@ -105,7 +120,11 @@ export function extractIsosurface(volume: Volume, iso: number): Mesh {
     const pa = gridPos(lo);
     const pb = gridPos(hi);
     const id = positions.length / 3;
-    positions.push(pa[0] + t * (pb[0] - pa[0]), pa[1] + t * (pb[1] - pa[1]), pa[2] + t * (pb[2] - pa[2]));
+    positions.push(
+      pa[0] + t * (pb[0] - pa[0]),
+      pa[1] + t * (pb[1] - pa[1]),
+      pa[2] + t * (pb[2] - pa[2]),
+    );
     edgeVertex.set(key, id);
     return id;
   };
@@ -118,11 +137,24 @@ export function extractIsosurface(volume: Volume, iso: number): Mesh {
     const pc = P(c);
     const u: Vec3 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
     const v: Vec3 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
-    const n: Vec3 = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
-    const cen: Vec3 = [(pa[0] + pb[0] + pc[0]) / 3, (pa[1] + pb[1] + pc[1]) / 3, (pa[2] + pb[2] + pc[2]) / 3];
+    const n: Vec3 = [
+      u[1] * v[2] - u[2] * v[1],
+      u[2] * v[0] - u[0] * v[2],
+      u[0] * v[1] - u[1] * v[0],
+    ];
+    const cen: Vec3 = [
+      (pa[0] + pb[0] + pc[0]) / 3,
+      (pa[1] + pb[1] + pc[1]) / 3,
+      (pa[2] + pb[2] + pc[2]) / 3,
+    ];
     let ref: Vec3;
     if (awayFrom) ref = [cen[0] - awayFrom[0], cen[1] - awayFrom[1], cen[2] - awayFrom[2]];
-    else ref = [(toward as Vec3)[0] - cen[0], (toward as Vec3)[1] - cen[1], (toward as Vec3)[2] - cen[2]];
+    else
+      ref = [
+        (toward as Vec3)[0] - cen[0],
+        (toward as Vec3)[1] - cen[1],
+        (toward as Vec3)[2] - cen[2],
+      ];
     const flip = n[0] * ref[0] + n[1] * ref[1] + n[2] * ref[2] < 0;
     if (flip) indices.push(a, c, b);
     else indices.push(a, b, c);
@@ -164,7 +196,11 @@ export function extractIsosurface(volume: Volume, iso: number): Mesh {
             const d = vertexOnEdge(ins[1], outs[0]);
             const mi = gridPos(ins[0]);
             const mj = gridPos(ins[1]);
-            const inMid: Vec3 = [(mi[0] + mj[0]) / 2, (mi[1] + mj[1]) / 2, (mi[2] + mj[2]) / 2];
+            const inMid: Vec3 = [
+              (mi[0] + mj[0]) / 2,
+              (mi[1] + mj[1]) / 2,
+              (mi[2] + mj[2]) / 2,
+            ];
             emit(a, b, c, inMid, null);
             emit(a, c, d, inMid, null);
           }
@@ -172,13 +208,16 @@ export function extractIsosurface(volume: Volume, iso: number): Mesh {
       }
     }
   }
-  return { positions: Float32Array.from(positions), indices: Uint32Array.from(indices) };
+  return {
+    positions: Float32Array.from(positions),
+    indices: Uint32Array.from(indices),
+    ...(volume.geometry ? { geometry: volume.geometry } : {}),
+    coordinateSpace: "image_index_mm",
+  };
 }
 
 /**
- * Surface of a binary mask. The mask is padded, lightly blurred so the surface falls between voxel centres,
- * then extracted at 0.5. Blurring slightly rounds corners; volume from the mesh and from voxels can differ a little,
- * and both are reported separately elsewhere.
+ * Surface of a binary mask. Preserves `mask.geometry` on the returned `Mesh`.
  */
 export function surfaceFromMask(mask: Mask, blurIterations = 1): Mesh {
   const { volume, offsetVoxels } = padMask(mask);
@@ -189,5 +228,9 @@ export function surfaceFromMask(mask: Mask, blurIterations = 1): Mesh {
     mesh.positions[i + 1] -= offsetVoxels[1] * mask.spacingMm[1];
     mesh.positions[i + 2] -= offsetVoxels[2] * mask.spacingMm[2];
   }
-  return mesh;
+  return {
+    ...mesh,
+    ...(mask.geometry ? { geometry: mask.geometry } : {}),
+    coordinateSpace: "image_index_mm",
+  };
 }

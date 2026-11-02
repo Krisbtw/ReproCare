@@ -59,7 +59,7 @@ export function normalisePercentile(volume: Volume, lowPct = 0.5, highPct = 99.5
   for (let i = 0; i < out.length; i += 1) {
     out[i] = span > 0 ? Math.min(1, Math.max(0, (volume.data[i] - lo) / span)) : 0;
   }
-  const v: Volume = { dims: volume.dims, spacingMm: volume.spacingMm, data: out };
+  const v: Volume = { dims: volume.dims, spacingMm: volume.spacingMm, data: out, ...(volume.geometry ? { geometry: volume.geometry } : {}) };
   return {
     volume: v,
     record: rec("normalise_percentile", { lowPct, highPct, low: lo, high: hi }, volume, v, span > 0 ? "Clipped to the percentile range and rescaled to 0–1." : "Flat volume: output set to 0."),
@@ -81,7 +81,7 @@ export function normaliseZScore(volume: Volume, mask?: Mask): Processed {
   const sd = n ? Math.sqrt(Math.max(0, sum2 / n - mean * mean)) : 0;
   const out = new Float32Array(volume.data.length);
   for (let i = 0; i < out.length; i += 1) out[i] = sd > 0 ? (volume.data[i] - mean) / sd : 0;
-  const v: Volume = { dims: volume.dims, spacingMm: volume.spacingMm, data: out };
+  const v: Volume = { dims: volume.dims, spacingMm: volume.spacingMm, data: out, ...(volume.geometry ? { geometry: volume.geometry } : {}) };
   return { volume: v, record: rec("normalise_zscore", { mean, sd, maskVoxels: n, masked: Boolean(mask) }, volume, v, sd > 0 ? "Mean 0, SD 1." : "Zero variance: output set to 0.") };
 }
 
@@ -165,7 +165,7 @@ export function medianFilter(volume: Volume): Processed {
       }
     }
   }
-  const v: Volume = { dims: volume.dims, spacingMm: volume.spacingMm, data: out };
+  const v: Volume = { dims: volume.dims, spacingMm: volume.spacingMm, data: out, ...(volume.geometry ? { geometry: volume.geometry } : {}) };
   return { volume: v, record: rec("median_3x3x3", {}, volume, v, "Edge-preserving for isolated noise; can remove structures thinner than one voxel.") };
 }
 

@@ -1,22 +1,4 @@
-"""DICOM series inspection and 3D volume assembly with full spatial geometry preservation.
-
-Reads raw DICOM bytes in memory, drops patient-identifying tags on arrival,
-orders slices by projection onto the slice normal (`ImageOrientationPatient`
-cross product dotted with `ImagePositionPatient`), and flags any geometry
-problem that makes a 3D volume unsafe to stack:
-
-  - unreadable files
-  - missing position / orientation / pixel spacing tags
-  - multiple SeriesInstanceUIDs mixed in one upload
-  - slices with inconsistent orientation (gantry tilt / mixed planes)
-  - slices with inconsistent matrix size or pixel spacing
-  - duplicate slice positions
-  - gaps or uneven step size along the slice normal
-
-Preserves full 3D coordinate-frame geometry (`origin_lps_mm`, `direction_cosines`,
-`spacing_zyx_mm`, `shape_zyx`, and non-identifying `frame_of_reference_uid`) so
-downstream AI segmentation and export can verify exact physical alignment.
-"""
+"""DICOM series inspection, multi-frame expansion, and 3D volume assembly with full spatial geometry preservation (Sprint 5 Task 1B, 1C, 1D)."""
 from __future__ import annotations
 
 import io
@@ -30,8 +12,6 @@ from .dicom_io import register_pydicom_fallback
 pydicom = register_pydicom_fallback()
 
 
-# Tags that may identify a person. Never copied out of a FileDataset, and
-# deleted before a dataset stays in memory for pixel stacking.
 _PHI_KEYWORDS = (
     "PatientName",
     "PatientID",
@@ -82,6 +62,8 @@ class VolumeGeometry:
     origin_lps_mm: tuple[float, float, float]
     direction_cosines: tuple[float, float, float, float, float, float, float, float, float]
     frame_of_reference_uid: str | None = None
+    patient_position: str | None = None
+    transfer_syntax_uid: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -90,6 +72,8 @@ class VolumeGeometry:
             "origin_lps_mm": [round(float(v), 6) for v in self.origin_lps_mm],
             "direction_cosines": [round(float(v), 6) for v in self.direction_cosines],
             "frame_of_reference_uid": self.frame_of_reference_uid,
+            "patient_position": self.patient_position,
+            "transfer_syntax_uid": self.transfer_syntax_uid,
         }
 
 
@@ -110,6 +94,8 @@ class SeriesReport:
     origin_lps_mm: tuple[float, float, float] | None = None
     direction_cosines: tuple[float, ...] | None = None
     frame_of_reference_uid: str | None = None
+    patient_position: str | None = None
+    transfer_syntax_uid: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -192,6 +178,10 @@ def inspect(raw_files: list[bytes], stop_before_pixels: bool = True) -> tuple[Se
     if len(series_uids) > 1:
         problems.append(Problem("mixed_series", f"{len(series_uids)} different SeriesInstanceUIDs in upload"))
 
+    patient_positions = {str(ds.get("PatientPosition", "")).strip() for ds in readable if str(ds.get("PatientPosition", "")).strip()}
+    if len(patient_positions) > 1:
+        problems.append(Problem("mixed_patient_position", f"inconsistent PatientPosition values: {sorted(patient_positions)}"))
+
     positioned: list[tuple[float, np.ndarray, pydicom.Dataset]] = []
     missing_geom = 0
     for ds in readable:
@@ -202,11 +192,35 @@ def inspect(raw_files: list[bytes], stop_before_pixels: bool = True) -> tuple[Se
             missing_geom += 1
             continue
         n = _normal(iop)
-        z = float(np.dot(np.asarray([float(x) for x in ipp], dtype=np.float64), n))
-        positioned.append((z, np.asarray([float(x) for x in iop], dtype=np.float64), ds))
+        base_ipp = np.asarray([float(x) for x in ipp], dtype=np.float64)
+        iop_arr = np.asarray([float(x) for x in iop], dtype=np.float64)
+        num_frames = int(ds.get("NumberOfFrames", 1) or 1)
+        if num_frames > 1:
+            gfov = ds.get("GridFrameOffsetVector")
+            sbs = ds.get("SpacingBetweenSlices")
+            if gfov is not None and isinstance(gfov, (list, tuple)) and len(gfov) == num_frames:
+                for f_idx, off in enumerate(gfov):
+                    f_ds = pydicom.dataset.FileDataset(None, dict(ds), file_meta=getattr(ds, "file_meta", None))
+                    f_ds["_frame_index"] = f_idx
+                    f_ipp = base_ipp + float(off) * n
+                    f_ds["ImagePositionPatient"] = [float(f_ipp[0]), float(f_ipp[1]), float(f_ipp[2])]
+                    positioned.append((float(np.dot(f_ipp, n)), iop_arr, f_ds))
+            elif sbs is not None and float(sbs) > 0:
+                step = float(sbs)
+                for f_idx in range(num_frames):
+                    f_ds = pydicom.dataset.FileDataset(None, dict(ds), file_meta=getattr(ds, "file_meta", None))
+                    f_ds["_frame_index"] = f_idx
+                    f_ipp = base_ipp + (f_idx * step) * n
+                    f_ds["ImagePositionPatient"] = [float(f_ipp[0]), float(f_ipp[1]), float(f_ipp[2])]
+                    positioned.append((float(np.dot(f_ipp, n)), iop_arr, f_ds))
+            else:
+                missing_geom += 1
+        else:
+            z = float(np.dot(base_ipp, n))
+            positioned.append((z, iop_arr, ds))
 
     if missing_geom:
-        problems.append(Problem("missing_geometry", f"{missing_geom} slice(s) lack position, orientation, or pixel spacing"))
+        problems.append(Problem("missing_geometry", f"{missing_geom} slice(s)/multi-frame object(s) lack position, orientation, pixel spacing, or frame spacing"))
 
     if not positioned:
         return (
@@ -269,6 +283,8 @@ def inspect(raw_files: list[bytes], stop_before_pixels: bool = True) -> tuple[Se
     origin0 = (float(ipp0[0]), float(ipp0[1]), float(ipp0[2])) if ipp0 is not None else (0.0, 0.0, 0.0)
     dir_cosines = _direction_tuple(ref_iop)
     for_uid = str(ds0.get("FrameOfReferenceUID", "")).strip() or None
+    pat_pos = str(ds0.get("PatientPosition", "")).strip() or None
+    ts_uid = str(getattr(ds0, "file_meta", {}).get("TransferSyntaxUID", "")).strip() or None
 
     report = SeriesReport(
         n_files=len(raw_files),
@@ -286,6 +302,8 @@ def inspect(raw_files: list[bytes], stop_before_pixels: bool = True) -> tuple[Se
         origin_lps_mm=origin0,
         direction_cosines=dir_cosines,
         frame_of_reference_uid=for_uid,
+        patient_position=pat_pos,
+        transfer_syntax_uid=ts_uid,
     )
     return report, [(z, ds) for z, _, ds in positioned]
 
@@ -299,6 +317,9 @@ def stack_volume(raw_files: list[bytes]) -> tuple[np.ndarray, tuple[float, float
     planes = []
     for _, ds in ordered:
         arr = ds.pixel_array.astype(np.float32)
+        f_idx = ds.get("_frame_index")
+        if f_idx is not None and arr.ndim == 3:
+            arr = arr[int(f_idx)]
         slope = float(getattr(ds, "RescaleSlope", 1.0) or 1.0)
         intercept = float(getattr(ds, "RescaleIntercept", 0.0) or 0.0)
         planes.append(arr * slope + intercept)
@@ -319,5 +340,7 @@ def stack_volume_with_geometry(raw_files: list[bytes]) -> tuple[np.ndarray, Volu
         origin_lps_mm=(float(origin_lps[0]), float(origin_lps[1]), float(origin_lps[2])),
         direction_cosines=tuple(float(v) for v in direction),  # type: ignore[arg-type]
         frame_of_reference_uid=report.frame_of_reference_uid,
+        patient_position=report.patient_position,
+        transfer_syntax_uid=report.transfer_syntax_uid,
     )
     return vol, geometry, report

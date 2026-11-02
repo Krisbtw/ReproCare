@@ -206,7 +206,7 @@ export function cropToBoundingBox(mask: Mask, margin: number): { mask: Mask; ori
   const a: Vec3 = [Math.max(0, lo[0] - margin), Math.max(0, lo[1] - margin), Math.max(0, lo[2] - margin)];
   const b: Vec3 = [Math.min(nx - 1, hi[0] + margin), Math.min(ny - 1, hi[1] + margin), Math.min(nz - 1, hi[2] + margin)];
   const dims: Vec3 = [b[0] - a[0] + 1, b[1] - a[1] + 1, b[2] - a[2] + 1];
-  const out = emptyMask(dims, mask.spacingMm);
+  const out = emptyMask(dims, mask.spacingMm, mask.geometry);
   for (let z = 0; z < dims[2]; z += 1) {
     for (let y = 0; y < dims[1]; y += 1) {
       for (let x = 0; x < dims[0]; x += 1) {
@@ -237,6 +237,7 @@ export function meshFromMask(mask: Mask, opts: MeshOptions = {}): { mesh: Mesh; 
     mesh.positions[i + 2] += oz;
   }
   if (taubin > 0 && mesh.indices.length > 0) mesh = taubinSmooth(mesh, taubin);
+  if (mask.geometry) mesh.geometry = mask.geometry;
   return { mesh, quality: meshQuality(mesh), blurIterations: blur, taubinIterations: taubin };
 }
 

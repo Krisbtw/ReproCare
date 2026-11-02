@@ -26,6 +26,21 @@ import {
 import { insertLabVersion, type LabVersionInput } from "./lab-version.ts";
 import { applyMenarcheYear } from "./menarche.ts";
 import {
+  recordFibroidPathwayAssessment,
+  reviewFibroidPathwayAssessment,
+  listFibroidPathwayAssessments,
+  recordEndometriosisPathwayAssessment,
+  recordOvarianCystPathwayAssessment,
+  recordPcosPathwayAssessment,
+  reviewConditionPathwayRecord,
+  getUnifiedPatientHistory,
+  CONDITION_EVIDENCE_TIERS,
+  type ConditionEvidenceTier,
+  type CystMorphologyCategory,
+  type PcosHormoneLabs,
+  type PcosMetabolicContext,
+} from "./workflows.ts";
+import {
   ALL_CLINICIAN_PERMISSIONS,
   DEFAULT_CLINICIAN_PERMISSIONS,
   grantClinicianConsent,
@@ -736,6 +751,7 @@ export async function executeGetWorkspace(sql: Sql, rawUserId: string): Promise<
     extractions,
     verifications: (verifications ?? []) as Workspace["verifications"],
     registrations,
+    fibroidAssessments: await sql<NonNullable<Workspace["fibroidAssessments"]>[number]>`select * from pathway_fibroid_assessments where user_id = ${userId} order by created_at desc`.catch(() => []),
     endometriosisRecords,
     ovarianCystRecords,
     pcosAssessments,
@@ -2167,7 +2183,21 @@ export const saveVolumeRegistration = createServerFn({ method: "POST" })
 export async function executeSaveEndometriosisRecord(
   sql: Sql,
   rawUserId: string,
-  data: { patientId: string; lesionSites: string[]; surgicalHistory: string; stagingRASRM?: string; imagingNote: string },
+  data: {
+    patientId: string;
+    studyId?: string | null;
+    reportId?: string | null;
+    lesionSites: string[];
+    imagingStatus?: "clinician_reported_finding" | "normal_or_no_visible_lesion" | "uncertain_finding";
+    surgicalHistory: string;
+    surgicalConfirmationStatus?: "not_performed" | "laparoscopy_confirmed" | "laparoscopy_negative" | "clinical_working_assessment";
+    stagingRASRM?: string;
+    imagingNote: string;
+    symptomHistory?: string[];
+    menstrualHistoryNote?: string | null;
+    historicalComparisonNote?: string | null;
+    evidenceTier?: ConditionEvidenceTier;
+  },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "entering endometriosis clinical records");
   const { patientOwnerUserId } = await requirePatientRecordAccess(
@@ -2177,17 +2207,8 @@ export async function executeSaveEndometriosisRecord(
     "entering endometriosis clinical records",
     "add_annotations",
   );
-  const id = crypto.randomUUID();
-  await sql`
-    insert into pathway_endometriosis_records (
-      id, user_id, patient_id, lesion_sites_json, surgical_history, staging_rASRM, imaging_note
-    ) values (
-      ${id}, ${patientOwnerUserId}, ${data.patientId}, ${JSON.stringify(data.lesionSites)},
-      ${data.surgicalHistory}, ${data.stagingRASRM ?? null}, ${data.imagingNote}
-    )
-  `;
-  await audit(sql, auth.userId, "save_endometriosis_record", "endometriosis_record", id, `Sites: ${data.lesionSites.join(", ")}; Staging: ${data.stagingRASRM ?? "N/A"}`);
-  return { ok: true, id };
+  const rec = await recordEndometriosisPathwayAssessment(sql, patientOwnerUserId, auth.userId, data);
+  return { ok: true, id: rec.id, record: rec };
 }
 
 /** Save structured Endometriosis clinical record. */
@@ -2227,7 +2248,23 @@ export const getEndometriosisRecords = createServerFn({ method: "POST" })
 export async function executeSaveOvarianCystRecord(
   sql: Sql,
   rawUserId: string,
-  data: { patientId: string; laterality: "left" | "right" | "bilateral"; maxDiameterMm: number; featuresText: string; followUpMonths?: number; clinicalNote: string },
+  data: {
+    patientId: string;
+    studyId?: string | null;
+    reportId?: string | null;
+    laterality: "left" | "right" | "bilateral";
+    anatomicalLocation?: string;
+    maxDiameterMm: number;
+    axesMm?: [number, number, number] | null;
+    morphologyCategory?: CystMorphologyCategory;
+    featuresText: string;
+    uncertaintyFlag?: boolean;
+    uncertaintyNote?: string | null;
+    associatedSymptoms?: string[];
+    followUpMonths?: number;
+    clinicalNote: string;
+    evidenceTier?: ConditionEvidenceTier;
+  },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "entering ovarian cyst clinical records");
   const { patientOwnerUserId } = await requirePatientRecordAccess(
@@ -2237,17 +2274,8 @@ export async function executeSaveOvarianCystRecord(
     "entering ovarian cyst clinical records",
     "add_annotations",
   );
-  const id = crypto.randomUUID();
-  await sql`
-    insert into pathway_ovarian_cyst_records (
-      id, user_id, patient_id, laterality, max_diameter_mm, features_text, follow_up_months, clinical_note
-    ) values (
-      ${id}, ${patientOwnerUserId}, ${data.patientId}, ${data.laterality},
-      ${data.maxDiameterMm}, ${data.featuresText}, ${data.followUpMonths ?? null}, ${data.clinicalNote}
-    )
-  `;
-  await audit(sql, auth.userId, "save_ovarian_cyst_record", "ovarian_cyst_record", id, `${data.laterality} cyst, diameter: ${data.maxDiameterMm}mm`);
-  return { ok: true, id };
+  const rec = await recordOvarianCystPathwayAssessment(sql, patientOwnerUserId, auth.userId, data);
+  return { ok: true, id: rec.id, record: rec };
 }
 
 /** Save structured Ovarian Cyst clinical record. */
@@ -2289,11 +2317,16 @@ export async function executeSavePcosAssessment(
   rawUserId: string,
   data: {
     patientId: string;
+    studyId?: string | null;
     cycleIrregularity: boolean;
     hyperandrogenismClinical: boolean;
     hyperandrogenismBiochemical: boolean;
     ultrasoundOrAmhFeatures: boolean;
+    exclusionMimickersChecked?: boolean;
+    hormoneLabs?: PcosHormoneLabs;
+    metabolicContext?: PcosMetabolicContext;
     notes: string;
+    referenceYear?: number;
   },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "entering PCOS assessments");
@@ -2304,22 +2337,15 @@ export async function executeSavePcosAssessment(
     "entering PCOS assessments",
     "add_annotations",
   );
-  const hyperandrogenism = data.hyperandrogenismClinical || data.hyperandrogenismBiochemical;
-  const criteriaCount = [data.cycleIrregularity, hyperandrogenism, data.ultrasoundOrAmhFeatures].filter(Boolean).length;
-  const rotterdamMet = criteriaCount >= 2;
-
-  const id = crypto.randomUUID();
-  await sql`
-    insert into pathway_pcos_assessments (
-      id, user_id, patient_id, cycle_irregularity, hyperandrogenism_clinical, hyperandrogenism_biochemical,
-      ultrasound_or_amh_features, rotterdam_criteria_met, notes
-    ) values (
-      ${id}, ${patientOwnerUserId}, ${data.patientId}, ${data.cycleIrregularity}, ${data.hyperandrogenismClinical},
-      ${data.hyperandrogenismBiochemical}, ${data.ultrasoundOrAmhFeatures}, ${rotterdamMet}, ${data.notes}
-    )
-  `;
-  await audit(sql, auth.userId, "save_pcos_assessment", "pcos_assessment", id, `Rotterdam criteria met: ${rotterdamMet} (${criteriaCount}/3 features)`);
-  return { ok: true, id, rotterdamCriteriaMet: rotterdamMet };
+  const rec = await recordPcosPathwayAssessment(sql, patientOwnerUserId, auth.userId, data);
+  return {
+    ok: true,
+    id: rec.id,
+    rotterdamCriteriaMet: rec.rotterdam_criteria_met,
+    assessmentCohort: rec.assessment_cohort,
+    adultCriteriaAllowed: rec.adult_criteria_allowed,
+    record: rec,
+  };
 }
 
 /** Save structured PCOS clinical assessment (Rotterdam Criteria). */
@@ -3200,4 +3226,128 @@ export const getReportRevisions = createServerFn({ method: "POST" })
   .handler(async ({ context, data: reportId }) => {
     const sql = await getSql();
     return executeGetReportRevisions(sql, context.userId, reportId);
+  });
+
+
+// ============================================================================
+// Sprint 5 Task 2: Condition-Specific Healthcare Workflows & Unified History
+// ============================================================================
+
+export { CONDITION_EVIDENCE_TIERS, type ConditionEvidenceTier, type CystMorphologyCategory };
+
+export async function executeSaveFibroidAssessment(
+  sql: Sql,
+  rawUserId: string,
+  data: Parameters<typeof recordFibroidPathwayAssessment>[3],
+) {
+  const auth = await requireVerifiedClinicianOrAdmin(
+    sql,
+    rawUserId,
+    "recording a uterine fibroid pathway assessment",
+  );
+  const { patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    auth.userId,
+    data.patientId,
+    "recording a uterine fibroid pathway assessment",
+    "add_annotations",
+  );
+  const rec = await recordFibroidPathwayAssessment(sql, patientOwnerUserId, auth.userId, data);
+  return { ok: true, id: rec.id, record: rec };
+}
+
+export const saveFibroidAssessment = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: Parameters<typeof recordFibroidPathwayAssessment>[3]) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeSaveFibroidAssessment(sql, context.userId, data);
+  });
+
+export async function executeGetFibroidAssessments(
+  sql: Sql,
+  rawUserId: string,
+  patientId: string,
+) {
+  await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    patientId,
+    "view uterine fibroid assessments",
+    "view_findings",
+  );
+  return listFibroidPathwayAssessments(sql, patientId);
+}
+
+export const getFibroidAssessments = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((patientId: string) => patientId)
+  .handler(async ({ context, data: patientId }) => {
+    const sql = await getSql();
+    return executeGetFibroidAssessments(sql, context.userId, patientId);
+  });
+
+export async function executeReviewPathwayRecord(
+  sql: Sql,
+  rawUserId: string,
+  input: {
+    patientId: string;
+    pathway: "fibroids" | "endometriosis" | "ovarian_cyst" | "pcos";
+    recordId: string;
+    decision: "clinician_reviewed" | "clinician_confirmed_assessment" | "rejected";
+    note: string;
+  },
+) {
+  const auth = await requireVerifiedClinicianOrAdmin(
+    sql,
+    rawUserId,
+    "reviewing or approving a clinical pathway assessment",
+  );
+  await requirePatientRecordAccess(
+    sql,
+    auth.userId,
+    input.patientId,
+    "reviewing or approving a clinical pathway assessment",
+    "approve_or_reject_findings",
+  );
+  return reviewConditionPathwayRecord(sql, auth.userId, input);
+}
+
+export const reviewPathwayRecord = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator(
+    (input: {
+      patientId: string;
+      pathway: "fibroids" | "endometriosis" | "ovarian_cyst" | "pcos";
+      recordId: string;
+      decision: "clinician_reviewed" | "clinician_confirmed_assessment" | "rejected";
+      note: string;
+    }) => input,
+  )
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeReviewPathwayRecord(sql, context.userId, data);
+  });
+
+export async function executeGetUnifiedPatientHistory(
+  sql: Sql,
+  rawUserId: string,
+  patientId: string,
+) {
+  await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    patientId,
+    "view unified patient history",
+    "view_demographics",
+  );
+  return getUnifiedPatientHistory(sql, patientId);
+}
+
+export const getUnifiedPatientHistoryServer = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((patientId: string) => patientId)
+  .handler(async ({ context, data: patientId }) => {
+    const sql = await getSql();
+    return executeGetUnifiedPatientHistory(sql, context.userId, patientId);
   });

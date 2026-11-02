@@ -61,7 +61,7 @@ export function windowFromSeed(volume: Volume, seed: Vec3, radius = 2, kSigma = 
 }
 
 export function regionGrow(volume: Volume, seed: Vec3, win: Window): Mask {
-  const mask = emptyMask(volume.dims, volume.spacingMm);
+  const mask = emptyMask(volume.dims, volume.spacingMm, volume.geometry);
   if (!inBounds(volume.dims, seed[0], seed[1], seed[2])) throw new Error("Seed is outside the volume.");
   const start = vIndex(volume.dims, seed[0], seed[1], seed[2]);
   const sv = volume.data[start];
@@ -94,7 +94,7 @@ export function regionGrow(volume: Volume, seed: Vec3, win: Window): Mask {
 export function dilate(mask: Mask, iterations = 1): Mask {
   let cur = mask;
   for (let it = 0; it < iterations; it += 1) {
-    const out = emptyMask(cur.dims, cur.spacingMm);
+    const out = emptyMask(cur.dims, cur.spacingMm, cur.geometry);
     for (let z = 0; z < cur.dims[2]; z += 1) {
       for (let y = 0; y < cur.dims[1]; y += 1) {
         for (let x = 0; x < cur.dims[0]; x += 1) {
@@ -120,7 +120,7 @@ export function dilate(mask: Mask, iterations = 1): Mask {
 export function erode(mask: Mask, iterations = 1): Mask {
   let cur = mask;
   for (let it = 0; it < iterations; it += 1) {
-    const out = emptyMask(cur.dims, cur.spacingMm);
+    const out = emptyMask(cur.dims, cur.spacingMm, cur.geometry);
     for (let z = 0; z < cur.dims[2]; z += 1) {
       for (let y = 0; y < cur.dims[1]; y += 1) {
         for (let x = 0; x < cur.dims[0]; x += 1) {
@@ -185,7 +185,7 @@ export function keepLargestComponent(mask: Mask): Mask {
   if (sizes.length <= 1) return mask;
   let best = 1;
   for (let k = 2; k <= sizes.length; k += 1) if (sizes[k - 1] > sizes[best - 1]) best = k;
-  const out = emptyMask(mask.dims, mask.spacingMm);
+  const out = emptyMask(mask.dims, mask.spacingMm, mask.geometry);
   for (let i = 0; i < labels.length; i += 1) if (labels[i] === best) out.data[i] = 1;
   return out;
 }

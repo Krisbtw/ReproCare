@@ -24,9 +24,11 @@ import {
   linkReportEvidence,
   requestClinicianVerification,
   verifyClinician,
+  saveFibroidAssessment,
   saveEndometriosisRecord,
   saveOvarianCystRecord,
   savePcosAssessment,
+  reviewPathwayRecord,
   grantPatientConsent,
   revokePatientConsent,
   reviewReportExtraction,
@@ -1335,7 +1337,20 @@ function Context({
           <Button type="submit" disabled={busy}>Add lab</Button>
         </form>
       </section>
-      <div className="grid gap-4 lg:grid-cols-3">
+      <section className="rounded-lg border border-line bg-paper p-3 text-xs text-ink-soft" data-testid="evidence-provenance-tiers">
+        <span className="font-semibold text-ink">6-Tier Evidence & Provenance Model: </span>
+        <Chip>1. Patient-reported</Chip>{" "}
+        <Chip>2. Original imaging observation</Chip>{" "}
+        <Chip>3. Report-extracted</Chip>{" "}
+        <Chip tone="clay">4. AI experimental (unconfirmed)</Chip>{" "}
+        <Chip tone="pine">5. Clinician-reviewed</Chip>{" "}
+        <Chip tone="pine">6. Confirmed clinical assessment</Chip>
+        <span className="ml-2 text-muted">
+          AI outputs never overwrite source evidence. Only verified clinicians can approve clinical findings.
+        </span>
+      </section>
+      <div className="grid gap-4 lg:grid-cols-2">
+        <FibroidPathwaySection pid={pid} data={data} clinician={clinician} busy={busy} run={run} />
         <EndometriosisSection pid={pid} data={data} clinician={clinician} busy={busy} run={run} />
         <OvarianCystSection pid={pid} data={data} clinician={clinician} busy={busy} run={run} />
         <PcosAssessmentSection pid={pid} data={data} clinician={clinician} busy={busy} run={run} />
@@ -1613,6 +1628,176 @@ function ClinicianVerificationForm({
   );
 }
 
+
+function FibroidPathwaySection({
+  pid,
+  data,
+  clinician,
+  busy,
+  run,
+}: {
+  pid: string;
+  data: Workspace;
+  clinician?: boolean;
+  busy: boolean;
+  run: (task: () => Promise<unknown>) => Promise<void>;
+}) {
+  const records = (data.fibroidAssessments ?? []).filter((r) => !r.patient_id || r.patient_id === pid);
+  const findings = (data.findings as Bag[]).filter((f) => s(f, "patient_id") === pid && s(f, "structure") === "fibroid");
+  const [location, setLocation] = useState("Anterior wall intramural");
+  const [figo, setFigo] = useState("4");
+  const [axesText, setAxesText] = useState("42, 37, 34");
+  const [segSource, setSegSource] = useState("clinician_caliper");
+
+  return (
+    <section className="space-y-3 rounded-lg border border-line bg-card p-4" data-testid="fibroid-pathway-section">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl">Uterine Fibroid Pathway</h2>
+        <Chip tone="pine">PALM-COEIN / FIGO</Chip>
+      </div>
+      <p className="text-xs text-muted">
+        Integrates MRI/US measurements, 3D volume estimation, report findings, and clinician-reviewed FIGO classification. FIGO classifications are never invented; measurements remain unconfirmed until clinician review.
+      </p>
+      <ul className="space-y-2 text-sm">
+        {records.map((rec) => (
+          <li key={rec.id} className="rounded-md border border-line bg-paper p-2 space-y-1">
+            <div className="flex flex-wrap items-center justify-between gap-1 text-xs">
+              <span className="font-medium text-ink">
+                {rec.anatomical_location} · {rec.figo_classification ? `FIGO ${rec.figo_classification} (${rec.figo_source})` : "FIGO not assigned"}
+              </span>
+              <div className="flex gap-1">
+                <Chip tone={rec.evidence_tier === "ai_experimental" ? "clay" : "ink"}>{rec.evidence_tier.replaceAll("_", " ")}</Chip>
+                <Chip tone={rec.review_status === "clinician_confirmed_assessment" || rec.review_status === "clinician_reviewed" ? "pine" : "clay"}>
+                  {rec.review_status.replaceAll("_", " ")}
+                </Chip>
+              </div>
+            </div>
+            <p className="text-xs text-ink-soft">
+              Longest: {rec.longest_mm ?? "—"} mm · Volume: {rec.volume_mm3 ? `${(rec.volume_mm3 / 1000).toFixed(1)} mL (${rec.volume_mm3} mm³)` : "—"}
+            </p>
+            {rec.longitudinal_comparison_note && <p className="text-xs text-pine">{rec.longitudinal_comparison_note}</p>}
+            {clinician && rec.review_status === "unreviewed" && (
+              <div className="pt-1">
+                <Button
+                  tone="ghost"
+                  disabled={busy}
+                  onClick={() =>
+                    void run(() =>
+                      reviewPathwayRecord({
+                        data: {
+                          patientId: pid,
+                          pathway: "fibroids",
+                          recordId: rec.id,
+                          decision: "clinician_confirmed_assessment",
+                          note: "Clinician verified fibroid location, dimensions, and FIGO subclassification.",
+                        },
+                      }),
+                    )
+                  }
+                >
+                  Approve Fibroid Assessment
+                </Button>
+              </div>
+            )}
+          </li>
+        ))}
+        {records.length === 0 && (
+          <li className="text-xs text-muted">
+            {findings.length > 0
+              ? `${findings.length} fibroid finding(s) tracked in Studio/ReproTrace. Record a structured pathway assessment below.`
+              : "No structured uterine fibroid pathway assessments recorded for this patient."}
+          </li>
+        )}
+      </ul>
+      {clinician && (
+        <form
+          className="space-y-2 border-t border-line pt-2 text-xs"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const parsedAxes = axesText
+              .split(",")
+              .map((x) => Number(x.trim()))
+              .filter((n) => Number.isFinite(n) && n > 0);
+            const axesMm =
+              parsedAxes.length === 3
+                ? ([parsedAxes[0], parsedAxes[1], parsedAxes[2]] as [number, number, number])
+                : null;
+            void run(() =>
+              saveFibroidAssessment({
+                data: {
+                  patientId: pid,
+                  findingId: findings[0] ? s(findings[0], "id") : null,
+                  anatomicalLocation: location,
+                  figoClassification: figo || null,
+                  figoSource: figo ? "clinician_entered" : "not_assigned",
+                  axesMm,
+                  segmentationSource: segSource,
+                },
+              }),
+            );
+          }}
+        >
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block text-muted">
+              Anatomical Location
+              <input
+                className="mt-1 min-h-10 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink"
+                value={location}
+                onChange={(e) => setLocation(e.target.value)}
+              />
+            </label>
+            <label className="block text-muted">
+              FIGO Subclassification (optional)
+              <select
+                className="mt-1 min-h-10 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink"
+                value={figo}
+                onChange={(e) => setFigo(e.target.value)}
+              >
+                <option value="">Not assigned</option>
+                <option value="0">FIGO 0 (Pedunculated intracavitary)</option>
+                <option value="1">FIGO 1 (Submucosal &lt;50% intramural)</option>
+                <option value="2">FIGO 2 (Submucosal &gt;=50% intramural)</option>
+                <option value="3">FIGO 3 (100% intramural, contacts endometrium)</option>
+                <option value="4">FIGO 4 (Intramural)</option>
+                <option value="5">FIGO 5 (Subserosal &gt;=50% intramural)</option>
+                <option value="6">FIGO 6 (Subserosal &lt;50% intramural)</option>
+                <option value="7">FIGO 7 (Pedunculated subserosal)</option>
+                <option value="8">FIGO 8 (Other, e.g. cervical/parasitic)</option>
+                <option value="2-5">FIGO 2-5 (Hybrid transmural)</option>
+              </select>
+            </label>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block text-muted">
+              3-Axis Dimensions (mm)
+              <input
+                className="mt-1 min-h-10 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink"
+                value={axesText}
+                onChange={(e) => setAxesText(e.target.value)}
+              />
+            </label>
+            <label className="block text-muted">
+              Measurement Source
+              <select
+                className="mt-1 min-h-10 w-full rounded-md border border-line bg-paper px-2 text-sm text-ink"
+                value={segSource}
+                onChange={(e) => setSegSource(e.target.value)}
+              >
+                <option value="clinician_caliper">Clinician 3-axis caliper</option>
+                <option value="classical_region_growing">Seeded region growing</option>
+                <option value="ai_unet3d">AI 3D UNet segmentation (experimental)</option>
+              </select>
+            </label>
+          </div>
+          <Button type="submit" disabled={busy}>
+            Save Fibroid Assessment
+          </Button>
+        </form>
+      )}
+    </section>
+  );
+}
+
 function EndometriosisSection({
   pid,
   data,
@@ -1639,7 +1824,7 @@ function EndometriosisSection({
         <Chip tone="clay">Clinical Decision Aid</Chip>
       </div>
       <p className="text-xs text-muted">
-        rASRM / Enzian classification aid. Not an autonomous diagnostic device. Surgical and multidisciplinary correlation required.
+        rASRM / Enzian classification aid. Not an autonomous diagnostic device. A normal ultrasound or MRI examination NEVER excludes endometriosis, and symptoms alone do not localize lesions.
       </p>
       <ul className="space-y-2 text-sm">
         {records.map((rec) => (

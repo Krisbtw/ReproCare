@@ -277,6 +277,32 @@ export type RegistrationRow = {
   created_at: string;
 };
 
+export type FibroidAssessmentItem = {
+  id: string;
+  user_id?: string;
+  patient_id?: string;
+  finding_id: string | null;
+  finding_version_id: string | null;
+  study_id: string | null;
+  report_id: string | null;
+  anatomical_location: string;
+  figo_classification: string | null;
+  figo_source: string;
+  axes_mm_json: string | null;
+  longest_mm: number | null;
+  volume_mm3: number | null;
+  volume_estimation_method: string | null;
+  segmentation_source: string | null;
+  associated_symptoms_json: string;
+  longitudinal_comparison_note: string | null;
+  evidence_tier: string;
+  review_status: string;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  review_note: string | null;
+  created_at: string;
+};
+
 export type EndometriosisRecordItem = {
   id: string;
   patient_id?: string;
@@ -341,6 +367,7 @@ export type Workspace = {
   models: ModelRow[];
   verifications?: ClinicianVerificationRow[];
   registrations?: RegistrationRow[];
+  fibroidAssessments?: FibroidAssessmentItem[];
   endometriosisRecords?: EndometriosisRecordItem[];
   ovarianCystRecords?: OvarianCystRecordItem[];
   pcosAssessments?: PcosAssessmentItem[];

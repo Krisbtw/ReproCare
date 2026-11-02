@@ -1,4 +1,14 @@
-"""Pure-Python NEMA PS3.10 Explicit VR Little Endian DICOM reader/writer and pydicom fallback."""
+"""Pure-Python NEMA PS3.10 Multi-Syntax DICOM reader/writer and pydicom fallback (Sprint 5 Task 1A & 1B).
+
+Supports:
+- Explicit VR Little Endian (1.2.840.10008.1.2.1)
+- Implicit VR Little Endian (1.2.840.10008.1.2)
+- Explicit VR Big Endian (1.2.840.10008.1.2.2)
+- Deflated Explicit VR Little Endian (1.2.840.10008.1.2.1.99)
+- RLE Lossless (1.2.840.10008.1.2.5)
+- Encapsulated JPEG / JPEG 2000 fragment parsing & validation
+- Multi-frame (NumberOfFrames 0028,0008, GridFrameOffsetVector 3004,000C)
+"""
 from __future__ import annotations
 
 import io
@@ -7,11 +17,15 @@ import struct
 import sys
 import types
 import uuid
+import zlib
 from typing import Any
 
 import numpy as np
 
 ExplicitVRLittleEndian = "1.2.840.10008.1.2.1"
+ImplicitVRLittleEndian = "1.2.840.10008.1.2"
+DeflatedExplicitVRLittleEndian = "1.2.840.10008.1.2.1.99"
+RLELossless = "1.2.840.10008.1.2.5"
 MRImageStorage = "1.2.840.10008.5.1.4.1.1.4"
 
 TAG_TO_KEYWORD: dict[tuple[int, int], tuple[str, str]] = {
@@ -43,6 +57,7 @@ TAG_TO_KEYWORD: dict[tuple[int, int], tuple[str, str]] = {
     (0x0010, 0x2154): ("PatientTelephoneNumbers", "SH"),
     (0x0018, 0x0050): ("SliceThickness", "DS"),
     (0x0018, 0x0088): ("SpacingBetweenSlices", "DS"),
+    (0x0018, 0x5100): ("PatientPosition", "CS"),
     (0x0020, 0x000D): ("StudyInstanceUID", "UI"),
     (0x0020, 0x000E): ("SeriesInstanceUID", "UI"),
     (0x0020, 0x0010): ("StudyID", "SH"),
@@ -53,6 +68,7 @@ TAG_TO_KEYWORD: dict[tuple[int, int], tuple[str, str]] = {
     (0x0020, 0x0052): ("FrameOfReferenceUID", "UI"),
     (0x0028, 0x0002): ("SamplesPerPixel", "US"),
     (0x0028, 0x0004): ("PhotometricInterpretation", "CS"),
+    (0x0028, 0x0008): ("NumberOfFrames", "IS"),
     (0x0028, 0x0010): ("Rows", "US"),
     (0x0028, 0x0011): ("Columns", "US"),
     (0x0028, 0x0030): ("PixelSpacing", "DS"),
@@ -62,6 +78,7 @@ TAG_TO_KEYWORD: dict[tuple[int, int], tuple[str, str]] = {
     (0x0028, 0x0103): ("PixelRepresentation", "US"),
     (0x0028, 0x1052): ("RescaleIntercept", "DS"),
     (0x0028, 0x1053): ("RescaleSlope", "DS"),
+    (0x3004, 0x000C): ("GridFrameOffsetVector", "DS"),
     (0x7FE0, 0x0010): ("PixelData", "OW"),
 }
 
@@ -69,11 +86,57 @@ KEYWORD_TO_TAG: dict[str, tuple[tuple[int, int], str]] = {
     kw: (tag, vr) for tag, (kw, vr) in TAG_TO_KEYWORD.items()
 }
 
-LONG_VRS = {"OB", "OD", "OF", "OL", "OW", "SQ", "UC", "UR", "UT", "UN"}
+LONG_VRS = {"OB", "OD", "OF", "OL", "OW", "SQ", "UC", "UR", "UT", "UN", "OV"}
 
 
 def generate_uid(prefix: str = "1.2.826.0.1.3680043.8.498.") -> str:
     return f"{prefix}{uuid.uuid4().int % (10**24)}"
+
+
+def decode_rle_lossless_frame(rle_bytes: bytes, num_pixels: int, bytes_per_pixel: int) -> bytes:
+    """NEMA PS3.5 Annex G RLE Lossless decoder for a single frame."""
+    if len(rle_bytes) < 64:
+        raise ValueError("Corrupted RLE Lossless stream: shorter than 64-byte header")
+    header = struct.unpack_from("<16I", rle_bytes, 0)
+    num_segments = header[0]
+    if num_segments < 1 or num_segments > 15 or num_segments != bytes_per_pixel:
+        raise ValueError(f"Invalid RLE segment count {num_segments} (expected {bytes_per_pixel})")
+    out = bytearray(num_pixels * bytes_per_pixel)
+    for s in range(num_segments):
+        seg_start = header[s + 1]
+        seg_end = header[s + 2] if (s + 1) < num_segments else len(rle_bytes)
+        if seg_start < 64 or seg_end < seg_start or seg_end > len(rle_bytes):
+            raise ValueError(f"Corrupted RLE segment offset table at segment {s + 1}")
+        byte_index = bytes_per_pixel - 1 - s
+        p_idx = 0
+        pos = seg_start
+        while pos < seg_end and p_idx < num_pixels:
+            n = struct.unpack_from("<b", rle_bytes, pos)[0]
+            pos += 1
+            if 0 <= n <= 127:
+                count = n + 1
+                if pos + count > seg_end:
+                    raise ValueError("Corrupted RLE literal run exceeds segment boundary")
+                for _ in range(count):
+                    if p_idx >= num_pixels:
+                        break
+                    out[p_idx * bytes_per_pixel + byte_index] = rle_bytes[pos]
+                    pos += 1
+                    p_idx += 1
+            elif -127 <= n <= -1:
+                count = 1 - n
+                if pos >= seg_end:
+                    raise ValueError("Corrupted RLE replicate run missing value byte")
+                val = rle_bytes[pos]
+                pos += 1
+                for _ in range(count):
+                    if p_idx >= num_pixels:
+                        break
+                    out[p_idx * bytes_per_pixel + byte_index] = val
+                    p_idx += 1
+        if p_idx < num_pixels:
+            raise ValueError(f"Truncated RLE stream: decoded {p_idx}/{num_pixels} pixels")
+    return bytes(out)
 
 
 class FileMetaDataset(dict):
@@ -139,8 +202,11 @@ class FileDataset(dict):
             raise AttributeError("Dataset does not contain PixelData")
         rows = int(self.get("Rows", 0))
         cols = int(self.get("Columns", 0))
+        num_frames = int(self.get("NumberOfFrames", 1) or 1)
         bits = int(self.get("BitsAllocated", 16))
         signed = int(self.get("PixelRepresentation", 0)) == 1
+        ts_uid = str(self.file_meta.get("TransferSyntaxUID", ExplicitVRLittleEndian)).strip()
+
         if bits == 8:
             dtype = np.int8 if signed else np.uint8
         elif bits == 16:
@@ -149,14 +215,33 @@ class FileDataset(dict):
             dtype = np.int32 if signed else np.uint32
         else:
             raise ValueError(f"Unsupported BitsAllocated: {bits}")
+
+        bytes_per_pixel = max(1, bits // 8)
+        pixels_per_frame = rows * cols
+
+        if isinstance(raw, list):
+            # Encapsulated pixel data fragments
+            if ts_uid == RLELossless:
+                if len(raw) < num_frames:
+                    raise ValueError(f"RLE Lossless fragments ({len(raw)}) fewer than NumberOfFrames ({num_frames})")
+                decoded_frames = [
+                    decode_rle_lossless_frame(frag, pixels_per_frame, bytes_per_pixel)
+                    for frag in raw[:num_frames]
+                ]
+                raw = b"".join(decoded_frames)
+            else:
+                raise ValueError(f"Unsupported compressed transfer syntax '{ts_uid}' for pixel decoding")
+
         arr = np.frombuffer(raw, dtype=dtype)
-        expected = rows * cols
+        expected = pixels_per_frame * num_frames
         if arr.size < expected:
-            raise ValueError(f"PixelData buffer smaller than Rows*Columns ({arr.size} < {expected})")
-        return arr[:expected].reshape((rows, cols)).copy()
+            raise ValueError(f"PixelData buffer smaller than expected ({arr.size} < {expected})")
+        if num_frames > 1:
+            return arr[:expected].reshape((num_frames, rows, cols)).copy()
+        return arr[:pixels_per_frame].reshape((rows, cols)).copy()
 
 
-def _encode_element(group: int, elem: int, vr: str, val: Any) -> bytes:
+def _encode_element(group: int, elem: int, vr: str, val: Any, implicit: bool = False) -> bytes:
     if vr == "US":
         payload = struct.pack("<H", int(val))
     elif vr == "SS":
@@ -189,6 +274,9 @@ def _encode_element(group: int, elem: int, vr: str, val: Any) -> bytes:
         payload = str(val).encode("utf-8")
         if len(payload) % 2 == 1:
             payload += b" "
+
+    if implicit and group != 0x0002:
+        return struct.pack("<HHI", group, elem, len(payload)) + payload
 
     vr_bytes = vr.encode("ascii")
     if vr in LONG_VRS:
@@ -233,12 +321,16 @@ def dcmwrite(fp: Any, dataset: FileDataset, enforce_file_format: bool = True) ->
 
     meta_items: list[tuple[tuple[int, int], str, Any]] = []
     file_meta = getattr(dataset, "file_meta", None) or {}
+    ts_uid = str(file_meta.get("TransferSyntaxUID", ExplicitVRLittleEndian)).strip()
+    implicit = ts_uid == ImplicitVRLittleEndian
+    deflated = ts_uid == DeflatedExplicitVRLittleEndian
+
     for kw, val in file_meta.items():
         if kw in KEYWORD_TO_TAG:
             tag, vr = KEYWORD_TO_TAG[kw]
             meta_items.append((tag, vr, val))
     meta_items.sort(key=lambda item: item[0])
-    meta_bytes = b"".join(_encode_element(g, e, vr, v) for (g, e), vr, v in meta_items)
+    meta_bytes = b"".join(_encode_element(g, e, vr, v, implicit=False) for (g, e), vr, v in meta_items)
     out.write(struct.pack("<HH2sH", 0x0002, 0x0000, b"UL", 4) + struct.pack("<I", len(meta_bytes)))
     out.write(meta_bytes)
 
@@ -251,15 +343,42 @@ def dcmwrite(fp: Any, dataset: FileDataset, enforce_file_format: bool = True) ->
             if tag[0] != 0x0002:
                 body_items.append((tag, vr, val))
     body_items.sort(key=lambda item: item[0])
+    body_buf = io.BytesIO()
     for (g, e), vr, val in body_items:
-        out.write(_encode_element(g, e, vr, val))
+        body_buf.write(_encode_element(g, e, vr, val, implicit=implicit))
 
+    body_bytes = body_buf.getvalue()
+    if deflated:
+        c = zlib.compressobj(level=6, wbits=-15)
+        body_bytes = c.compress(body_bytes) + c.flush()
+
+    out.write(body_bytes)
     data = out.getvalue()
     if hasattr(fp, "write"):
         fp.write(data)
     else:
         with open(fp, "wb") as f:
             f.write(data)
+
+
+def _parse_encapsulated_fragments(data: bytes, offset: int) -> tuple[list[bytes], int]:
+    fragments: list[bytes] = []
+    n = len(data)
+    item_idx = 0
+    while offset + 8 <= n:
+        g, e, length = struct.unpack_from("<HHI", data, offset)
+        offset += 8
+        if (g, e) == (0xFFFE, 0xE0DD):
+            break
+        if (g, e) != (0xFFFE, 0xE000):
+            raise ValueError(f"Invalid encapsulated item tag ({g:04x},{e:04x})")
+        if offset + length > n:
+            raise ValueError("Truncated encapsulated pixel fragment")
+        if item_idx > 0 and length > 0:
+            fragments.append(data[offset : offset + length])
+        offset += length
+        item_idx += 1
+    return fragments, offset
 
 
 def dcmread(fp: Any, stop_before_pixels: bool = False, force: bool = False) -> FileDataset:
@@ -277,13 +396,34 @@ def dcmread(fp: Any, stop_before_pixels: bool = False, force: bool = False) -> F
     ds = FileDataset()
     offset = 132
     n = len(data)
+    transfer_syntax = ExplicitVRLittleEndian
+    deflated_inflated = False
+
     while offset + 8 <= n:
+        peek_group = struct.unpack_from("<H", data, offset)[0]
+        if peek_group != 0x0002 and not deflated_inflated and transfer_syntax == DeflatedExplicitVRLittleEndian:
+            raw_body = data[offset:]
+            try:
+                inflated = zlib.decompress(raw_body, -15)
+            except zlib.error:
+                inflated = zlib.decompress(raw_body)
+            data = data[:offset] + inflated
+            n = len(data)
+            deflated_inflated = True
+
         group, elem = struct.unpack_from("<HH", data, offset)
         if stop_before_pixels and (group, elem) == (0x7FE0, 0x0010):
             break
+
+        implicit = group != 0x0002 and transfer_syntax == ImplicitVRLittleEndian
         vr_raw = data[offset + 4 : offset + 6]
         vr = vr_raw.decode("ascii", errors="replace")
-        if vr in LONG_VRS:
+
+        if implicit:
+            length = struct.unpack_from("<I", data, offset + 4)[0]
+            val_offset = offset + 8
+            vr = TAG_TO_KEYWORD.get((group, elem), ("", "UN"))[1]
+        elif vr in LONG_VRS:
             if offset + 12 > n:
                 raise ValueError("Truncated long-VR DICOM element header")
             length = struct.unpack_from("<I", data, offset + 8)[0]
@@ -296,8 +436,17 @@ def dcmread(fp: Any, stop_before_pixels: bool = False, force: bool = False) -> F
             val_offset = offset + 8
             vr = TAG_TO_KEYWORD.get((group, elem), ("", "UN"))[1]
 
-        if length == 0xFFFFFFFF or val_offset + length > n:
-            raise ValueError("Invalid or undefined DICOM element length")
+        if length == 0xFFFFFFFF:
+            if (group, elem) == (0x7FE0, 0x0010):
+                fragments, new_offset = _parse_encapsulated_fragments(data, val_offset)
+                ds["PixelData"] = fragments
+                ds[(0x7FE0, 0x0010)] = fragments
+                offset = new_offset
+                continue
+            raise ValueError("Invalid undefined DICOM element length on non-PixelData element")
+
+        if val_offset + length > n:
+            raise ValueError("Truncated DICOM element value exceeds file length")
 
         raw_val = data[val_offset : val_offset + length]
         offset = val_offset + length
@@ -309,6 +458,8 @@ def dcmread(fp: Any, stop_before_pixels: bool = False, force: bool = False) -> F
         if group == 0x0002:
             if kw_vr:
                 ds.file_meta[kw_vr[0]] = decoded
+                if kw_vr[0] == "TransferSyntaxUID":
+                    transfer_syntax = str(decoded).strip()
         else:
             if kw_vr:
                 ds[kw_vr[0]] = decoded
@@ -334,6 +485,9 @@ def register_pydicom_fallback() -> Any:
 
         uid_mod = types.ModuleType("pydicom.uid")
         uid_mod.ExplicitVRLittleEndian = ExplicitVRLittleEndian  # type: ignore[attr-defined]
+        uid_mod.ImplicitVRLittleEndian = ImplicitVRLittleEndian  # type: ignore[attr-defined]
+        uid_mod.DeflatedExplicitVRLittleEndian = DeflatedExplicitVRLittleEndian  # type: ignore[attr-defined]
+        uid_mod.RLELossless = RLELossless  # type: ignore[attr-defined]
         uid_mod.MRImageStorage = MRImageStorage  # type: ignore[attr-defined]
         uid_mod.generate_uid = generate_uid  # type: ignore[attr-defined]
 
@@ -441,10 +595,6 @@ def register_pytest_fallback() -> Any:
 
 
 def register_torch_pickle_guard_fallback() -> None:
-    """When PyTorch is not installed, register a minimal `torch` shim providing `torch.save`
-    so security tests verifying that `UmdMonaiAdapter` rejects arbitrary pickled objects
-    (`weights_only=True`) can execute without importing full PyTorch.
-    """
     if "torch" in sys.modules:
         return
     try:

@@ -1,12 +1,22 @@
 /**
- * DICOM series geometry checks. Works on plain per-slice records so it does not depend on a parser.
+ * DICOM series geometry validation, multi-frame expansion, and physical LPS volume assembly
+ * (Sprint 5 Task 1B, 1C, 1D).
+ *
+ * Works on plain per-slice records so it does not depend on a parser.
  * Nothing here resamples or invents slices: a series with gaps is reported, not silently repaired.
  */
-import type { Vec3, Volume } from "./volume.ts";
+import type {
+  DirectionCosines9,
+   Vec3,
+  Volume,
+  VolumePatientGeometry,
+} from "./volume.ts";
+import type { DicomRead } from "../dicom/codec.ts";
 
 export type SliceGeometry = {
   id: string;
   seriesUid: string | null;
+  sopInstanceUid?: string | null;
   instanceNumber: number | null;
   /** ImagePositionPatient, mm. */
   positionMm: Vec3 | null;
@@ -17,6 +27,9 @@ export type SliceGeometry = {
   rows: number;
   cols: number;
   sliceThicknessMm: number | null;
+  transferSyntax?: string | null;
+  patientPosition?: string | null;
+  frameOfReferenceUid?: string | null;
 };
 
 export type IssueSeverity = "error" | "warning";
@@ -31,6 +44,9 @@ export type SeriesIssue = {
     | "bad_orientation"
     | "mixed_orientation"
     | "duplicate_position"
+    | "duplicate_sop_instance"
+    | "mixed_transfer_syntax"
+    | "mixed_patient_position"
     | "missing_slices"
     | "irregular_spacing"
     | "thickness_spacing_mismatch"
@@ -53,6 +69,8 @@ export type SeriesReport = {
   issues: SeriesIssue[];
   /** True only when a gap-free, consistently oriented volume can be stacked without resampling. */
   volumeReady: boolean;
+  /** Complete physical DICOM LPS coordinate frame of the stacked volume (origin at ordered slice 0). */
+  geometry?: VolumePatientGeometry | null;
 };
 
 const UNIT_TOL = 0.02;
@@ -65,10 +83,18 @@ function dot(a: Vec3, b: Vec3): number {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 function cross(a: Vec3, b: Vec3): Vec3 {
-  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
 }
 function norm(a: Vec3): number {
   return Math.sqrt(dot(a, a));
+}
+function normalizeVec(a: Vec3): Vec3 {
+  const n = norm(a);
+  return n > 0 ? [a[0] / n, a[1] / n, a[2] / n] : [0, 0, 0];
 }
 function median(values: number[]): number {
   const s = [...values].sort((x, y) => x - y);
@@ -98,6 +124,7 @@ export function geometryFromMetadata(
   return {
     id,
     seriesUid: metadata["Series UID"] ?? null,
+    sopInstanceUid: metadata["SOP instance UID"] ?? null,
     instanceNumber: inst && inst.length === 1 ? inst[0] : null,
     positionMm: pos && pos.length === 3 ? (pos as Vec3) : null,
     orientation: ori && ori.length === 6 ? (ori as SliceGeometry["orientation"]) : null,
@@ -105,7 +132,48 @@ export function geometryFromMetadata(
     rows,
     cols,
     sliceThicknessMm: thick && thick.length === 1 ? thick[0] : null,
+    transferSyntax: metadata["Transfer syntax"] ?? null,
+    patientPosition: metadata["Patient position"] ?? null,
+    frameOfReferenceUid: metadata["Frame of reference UID"] ?? null,
   };
+}
+
+/**
+ * Expands a single-frame or multi-frame `DicomRead` into individual `SliceGeometry` entries
+ * and a `Map<string, Float32Array>` of calibrated pixel buffers for `analyzeSeries` / `buildVolume`.
+ */
+export function expandMultiFrameDicomToSeries(
+  idPrefix: string,
+  read: DicomRead,
+): {
+  slices: SliceGeometry[];
+  pixelsById: Map<string, Float32Array>;
+} {
+  const slices: SliceGeometry[] = [];
+  const pixelsById = new Map<string, Float32Array>();
+  const baseGeom = geometryFromMetadata(idPrefix, read.metadata, read.rows, read.cols);
+
+  const count = Math.max(1, read.numberOfFrames);
+  for (let f = 0; f < count; f++) {
+    const frameId = count === 1 ? idPrefix : `${idPrefix}#frame-${f + 1}`;
+    const framePos = read.framePositionsMm[f] ?? (f === 0 ? baseGeom.positionMm : null);
+    slices.push({
+      ...baseGeom,
+      id: frameId,
+      sopInstanceUid:
+        baseGeom.sopInstanceUid && count > 1
+          ? `${baseGeom.sopInstanceUid}.${f + 1}`
+          : baseGeom.sopInstanceUid,
+      instanceNumber: count > 1 ? f + 1 : baseGeom.instanceNumber,
+      positionMm: framePos,
+    });
+    const frameBuf = read.frameFloatPixels[f];
+    if (frameBuf) {
+      pixelsById.set(frameId, frameBuf);
+    }
+  }
+
+  return { slices, pixelsById };
 }
 
 export function analyzeSeries(slices: SliceGeometry[]): SeriesReport {
@@ -120,9 +188,15 @@ export function analyzeSeries(slices: SliceGeometry[]): SeriesReport {
     cols: 0,
     issues,
     volumeReady: false,
+    geometry: null,
   };
   if (slices.length === 0) {
-    issues.push({ code: "empty", severity: "error", message: "No slices were provided.", sliceIds: [] });
+    issues.push({
+      code: "empty",
+      severity: "error",
+      message: "No slices were provided.",
+      sliceIds: [],
+    });
     return report;
   }
 
@@ -143,11 +217,62 @@ export function analyzeSeries(slices: SliceGeometry[]): SeriesReport {
       code: "mixed_matrix",
       severity: "error",
       message: "Slices do not share one rows × columns matrix.",
-      sliceIds: slices.filter((s) => s.rows !== report.rows || s.cols !== report.cols).map((s) => s.id),
+      sliceIds: slices
+        .filter((s) => s.rows !== report.rows || s.cols !== report.cols)
+        .map((s) => s.id),
     });
   }
 
-  const missing = slices.filter((s) => !s.positionMm || !s.orientation || !s.pixelSpacingMm);
+  // Check duplicate SOPInstanceUIDs when populated
+  const seenSop = new Map<string, string>();
+  const dupSopSliceIds: string[] = [];
+  for (const s of slices) {
+    if (s.sopInstanceUid) {
+      if (seenSop.has(s.sopInstanceUid)) {
+        dupSopSliceIds.push(s.id);
+      } else {
+        seenSop.set(s.sopInstanceUid, s.id);
+      }
+    }
+  }
+  if (dupSopSliceIds.length > 0) {
+    issues.push({
+      code: "duplicate_sop_instance",
+      severity: "error",
+      message: "Duplicate SOPInstanceUID detected in series.",
+      sliceIds: dupSopSliceIds,
+    });
+  }
+
+  // Check transfer syntax consistency across slices
+  const nonEmptySyntaxes = new Set(
+    slices.map((s) => s.transferSyntax).filter((t): t is string => Boolean(t)),
+  );
+  if (nonEmptySyntaxes.size > 1) {
+    issues.push({
+      code: "mixed_transfer_syntax",
+      severity: "warning",
+      message: `Series slices use multiple transfer syntaxes (${[...nonEmptySyntaxes].join(", ")}).`,
+      sliceIds: slices.map((s) => s.id),
+    });
+  }
+
+  // Check PatientPosition consistency across slices
+  const nonEmptyPositions = new Set(
+    slices.map((s) => s.patientPosition).filter((p): p is string => Boolean(p)),
+  );
+  if (nonEmptyPositions.size > 1) {
+    issues.push({
+      code: "mixed_patient_position",
+      severity: "error",
+      message: `Slices have conflicting PatientPosition values (${[...nonEmptyPositions].join(" vs ")}).`,
+      sliceIds: slices.map((s) => s.id),
+    });
+  }
+
+  const missing = slices.filter(
+    (s) => !s.positionMm || !s.orientation || !s.pixelSpacingMm,
+  );
   if (missing.length) {
     issues.push({
       code: "missing_geometry",
@@ -163,8 +288,10 @@ export function analyzeSeries(slices: SliceGeometry[]): SeriesReport {
   report.pixelSpacingMm = first.pixelSpacingMm;
   const psBad = slices.filter(
     (s) =>
-      Math.abs((s.pixelSpacingMm as number[])[0] - (first.pixelSpacingMm as number[])[0]) > 1e-3 ||
-      Math.abs((s.pixelSpacingMm as number[])[1] - (first.pixelSpacingMm as number[])[1]) > 1e-3,
+      Math.abs((s.pixelSpacingMm as number[])[0] - (first.pixelSpacingMm as number[])[0]) >
+        1e-3 ||
+      Math.abs((s.pixelSpacingMm as number[])[1] - (first.pixelSpacingMm as number[])[1]) >
+        1e-3,
   );
   if (psBad.length) {
     issues.push({
@@ -177,11 +304,16 @@ export function analyzeSeries(slices: SliceGeometry[]): SeriesReport {
 
   const row0 = (first.orientation as number[]).slice(0, 3) as Vec3;
   const col0 = (first.orientation as number[]).slice(3, 6) as Vec3;
-  if (Math.abs(norm(row0) - 1) > UNIT_TOL || Math.abs(norm(col0) - 1) > UNIT_TOL || Math.abs(dot(row0, col0)) > ORTHO_TOL) {
+  if (
+    Math.abs(norm(row0) - 1) > UNIT_TOL ||
+    Math.abs(norm(col0) - 1) > UNIT_TOL ||
+    Math.abs(dot(row0, col0)) > ORTHO_TOL
+  ) {
     issues.push({
       code: "bad_orientation",
       severity: "error",
-      message: "Image orientation vectors are not unit length and perpendicular, so the slice plane is not well defined.",
+      message:
+        "Image orientation vectors are not unit length and perpendicular, so the slice plane is not well defined.",
       sliceIds: [first.id],
     });
     return report;
@@ -194,18 +326,42 @@ export function analyzeSeries(slices: SliceGeometry[]): SeriesReport {
     issues.push({
       code: "mixed_orientation",
       severity: "error",
-      message: "Slices have different orientations (for example a localiser mixed into the series, or gantry tilt).",
+      message:
+        "Slices have different orientations (for example a localiser mixed into the series, or gantry tilt).",
       sliceIds: mixedOri.map((s) => s.id),
     });
     return report;
   }
 
-  const normal = cross(row0, col0);
+  const unitRow = normalizeVec(row0);
+  const unitCol = normalizeVec(col0);
+  const normal = normalizeVec(cross(unitRow, unitCol));
   report.normal = normal;
   const withPos = slices.map((s) => ({ s, d: dot(s.positionMm as Vec3, normal) }));
   withPos.sort((a, b) => a.d - b.d);
   report.orderedIds = withPos.map((p) => p.s.id);
   report.spatiallyOrdered = true;
+
+  const firstOrderedSlice = withPos[0].s;
+  const originMm = firstOrderedSlice.positionMm as Vec3;
+  const directionCosines: DirectionCosines9 = [
+    unitRow[0], unitRow[1], unitRow[2],
+    unitCol[0], unitCol[1], unitCol[2],
+    normal[0], normal[1], normal[2],
+  ];
+
+  report.geometry = {
+    originMm: [originMm[0], originMm[1], originMm[2]],
+    rowCosines: unitRow,
+    colCosines: unitCol,
+    normalCosines: normal,
+    directionCosines,
+    patientPosition: firstOrderedSlice.patientPosition ?? null,
+    frameOfReferenceUid: firstOrderedSlice.frameOfReferenceUid ?? null,
+    seriesUid: firstOrderedSlice.seriesUid ?? null,
+    transferSyntax: firstOrderedSlice.transferSyntax ?? null,
+    coordinateSystem: "DICOM_LPS",
+  };
 
   const deltas: number[] = [];
   const dupIds: string[] = [];
@@ -253,11 +409,14 @@ export function analyzeSeries(slices: SliceGeometry[]): SeriesReport {
     issues.push({
       code: "irregular_spacing",
       severity: "warning",
-      message: "Slice spacing varies by more than 10% in places. Distances along the slice axis are approximate.",
+      message:
+        "Slice spacing varies by more than 10% in places. Distances along the slice axis are approximate.",
       sliceIds: irregularIds,
     });
   }
-  const thicknesses = slices.map((s) => s.sliceThicknessMm).filter((n): n is number => n != null && Number.isFinite(n));
+  const thicknesses = slices
+    .map((s) => s.sliceThicknessMm)
+    .filter((n): n is number => n != null && Number.isFinite(n));
   const thick = thicknesses.length ? median(thicknesses) : NaN;
   if (Number.isFinite(thick) && Math.abs(thick - step) / step > 0.2) {
     issues.push({
@@ -270,8 +429,16 @@ export function analyzeSeries(slices: SliceGeometry[]): SeriesReport {
 
   const instanced = withPos.filter((p) => p.s.instanceNumber != null);
   if (instanced.length === withPos.length && withPos.length > 2) {
-    const asc = instanced.every((p, i) => i === 0 || (p.s.instanceNumber as number) > (instanced[i - 1].s.instanceNumber as number));
-    const desc = instanced.every((p, i) => i === 0 || (p.s.instanceNumber as number) < (instanced[i - 1].s.instanceNumber as number));
+    const asc = instanced.every(
+      (p, i) =>
+        i === 0 ||
+        (p.s.instanceNumber as number) > (instanced[i - 1].s.instanceNumber as number),
+    );
+    const desc = instanced.every(
+      (p, i) =>
+        i === 0 ||
+        (p.s.instanceNumber as number) < (instanced[i - 1].s.instanceNumber as number),
+    );
     if (!asc && !desc) {
       issues.push({
         code: "instance_order_disagrees",
@@ -287,12 +454,22 @@ export function analyzeSeries(slices: SliceGeometry[]): SeriesReport {
 }
 
 /**
- * Stacks per-slice pixel arrays (row-major, rows × cols, already rescaled to real intensities) into one volume.
+ * Stacks per-slice pixel arrays (row-major, rows × cols, already rescaled to real intensities) into one volume
+ * and attaches the physical DICOM patient geometry (`VolumePatientGeometry`).
  * Refuses when the series report is not volume-ready. x = column index, y = row index, z = slice index in spatial order.
  */
-export function buildVolume(report: SeriesReport, pixelsById: Map<string, Float32Array>): Volume {
+export function buildVolume(
+  report: SeriesReport,
+  pixelsById: Map<string, Float32Array>,
+): Volume {
   if (!report.volumeReady || !report.pixelSpacingMm || report.sliceSpacingMm == null) {
-    throw new Error("Series is not volume-ready: " + report.issues.filter((i) => i.severity === "error").map((i) => i.message).join(" "));
+    throw new Error(
+      "Series is not volume-ready: " +
+        report.issues
+          .filter((i) => i.severity === "error")
+          .map((i) => i.message)
+          .join(" "),
+    );
   }
   const nx = report.cols;
   const ny = report.rows;
@@ -300,7 +477,9 @@ export function buildVolume(report: SeriesReport, pixelsById: Map<string, Float3
   const data = new Float32Array(nx * ny * nz);
   report.orderedIds.forEach((id, z) => {
     const px = pixelsById.get(id);
-    if (!px || px.length !== nx * ny) throw new Error(`Pixel data missing or wrong size for slice ${id}.`);
+    if (!px || px.length !== nx * ny) {
+      throw new Error(`Pixel data missing or wrong size for slice ${id}.`);
+    }
     data.set(px, z * nx * ny);
   });
   // PixelSpacing is [between rows (y step), between columns (x step)].
@@ -308,5 +487,6 @@ export function buildVolume(report: SeriesReport, pixelsById: Map<string, Float3
     dims: [nx, ny, nz],
     spacingMm: [report.pixelSpacingMm[1], report.pixelSpacingMm[0], report.sliceSpacingMm],
     data,
+    ...(report.geometry ? { geometry: report.geometry } : {}),
   };
 }
