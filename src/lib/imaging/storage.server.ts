@@ -36,11 +36,13 @@ export type ImagingArtifactKind =
   | "mask"
   | "mesh"
   | "volume"
+  | "report"
+  | "clinical_report"
   | "dicom_instance"
   | "dicom_series"
   | "segmentation_mask"
   | "mesh_3d";
-export type CanonicalArtifactKind = "dicom" | "mask" | "mesh" | "volume";
+export type CanonicalArtifactKind = "dicom" | "mask" | "mesh" | "volume" | "report";
 export type ImagingObjectStatus = "active" | "archived" | "purged" | "corrupted" | "missing";
 
 const KIND_ALIAS_MAP: Record<string, CanonicalArtifactKind> = {
@@ -52,6 +54,8 @@ const KIND_ALIAS_MAP: Record<string, CanonicalArtifactKind> = {
   mesh: "mesh",
   mesh_3d: "mesh",
   volume: "volume",
+  report: "report",
+  clinical_report: "report",
 };
 
 function normalizeKind(kind: string): CanonicalArtifactKind {
@@ -410,14 +414,15 @@ async function checkPatientAndClinicianAccess(
   userId: string,
   patientId: string,
   requireClinicianForMutation: boolean,
-): Promise<void> {
+): Promise<{ patientOwnerUserId: string }> {
   if (!userId || typeof userId !== "string" || !userId.trim()) {
     throw new Error("Unauthorized: Authentication is required.");
   }
-  const patients = await sql<{ id: string; is_self: boolean }>`
-    select id, is_self from patients where id = ${patientId} and user_id = ${userId}
+  const allPatientRows = await sql<{ id: string; user_id: string; is_self: boolean }>`
+    select id, user_id, is_self from patients where id = ${patientId}
   `;
-  if (!patients[0]) {
+  const patient = allPatientRows[0];
+  if (!patient) {
     throw new Error("Record not found or access denied.");
   }
   const profileRows = await sql<{ role: string }>`select role from profiles where user_id = ${userId}`.catch(() => []);
@@ -441,14 +446,50 @@ async function checkPatientAndClinicianAccess(
       String(v.registry ?? "").trim().length > 0;
   }
 
+  if (patient.user_id !== userId) {
+    // Cross-user access: only permitted for a verified clinician with active, non-expired consent
+    if (!canActAsClinician || role === "admin") {
+      throw new Error("Record not found or access denied.");
+    }
+    const consentRows = await sql<{
+      id: string;
+      status: string;
+      permissions_json: string;
+      expires_at: string | null;
+    }>`
+      select id, status, permissions_json, expires_at
+      from patient_clinician_consents
+      where patient_id = ${patientId} and clinician_user_id = ${userId}
+      order by granted_at desc
+      limit 1
+    `.catch(() => []);
+    const c = consentRows[0];
+    const expired = c?.expires_at ? Date.parse(c.expires_at) <= Date.now() : false;
+    if (!c || c.status !== "active" || expired) {
+      throw new Error("Record not found or access denied.");
+    }
+    let perms: string[] = [];
+    try {
+      perms = JSON.parse(c.permissions_json || "[]");
+    } catch {
+      perms = [];
+    }
+    const neededPerm = requireClinicianForMutation ? "review_ai_findings" : "view_imaging";
+    if (!perms.includes(neededPerm) && !perms.includes("add_annotations") && !perms.includes("view_reports")) {
+      throw new Error(`Unauthorized: Active consent does not grant '${neededPerm}' permission.`);
+    }
+    return { patientOwnerUserId: patient.user_id };
+  }
+
   if (requireClinicianForMutation && !canActAsClinician) {
     throw new Error(
       "Unauthorized: Storing or modifying clinical imaging artifacts requires verified clinician or administrator credentials.",
     );
   }
-  if (!canActAsClinician && !patients[0].is_self) {
+  if (!canActAsClinician && !patient.is_self) {
     throw new Error("Unauthorized: Patient accounts can access only their own imaging records.");
   }
+  return { patientOwnerUserId: patient.user_id };
 }
 
 function mapArtifactRow(r: Record<string, unknown>): StoredArtifactRecord {
@@ -614,6 +655,7 @@ export async function storeImagingArtifact(
   const combinedMeta = {
     ...(extractedDicomMeta ? { dicom: extractedDicomMeta } : {}),
     ...(input.metadata ?? {}),
+    artifactKind: canonicalKind,
     deidentified: true,
   };
   const metaJsonStr = JSON.stringify(combinedMeta);
@@ -636,18 +678,39 @@ export async function storeImagingArtifact(
     `;
     insertedRow = rows[0];
   } catch {
-    // Fallback for schemas prior to migration 0011
-    const rows = await sql<Record<string, unknown>>`
-      insert into imaging_objects (
-        id, user_id, patient_id, series_id, kind, storage_uri, sha256, bytes, version, created_by, retention_until
-      ) values (
-        ${id}, ${input.userId}, ${input.patientId}, ${input.seriesId ?? null},
-        ${canonicalKind}, ${relativePath}, ${hash}, ${payloadToStore.byteLength}, ${nextVersion},
-        ${input.userId}, ${retentionUntil?.toISOString() ?? null}
-      )
-      returning *
-    `;
-    insertedRow = rows[0];
+    const dbCompatKind =
+      canonicalKind === "dicom" || canonicalKind === "mask" || canonicalKind === "mesh" || canonicalKind === "volume"
+        ? canonicalKind
+        : "volume";
+    try {
+      const rows = await sql<Record<string, unknown>>`
+        insert into imaging_objects (
+          id, user_id, patient_id, study_id, series_id, finding_version_id, source_object_id,
+          sop_instance_uid, instance_number, kind, storage_uri, sha256, bytes, version,
+          mime_type, original_filename, metadata_json, status, created_by, retention_until
+        ) values (
+          ${id}, ${input.userId}, ${input.patientId}, ${resolvedStudyId}, ${input.seriesId ?? null},
+          ${input.findingVersionId ?? null}, ${input.sourceObjectId ?? null},
+          ${sopUid}, ${instNum}, ${dbCompatKind}, ${relativePath}, ${hash}, ${payloadToStore.byteLength},
+          ${nextVersion}, ${mimeType}, ${safeFilename}, ${metaJsonStr}, 'active',
+          ${input.userId}, ${retentionUntil?.toISOString() ?? null}
+        )
+        returning *
+      `;
+      insertedRow = rows[0] ? { ...rows[0], kind: canonicalKind } : undefined;
+    } catch {
+      const rows = await sql<Record<string, unknown>>`
+        insert into imaging_objects (
+          id, user_id, patient_id, series_id, kind, storage_uri, sha256, bytes, version, created_by, retention_until
+        ) values (
+          ${id}, ${input.userId}, ${input.patientId}, ${input.seriesId ?? null},
+          ${dbCompatKind}, ${relativePath}, ${hash}, ${payloadToStore.byteLength}, ${nextVersion},
+          ${input.userId}, ${retentionUntil?.toISOString() ?? null}
+        )
+        returning *
+      `;
+      insertedRow = rows[0] ? { ...rows[0], kind: canonicalKind } : undefined;
+    }
   }
 
   await writeAuditEvent(
@@ -702,7 +765,7 @@ export async function verifyImagingObjectIntegrity(
     throw new Error("Unauthorized: Authentication is required.");
   }
   const rows = await sql<Record<string, unknown>>`
-    select * from imaging_objects where id = ${objectId} and user_id = ${userId}
+    select * from imaging_objects where id = ${objectId}
   `;
   if (rows.length === 0) {
     throw new Error("Imaging object not found or access denied.");
@@ -807,7 +870,7 @@ export async function getImagingArtifact(
     throw new Error("Unauthorized: Authentication is required.");
   }
   const rows = await sql<Record<string, unknown>>`
-    select * from imaging_objects where id = ${objectId} and user_id = ${userId}
+    select * from imaging_objects where id = ${objectId}
   `;
 
   if (rows.length === 0) {
@@ -873,12 +936,12 @@ export async function listImagingArtifacts(
   const rows = seriesId
     ? await sql<Record<string, unknown>>`
         select * from imaging_objects
-        where user_id = ${userId} and patient_id = ${patientId} and series_id = ${seriesId}
+        where patient_id = ${patientId} and series_id = ${seriesId}
         order by version desc, created_at desc
       `
     : await sql<Record<string, unknown>>`
         select * from imaging_objects
-        where user_id = ${userId} and patient_id = ${patientId}
+        where patient_id = ${patientId}
         order by version desc, created_at desc
       `;
 
@@ -901,7 +964,7 @@ export async function purgeImagingArtifact(
   }
 
   const rows = await sql<Record<string, unknown>>`
-    select * from imaging_objects where id = ${objectId} and user_id = ${userId}
+    select * from imaging_objects where id = ${objectId}
   `;
   if (rows.length === 0) {
     throw new Error("Imaging object not found or access denied.");

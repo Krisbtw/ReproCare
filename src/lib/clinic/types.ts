@@ -344,6 +344,47 @@ export type Workspace = {
   endometriosisRecords?: EndometriosisRecordItem[];
   ovarianCystRecords?: OvarianCystRecordItem[];
   pcosAssessments?: PcosAssessmentItem[];
+  clinicianConsents?: Array<{
+    id: string;
+    patient_id: string;
+    patient_user_id: string;
+    clinician_user_id: string;
+    clinician_display_name?: string | null;
+    clinician_licence_no?: string | null;
+    clinician_registry?: string | null;
+    clinician_verification_status?: string | null;
+    patient_display_name?: string | null;
+    patient_code?: string | null;
+    status: "active" | "revoked" | "expired";
+    permissions: string[];
+    permissions_json: string;
+    scope_note: string;
+    granted_at: string;
+    expires_at: string | null;
+    revoked_at: string | null;
+    revoked_reason: string | null;
+    updated_at: string;
+  }>;
+  availableClinicians?: Array<{
+    user_id: string;
+    display_name: string;
+    licence_no: string;
+    registry: string;
+    status: string;
+  }>;
+  consentAccessLogs?: Array<{
+    id: string;
+    consent_id: string | null;
+    patient_id: string;
+    patient_user_id: string;
+    actor_user_id: string;
+    actor_role: string;
+    action: string;
+    permission_checked: string | null;
+    outcome: "allowed" | "denied";
+    detail: string;
+    created_at: string;
+  }>;
   engineVersion: string;
 };
 

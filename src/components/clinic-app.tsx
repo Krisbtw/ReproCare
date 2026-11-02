@@ -27,6 +27,14 @@ import {
   saveEndometriosisRecord,
   saveOvarianCystRecord,
   savePcosAssessment,
+  grantPatientConsent,
+  revokePatientConsent,
+  reviewReportExtraction,
+  decideReportFinding,
+  interpretClinicalReport,
+  askClinicalReportQuestion,
+  ALL_CLINICIAN_PERMISSIONS,
+  DEFAULT_CLINICIAN_PERMISSIONS,
 } from "@/lib/clinic/server";
 import { explainPlain } from "@/lib/clinic/plain";
 import { checkMenarcheYear, cycleBand, outsideBand, pcosContext } from "@/lib/clinic/pcos-context";
@@ -285,7 +293,7 @@ export function ClinicApp() {
         {error && <p className="bg-clay-soft px-4 py-2 text-sm text-clay">{error}</p>}
         <div className="space-y-6 p-4 lg:p-6">
           {view === "board" && <Board data={data} patients={visiblePatients} onOpen={(id) => { void run(() => setActivePatient({ data: id })); setView("studio"); }} />}
-          {view === "people" && patient && <People data={data} patients={visiblePatients} active={patient} onOpen={(id) => { void run(() => setActivePatient({ data: id })); setView("studio"); }} />}
+          {view === "people" && patient && <People data={data} patients={visiblePatients} active={patient} busy={busy} run={run} onOpen={(id) => { void run(() => setActivePatient({ data: id })); setView("studio"); }} />}
           {view === "studio" && patient && <Studio data={data} patient={patient} clinician={isVerifiedClinician} busy={busy} run={run} />}
           {labOpened && isVerifiedClinician && (
             <div hidden={view !== "lab"}>
@@ -315,6 +323,10 @@ export function ClinicApp() {
               run={run}
               upload={(input) => uploadReport({ data: input })}
               link={(input) => linkReportEvidence({ data: input })}
+              onReviewExtraction={(input) => reviewReportExtraction({ data: input })}
+              onDecideFinding={(input) => decideReportFinding({ data: input })}
+              onInterpretReport={(reportId) => interpretClinicalReport({ data: { reportId } })}
+              onAskReportQuestion={(reportId, question) => askClinicalReportQuestion({ data: { reportId, question } })}
             />
           )}
           {view === "course" && patient && <CourseView data={data} patient={patient} onStudio={() => setView("studio")} />}
@@ -359,7 +371,258 @@ function Board({ data, patients, onOpen }: { data: Workspace; patients: Bag[]; o
   );
 }
 
-function People({ data, patients, active, onOpen }: { data: Workspace; patients: Bag[]; active: Bag; onOpen: (id: string) => void }) {
+function PatientClinicianCollaborationPanel({
+  data,
+  patient,
+  busy,
+  run,
+}: {
+  data: Workspace;
+  patient: Bag;
+  busy: boolean;
+  run: (task: () => Promise<unknown>) => Promise<void>;
+}) {
+  const pid = s(patient, "id");
+  const isOwnerPatient = Boolean(patient.is_self) && s(patient, "user_id") === data.profile.user_id;
+  const consents = (data.clinicianConsents ?? []).filter((c) => c.patient_id === pid);
+  const availableClinicians = (data.availableClinicians ?? []).filter(
+    (c) => c.user_id !== data.profile.user_id,
+  );
+  const accessLogs = (data.consentAccessLogs ?? []).filter((l) => l.patient_id === pid);
+
+  const [selectedClinicianId, setSelectedClinicianId] = useState<string>(
+    availableClinicians[0]?.user_id ?? "",
+  );
+  const [selectedPerms, setSelectedPerms] = useState<string[]>([...DEFAULT_CLINICIAN_PERMISSIONS]);
+  const [expiresAt, setExpiresAt] = useState<string>("");
+  const [scopeNote, setScopeNote] = useState<string>(
+    "Authorized clinical consultation and longitudinal imaging review",
+  );
+
+  function togglePerm(perm: string) {
+    setSelectedPerms((prev) =>
+      prev.includes(perm) ? prev.filter((p) => p !== perm) : [...prev, perm],
+    );
+  }
+
+  return (
+    <section
+      className="space-y-3 rounded-lg border border-line bg-paper p-4"
+      data-testid="patient-clinician-collaboration"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-xl">Patient–Clinician Record Sharing & Granular Consent</h2>
+          <p className="text-xs text-muted">
+            Clinicians can access this medical record only when an active, non-expired authorization
+            exists and their clinician credentials remain approved. Administrators do not
+            automatically receive unrestricted access to patient medical records.
+          </p>
+        </div>
+        <Chip tone="pine">{`${consents.filter((c) => c.status === "active").length} active clinician(s)`}</Chip>
+      </div>
+
+      {/* Currently Assigned / Historical Clinicians */}
+      <div className="space-y-2">
+        <p className="text-xs font-medium text-ink">Assigned Clinicians & Consent Status</p>
+        {consents.length === 0 ? (
+          <p className="text-xs text-muted">
+            No clinicians have been granted access to this record yet.
+          </p>
+        ) : (
+          <ul className="space-y-2 text-sm">
+            {consents.map((c) => (
+              <li
+                key={c.id}
+                className="rounded-md border border-line bg-card p-3 space-y-1.5"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-medium text-ink">
+                    {c.clinician_display_name || c.clinician_user_id}
+                    {c.clinician_licence_no
+                      ? ` · Licence ${c.clinician_licence_no} (${c.clinician_registry})`
+                      : ""}
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <Chip
+                      tone={
+                        c.status === "active"
+                          ? "pine"
+                          : c.status === "revoked"
+                            ? "clay"
+                            : "ink"
+                      }
+                    >
+                      {`consent: ${c.status}`}
+                    </Chip>
+                    {c.clinician_verification_status && (
+                      <Chip
+                        tone={
+                          c.clinician_verification_status === "verified" ||
+                          c.clinician_verification_status === "approved"
+                            ? "pine"
+                            : "clay"
+                        }
+                      >
+                        {`credential: ${c.clinician_verification_status}`}
+                      </Chip>
+                    )}
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {c.permissions.map((perm) => (
+                    <Chip key={perm}>{perm.replaceAll("_", " ")}</Chip>
+                  ))}
+                </div>
+                <p className="text-xs text-muted">
+                  Granted: {new Date(c.granted_at).toLocaleString()}
+                  {c.expires_at ? ` · Expires: ${new Date(c.expires_at).toLocaleString()}` : " · No automatic expiry"}
+                  {c.revoked_at ? ` · Revoked: ${new Date(c.revoked_at).toLocaleString()} (${c.revoked_reason ?? ""})` : ""}
+                </p>
+                {c.status === "active" &&
+                  (isOwnerPatient || c.clinician_user_id === data.profile.user_id) && (
+                    <div className="pt-1">
+                      <Button
+                        tone="clay"
+                        disabled={busy}
+                        onClick={() => {
+                          void run(() =>
+                            revokePatientConsent({
+                              data: {
+                                consentId: c.id,
+                                reason: isOwnerPatient
+                                  ? "Revoked by patient in Collaboration panel"
+                                  : "Relinquished by assigned clinician",
+                              },
+                            }),
+                          );
+                        }}
+                      >
+                        Revoke Access Immediately
+                      </Button>
+                    </div>
+                  )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {/* Grant Consent Form (Patient Owner Only) */}
+      {isOwnerPatient && (
+        <form
+          className="space-y-3 border-t border-line pt-3 text-sm"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!selectedClinicianId.trim()) return;
+            void run(() =>
+              grantPatientConsent({
+                data: {
+                  patientId: pid,
+                  clinicianUserId: selectedClinicianId.trim(),
+                  permissions: selectedPerms,
+                  scopeNote,
+                  expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+                },
+              }),
+            );
+          }}
+        >
+          <p className="text-xs font-medium text-ink">
+            Grant Record Access to an Approved Clinician
+          </p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <label className="block text-xs text-muted">
+              Approved Clinician
+              <select
+                className="mt-1 min-h-10 w-full rounded-md border border-line bg-card px-2 text-sm text-ink"
+                value={selectedClinicianId}
+                onChange={(e) => setSelectedClinicianId(e.target.value)}
+              >
+                <option value="">Select approved clinician…</option>
+                {availableClinicians.map((cl) => (
+                  <option key={cl.user_id} value={cl.user_id}>
+                    {`${cl.display_name} · ${cl.licence_no} (${cl.registry})`}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block text-xs text-muted">
+              Optional Expiry Date
+              <input
+                type="date"
+                className="mt-1 min-h-10 w-full rounded-md border border-line bg-card px-2 text-sm text-ink"
+                value={expiresAt}
+                onChange={(e) => setExpiresAt(e.target.value)}
+              />
+            </label>
+          </div>
+          <div className="space-y-1">
+            <p className="text-xs text-muted">Granular Permissions Scope</p>
+            <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4 text-xs">
+              {ALL_CLINICIAN_PERMISSIONS.map((perm) => (
+                <label
+                  key={perm}
+                  className="flex items-center gap-1.5 rounded border border-line bg-card px-2 py-1.5 cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedPerms.includes(perm)}
+                    onChange={() => togglePerm(perm)}
+                  />
+                  <span>{perm.replaceAll("_", " ")}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+          <input
+            className="min-h-10 w-full rounded-md border border-line bg-card px-2 text-sm text-ink"
+            placeholder="Purpose / clinical scope note"
+            value={scopeNote}
+            onChange={(e) => setScopeNote(e.target.value)}
+          />
+          <Button
+            type="submit"
+            disabled={busy || !selectedClinicianId.trim() || selectedPerms.length === 0}
+          >
+            Grant Clinician Access
+          </Button>
+        </form>
+      )}
+
+      {/* Consent Access Audit History */}
+      {accessLogs.length > 0 && (
+        <div className="space-y-1 border-t border-line pt-2 text-xs text-muted">
+          <p className="font-medium text-ink">Consent & Access Audit Trail (Append-Only)</p>
+          <ul className="max-h-32 overflow-auto space-y-1">
+            {accessLogs.slice(0, 12).map((log) => (
+              <li key={log.id}>
+                {new Date(log.created_at).toLocaleString()} · [{log.outcome.toUpperCase()}]{" "}
+                {log.action} ({log.actor_user_id}) — {log.detail}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function People({
+  data,
+  patients,
+  active,
+  busy,
+  run,
+  onOpen,
+}: {
+  data: Workspace;
+  patients: Bag[];
+  active: Bag;
+  busy: boolean;
+  run: (task: () => Promise<unknown>) => Promise<void>;
+  onOpen: (id: string) => void;
+}) {
   const studies = (data.studies as Bag[]).filter((st) => s(st, "patient_id") === s(active, "id"));
   return (
     <div className="grid gap-4 lg:grid-cols-[280px_1fr]">
@@ -371,10 +634,11 @@ function People({ data, patients, active, onOpen }: { data: Workspace; patients:
           </button>
         ))}
       </div>
-      <article className="space-y-3 rounded-lg border border-line bg-card p-4">
+      <article className="space-y-4 rounded-lg border border-line bg-card p-4">
         <h1 className="text-3xl">{s(active, "display_name")}</h1>
         <p className="text-sm text-ink-soft">{s(active, "synopsis")}</p>
         <p className="text-sm text-muted">Year of birth on the synthetic file: {s(active, "year_of_birth")}. Pathway: {s(active, "pathway")}.</p>
+        <PatientClinicianCollaborationPanel data={data} patient={active} busy={busy} run={run} />
         <h2 className="text-xl">Studies</h2>
         <ul className="space-y-2 text-sm">
           {studies.map((st) => (

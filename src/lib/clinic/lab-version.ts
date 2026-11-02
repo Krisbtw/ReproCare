@@ -1,6 +1,7 @@
 import type { Sql } from "../db.ts";
 import { storeImagingArtifact } from "../imaging/storage.server.ts";
 import { computeVoxelBoundaryUncertainty } from "../reprotrace/params.ts";
+import { evaluateClinicianConsentForPatient } from "./collaboration.ts";
 
 export type LabVersionInput = {
   findingId: string;
@@ -117,24 +118,41 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
   if (!userId || typeof userId !== "string" || !userId.trim()) {
     throw new Error("Unauthorized: Authentication is required.");
   }
-  const found = await sql<Record<string, unknown>>`select * from finding_versions
-    where finding_id = ${data.findingId} and user_id = ${userId} order by version_no desc limit 1`;
-  const current = found[0];
-  if (!current) throw new Error("Finding not found.");
-
   await enforceVerifiedClinicianIfProfileExists(sql, userId);
 
-  const findingRows = await sql<{ patient_id: string }>`
-    select patient_id from findings where id = ${data.findingId} and user_id = ${userId} limit 1
+  const findingRows = await sql<{ id: string; user_id: string; patient_id: string }>`
+    select id, user_id, patient_id from findings where id = ${data.findingId} limit 1
   `;
-  const patientId = findingRows[0]?.patient_id ?? data.newStudy?.patientId ?? "";
+  const findingMeta = findingRows[0];
+  if (!findingMeta) throw new Error("Finding not found.");
+
+  const recordOwnerUserId = findingMeta.user_id;
+  const patientId = findingMeta.patient_id ?? data.newStudy?.patientId ?? "";
+
+  if (recordOwnerUserId !== userId) {
+    const consentEval = await evaluateClinicianConsentForPatient(
+      sql,
+      userId,
+      patientId,
+      "add_annotations",
+      "save_lab_measurement",
+    );
+    if (!consentEval.allowed) {
+      throw new Error(`Finding not found or unauthorized: ${consentEval.reason}`);
+    }
+  }
+
+  const found = await sql<Record<string, unknown>>`select * from finding_versions
+    where finding_id = ${data.findingId} and user_id = ${recordOwnerUserId} order by version_no desc limit 1`;
+  const current = found[0];
+  if (!current) throw new Error("Finding not found.");
 
   let targetStudyId = current.study_id as string;
   let targetSeriesId = data.seriesId ?? null;
   let targetObservedOn = current.observed_on as string;
 
   if (data.newStudy) {
-    const patientCheck = await sql`select id from patients where id = ${data.newStudy.patientId} and user_id = ${userId}`;
+    const patientCheck = await sql`select id from patients where id = ${data.newStudy.patientId} and user_id = ${recordOwnerUserId}`;
     if (!patientCheck.length) throw new Error("Patient not found for new study.");
     targetStudyId = crypto.randomUUID();
     targetObservedOn = data.newStudy.studyDate ?? new Date().toISOString().slice(0, 10);
@@ -143,7 +161,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
         id, user_id, patient_id, modality, study_date, description, accession, synthetic, source_note, study_instance_uid
       ) values (
         ${targetStudyId},
-        ${userId},
+        ${recordOwnerUserId},
         ${data.newStudy.patientId},
         ${data.newStudy.modality ?? "MR"},
         ${targetObservedOn},
@@ -157,7 +175,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
       await sql`insert into studies (id, user_id, patient_id, modality, study_date, description, accession, synthetic, source_note)
         values (
           ${targetStudyId},
-          ${userId},
+          ${recordOwnerUserId},
           ${data.newStudy.patientId},
           ${data.newStudy.modality ?? "MR"},
           ${targetObservedOn},
@@ -175,7 +193,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
           series_instance_uid, frame_of_reference_uid, geometry_json, volume_sha256
         ) values (
           ${targetSeriesId},
-          ${userId},
+          ${recordOwnerUserId},
           ${targetStudyId},
           ${data.newSeries.seriesNumber ?? 1},
           ${data.newSeries.description ?? "DICOM Series"},
@@ -192,7 +210,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
         await sql`insert into series (id, user_id, study_id, series_number, description, plane, slice_count, pixel_spacing_mm, slice_thickness_mm)
           values (
             ${targetSeriesId},
-            ${userId},
+            ${recordOwnerUserId},
             ${targetStudyId},
             ${data.newSeries.seriesNumber ?? 1},
             ${data.newSeries.description ?? "DICOM Series"},
@@ -204,7 +222,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
       }
     }
   } else if (data.studyId) {
-    const studyCheck = await sql<{ id: string; study_date: string }>`select id, study_date from studies where id = ${data.studyId} and user_id = ${userId}`;
+    const studyCheck = await sql<{ id: string; study_date: string }>`select id, study_date from studies where id = ${data.studyId} and user_id = ${recordOwnerUserId}`;
     if (!studyCheck.length) {
       throw new Error(`Invalid studyId: Study ${data.studyId} does not exist or does not belong to user.`);
     }
@@ -213,7 +231,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
   }
 
   if (targetSeriesId) {
-    const seriesCheck = await sql<{ id: string }>`select id from series where id = ${targetSeriesId} and user_id = ${userId}`;
+    const seriesCheck = await sql<{ id: string }>`select id from series where id = ${targetSeriesId} and user_id = ${recordOwnerUserId}`;
     if (!seriesCheck.length) {
       throw new Error(`Invalid seriesId: Series ${targetSeriesId} does not exist or does not belong to user.`);
     }
@@ -253,7 +271,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
       const payload = f.data ?? f.dataBase64;
       if (!payload) continue;
       const stored = await storeImagingArtifact(sql, {
-        userId,
+        userId: recordOwnerUserId,
         patientId,
         studyId: targetStudyId,
         seriesId: targetSeriesId,
@@ -274,7 +292,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
   const maskPayload = data.maskArtifact?.data ?? data.maskArtifact?.dataBase64;
   if (patientId && data.maskArtifact && maskPayload) {
     const maskStored = await storeImagingArtifact(sql, {
-      userId,
+      userId: recordOwnerUserId,
       patientId,
       studyId: targetStudyId,
       seriesId: targetSeriesId,
@@ -300,7 +318,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
           mask_object_id, label_counts, volume_mm3, status
         ) values (
           ${segmentationRunId},
-          ${userId},
+          ${recordOwnerUserId},
           ${targetSeriesId},
           ${data.modelId ?? data.segmentationSource ?? "classical_region_growing"},
           ${data.weightsSha256 ?? null},
@@ -318,7 +336,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
   const meshPayload = data.meshArtifact?.data ?? data.meshArtifact?.dataBase64;
   if (patientId && data.meshArtifact && meshPayload) {
     await storeImagingArtifact(sql, {
-      userId,
+      userId: recordOwnerUserId,
       patientId,
       studyId: targetStudyId,
       seriesId: targetSeriesId,
@@ -336,7 +354,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
     centroid_mm, axes_mm, longest_mm, measurement_basis, frame, segmentation_source, model_id, quality, modality,
     report_longest_mm, change_reason, series_id, volume_mm3, volume_method, segmentation_run_id, uncertainty_mm3
   ) values (
-    ${versionId}, ${userId}, ${data.findingId}, ${num(current.version_no) + 1}, ${current.id as string},
+    ${versionId}, ${recordOwnerUserId}, ${data.findingId}, ${num(current.version_no) + 1}, ${current.id as string},
     ${targetStudyId}, ${targetObservedOn}, ${current.location_label as string}, ${current.figo as string | null},
     ${centroidJson}, ${JSON.stringify(data.axes)}, ${data.longest}, ${"principal-axis extents of a seeded mask (not a caliper plane)"},
     ${frameVal}, ${data.segmentationSource ?? "classical_region_growing"}, ${data.modelId ?? null}, ${"adequate"}, ${current.modality as string},
@@ -349,7 +367,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
     await sql`
       update imaging_objects
       set finding_version_id = ${versionId}
-      where user_id = ${userId}
+      where user_id = ${recordOwnerUserId}
         and id in (${primaryDicomObjectId ?? ""}, ${storedMaskObjectId ?? ""})
     `.catch(() => null);
   }
@@ -359,13 +377,13 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
       id, user_id, finding_version_id, kind, study_id, series_id, report_id, quote, slice_index, note,
       imaging_object_id, mask_object_id
     ) values (
-      ${crypto.randomUUID()}, ${userId}, ${versionId}, ${"lab_segmentation"},
+      ${crypto.randomUUID()}, ${recordOwnerUserId}, ${versionId}, ${"lab_segmentation"},
       ${targetStudyId}, ${targetSeriesId}, ${null}, ${null}, ${data.sliceIndex}, ${data.evidenceNote},
       ${primaryDicomObjectId}, ${storedMaskObjectId}
     )`;
   } catch {
     await sql`insert into evidence_links (id, user_id, finding_version_id, kind, study_id, series_id, report_id, quote, slice_index, note)
-      values (${crypto.randomUUID()}, ${userId}, ${versionId}, ${"lab_segmentation"}, ${targetStudyId}, ${targetSeriesId}, ${null}, ${null}, ${data.sliceIndex}, ${data.evidenceNote})`;
+      values (${crypto.randomUUID()}, ${recordOwnerUserId}, ${versionId}, ${"lab_segmentation"}, ${targetStudyId}, ${targetSeriesId}, ${null}, ${null}, ${data.sliceIndex}, ${data.evidenceNote})`;
   }
 
   return versionId;

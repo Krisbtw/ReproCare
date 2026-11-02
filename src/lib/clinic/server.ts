@@ -25,7 +25,37 @@ import {
 } from "../imaging/storage.server.ts";
 import { insertLabVersion, type LabVersionInput } from "./lab-version.ts";
 import { applyMenarcheYear } from "./menarche.ts";
-import { ingestReport, linkReportQuote, type IngestInput, type QuoteLinkInput } from "../reports/store.ts";
+import {
+  ALL_CLINICIAN_PERMISSIONS,
+  DEFAULT_CLINICIAN_PERMISSIONS,
+  grantClinicianConsent,
+  revokeClinicianConsent,
+  evaluateClinicianConsentForPatient,
+  listConsentsForPatient,
+  listConsentsForClinician,
+  listApprovedCliniciansDirectory,
+  listConsentAccessHistory,
+  type ClinicianPermission,
+  type PatientClinicianConsentRow,
+} from "./collaboration.ts";
+import {
+  ingestReport,
+  linkReportQuote,
+  reviewAndEditReportExtraction,
+  decideExtractedFinding,
+  reconcileReportWithImaging,
+  type IngestInput,
+  type QuoteLinkInput,
+} from "../reports/store.ts";
+import { extractReportText } from "../reports/text.ts";
+import { extractReport } from "../reports/extract.ts";
+import { deidentify } from "../reports/deidentify.ts";
+import {
+  interpretReportWithLlm,
+  answerQuestionFromSourceReport,
+  type LlmInterpretationResult,
+  type ReportQuestionAnswerResult,
+} from "../reports/llm-interpreter.ts";
 import type {
   ExportPayload,
   VersionRow,
@@ -50,6 +80,13 @@ import {
   discrepanciesFor,
   proposalsFor,
 } from "./story.ts";
+
+export {
+  ALL_CLINICIAN_PERMISSIONS,
+  DEFAULT_CLINICIAN_PERMISSIONS,
+  type ClinicianPermission,
+  type PatientClinicianConsentRow,
+};
 
 export type ClinicianVerificationDecision =
   | "verified"
@@ -119,7 +156,8 @@ export function requireAuthenticatedUser(userId: string | null | undefined): str
  * 2. A user with `profiles.role === 'clinician'` must have an active approved verification status
  *    (`status === 'verified'` or `status === 'approved'`) with non-empty licence and registry.
  * 3. Unverified, pending, rejected, suspended, or revoked clinicians are downgraded to effective `'patient'` access.
- * 4. Administrators (`profiles.role === 'admin'`) hold full administrative and clinical privileges.
+ * 4. Administrators (`profiles.role === 'admin'`) hold administrative privileges (clinician verification and account management)
+ *    without automatically receiving unrestricted access to other users' medical records.
  */
 export async function resolveUserAuthorization(sql: Sql, userId: string): Promise<UserAuthorization> {
   const uid = requireAuthenticatedUser(userId);
@@ -215,32 +253,91 @@ export async function requireAdmin(
 }
 
 /**
- * Enforces patient-record ownership and ensures that patients (and unverified clinicians)
- * can only access or modify their own (`is_self = true`) patient record.
+ * Enforces patient-record ownership and patient-clinician consent rules (Sprint 4 Task 1):
+ * - Patients (and unverified clinicians) can only access or modify their own (`is_self = true`) patient record.
+ * - Cross-user medical record access (`patient.user_id !== auth.userId`):
+ *   - Patients are strictly denied.
+ *   - Administrators who are not verified clinicians with an active patient consent are strictly denied
+ *     ("Administrators can manage clinician verification and account status, but must not automatically receive unrestricted access to all medical records").
+ *   - Verified clinicians are permitted ONLY when an active, non-expired consent row exists in
+ *     `patient_clinician_consents` granting `requiredPermission`.
  */
 export async function requirePatientRecordAccess(
   sql: Sql,
   userId: string,
   patientId: string,
   actionDescription?: string,
-): Promise<{ auth: UserAuthorization; patient: Record<string, unknown> & { id: string; is_self: boolean } }> {
+  requiredPermission?: ClinicianPermission,
+): Promise<{
+  auth: UserAuthorization;
+  patient: Record<string, unknown> & { id: string; user_id: string; is_self: boolean };
+  patientOwnerUserId: string;
+  consent: PatientClinicianConsentRow | null;
+  permissions: ClinicianPermission[];
+}> {
   const auth = await resolveUserAuthorization(sql, userId);
   if (!patientId || typeof patientId !== "string" || !patientId.trim()) {
     throw new Error("Record not found.");
   }
-  const rows = await sql<Record<string, unknown> & { id: string; is_self: boolean }>`
-    select * from patients where id = ${patientId} and user_id = ${auth.userId}
+  const rows = await sql<Record<string, unknown> & { id: string; user_id: string; is_self: boolean }>`
+    select * from patients where id = ${patientId}
   `;
   const patient = rows[0];
   if (!patient) {
     throw new Error("Record not found.");
   }
+
+  const patientOwnerUserId = String(patient.user_id);
+
+  // Case 1: Cross-user medical record access
+  if (patientOwnerUserId !== auth.userId) {
+    if (!auth.isClinicianVerified) {
+      if (auth.isAdmin) {
+        throw new Error(
+          "Unauthorized: Administrators manage clinician verification and account status, and do not automatically receive unrestricted access to other users' medical records.",
+        );
+      }
+      if (auth.storedRole === "clinician" || auth.verificationStatus !== "unverified") {
+        throw new Error(
+          `Unauthorized: Clinician verification is not approved (status: ${auth.verificationStatus}). Unverified, suspended, or revoked clinicians cannot access patient information.`,
+        );
+      }
+      throw new Error("Unauthorized: Patients cannot access another patient's medical records.");
+    }
+
+    const consentEval = await evaluateClinicianConsentForPatient(
+      sql,
+      auth.userId,
+      patientId,
+      requiredPermission ?? "view_demographics",
+      actionDescription ?? "access_patient_record",
+    );
+    if (!consentEval.allowed) {
+      throw new Error(`Unauthorized: ${consentEval.reason}`);
+    }
+    return {
+      auth,
+      patient,
+      patientOwnerUserId,
+      consent: consentEval.consent,
+      permissions: consentEval.permissions,
+    };
+  }
+
+  // Case 2: Same-workspace patient record (`patient.user_id === auth.userId`)
   if (!auth.canPerformClinicianActions && !patient.is_self) {
     throw new Error(
       `Unauthorized: Patient view can ${actionDescription ?? "access or modify"} only on your own synthetic record.`,
     );
   }
-  return { auth, patient };
+
+  return {
+    auth,
+    patient,
+    patientOwnerUserId,
+    consent: null,
+    permissions: [...ALL_CLINICIAN_PERMISSIONS],
+  };
 }
 
 async function roleOf(sql: Sql, userId: string): Promise<string> {
@@ -404,6 +501,7 @@ export async function executeGetWorkspace(sql: Sql, rawUserId: string): Promise<
     allEndometriosisRecords,
     allOvarianCystRecords,
     allPcosAssessments,
+    availableClinicians,
   ] = await Promise.all([
     sql<Workspace["patients"][number]>`select * from patients where user_id = ${userId} order by code`,
     sql<Workspace["studies"][number]>`select * from studies where user_id = ${userId} order by study_date`,
@@ -422,7 +520,15 @@ export async function executeGetWorkspace(sql: Sql, rawUserId: string): Promise<
     sql<Workspace["consents"][number]>`select * from consents where user_id = ${userId} order by created_at`,
     sql<Workspace["uploads"][number]>`select id, patient_id, received_at, file_name, transfer_syntax, metadata, warnings, identifiers_withheld from dicom_uploads where user_id = ${userId} order by received_at desc limit 12`,
     sql<Workspace["audit"][number]>`select * from audit_events where user_id = ${userId} order by at desc limit 40`,
-    sql<Workspace["extractions"][number]>`select id, report_id, file_name, file_kind, content_sha256, deid_method, redaction_count, redaction_kinds, extractor, extraction, warnings, created_at from report_extractions where user_id = ${userId} order by created_at desc`,
+    sql<Workspace["extractions"][number]>`
+      select id, report_id, file_name, file_kind, content_sha256, deid_method, redaction_count, redaction_kinds,
+             extractor, extraction, warnings, created_at,
+             report_object_id, extraction_method, page_count, pages_json, ocr_used, ocr_reviewed,
+             review_status, reviewed_by, reviewed_at, version_no, llm_interpretation_json
+      from report_extractions where user_id = ${userId} order by created_at desc
+    `.catch(() =>
+      sql<Workspace["extractions"][number]>`select id, report_id, file_name, file_kind, content_sha256, deid_method, redaction_count, redaction_kinds, extractor, extraction, warnings, created_at from report_extractions where user_id = ${userId} order by created_at desc`
+    ),
     auth.isAdmin
       ? sql<ClinicianVerificationRow>`
           select cv.*, p.display_name, p.role as current_role
@@ -437,11 +543,12 @@ export async function executeGetWorkspace(sql: Sql, rawUserId: string): Promise<
     sql<EndometriosisRecordItem>`select * from pathway_endometriosis_records where user_id = ${userId} order by created_at desc`.catch(() => []),
     sql<OvarianCystRecordItem>`select * from pathway_ovarian_cyst_records where user_id = ${userId} order by created_at desc`.catch(() => []),
     sql<PcosAssessmentItem>`select * from pathway_pcos_assessments where user_id = ${userId} order by created_at desc`.catch(() => []),
+    listApprovedCliniciansDirectory(sql).catch(() => []),
   ]);
 
   // Enforce backend patient-record filtering: non-clinicians/unverified clinicians only receive their own (is_self = true) records
   const patients = auth.canPerformClinicianActions
-    ? allPatients
+    ? [...allPatients]
     : allPatients.filter((p) => Boolean(p.is_self));
   const allowedPatientIds = new Set(patients.map((p) => p.id));
 
@@ -479,6 +586,109 @@ export async function executeGetWorkspace(sql: Sql, rawUserId: string): Promise<
   const pcosAssessments = (allPcosAssessments ?? []).filter(
     (r) => !r.patient_id || allowedPatientIds.has(r.patient_id),
   );
+
+  // Sprint 4 Task 1: Load patient-clinician consents and shared patient records for verified clinicians
+  const selfPatient = allPatients.find((p) => Boolean(p.is_self));
+  const patientConsents = selfPatient
+    ? await listConsentsForPatient(sql, userId, selfPatient.id).catch(() => [])
+    : [];
+  const clinicianActiveConsents = auth.isClinicianVerified
+    ? await listConsentsForClinician(sql, userId).catch(() => [])
+    : [];
+
+  for (const sharedConsent of clinicianActiveConsents) {
+    if (allowedPatientIds.has(sharedConsent.patient_id)) continue;
+    const perms = new Set(sharedConsent.permissions);
+    if (!perms.has("view_demographics")) continue;
+
+    const sharedPatients = await sql<Workspace["patients"][number]>`
+      select * from patients where id = ${sharedConsent.patient_id}
+    `.catch(() => []);
+    if (!sharedPatients[0]) continue;
+    patients.push(sharedPatients[0]);
+    allowedPatientIds.add(sharedConsent.patient_id);
+
+    const sharedStudies = await sql<Workspace["studies"][number]>`
+      select * from studies where patient_id = ${sharedConsent.patient_id} order by study_date
+    `.catch(() => []);
+
+    if (perms.has("view_imaging") || perms.has("view_reports") || perms.has("view_findings")) {
+      studies.push(...sharedStudies);
+      for (const st of sharedStudies) allowedStudyIds.add(st.id);
+    }
+
+    if (perms.has("view_imaging")) {
+      for (const st of sharedStudies) {
+        const stSeries = await sql<Workspace["series"][number]>`
+          select * from series where study_id = ${st.id} order by series_number
+        `.catch(() => []);
+        series.push(...stSeries);
+      }
+    }
+
+    if (perms.has("view_reports")) {
+      for (const st of sharedStudies) {
+        const stReports = await sql<Workspace["reports"][number]>`
+          select * from reports where study_id = ${st.id} order by report_date
+        `.catch(() => []);
+        reports.push(...stReports);
+        for (const rp of stReports) {
+          allowedReportIds.add(rp.id);
+          const rpExtractions = await sql<Workspace["extractions"][number]>`
+            select * from report_extractions where report_id = ${rp.id} order by created_at desc
+          `.catch(() => []);
+          extractions.push(...rpExtractions);
+        }
+      }
+    }
+
+    if (perms.has("view_findings")) {
+      const shFindings = await sql<Workspace["findings"][number]>`
+        select * from findings where patient_id = ${sharedConsent.patient_id} order by code
+      `.catch(() => []);
+      findings.push(...shFindings);
+      for (const fd of shFindings) {
+        allowedFindingIds.add(fd.id);
+        const fdVersions = await sql<Record<string, unknown>>`
+          select * from finding_versions where finding_id = ${fd.id} order by observed_on, version_no
+        `.catch(() => []);
+        versionsFiltered.push(...fdVersions);
+        for (const fv of fdVersions) {
+          allowedVersionIds.add(String(fv.id));
+          const fvEv = await sql<Workspace["evidence"][number]>`
+            select * from evidence_links where finding_version_id = ${String(fv.id)}
+          `.catch(() => []);
+          evidence.push(...fvEv);
+        }
+      }
+    }
+
+    if (perms.has("view_longitudinal_history")) {
+      const [shSymptoms, shCycles, shLabs, shCorr, shDisc, shRegs] = await Promise.all([
+        sql<Workspace["symptoms"][number]>`select * from symptoms where patient_id = ${sharedConsent.patient_id} order by recorded_on`.catch(() => []),
+        sql<Workspace["cycles"][number]>`select * from cycles where patient_id = ${sharedConsent.patient_id} order by start_date`.catch(() => []),
+        sql<Workspace["labs"][number]>`select * from labs where patient_id = ${sharedConsent.patient_id} order by observed_on, analyte`.catch(() => []),
+        sql<Workspace["correspondences"][number]>`select * from correspondences where patient_id = ${sharedConsent.patient_id} and active = true order by created_at`.catch(() => []),
+        sql<Workspace["discrepancies"][number]>`select * from discrepancies where patient_id = ${sharedConsent.patient_id} and active = true order by created_at`.catch(() => []),
+        sql<RegistrationRow>`select * from registrations where patient_id = ${sharedConsent.patient_id} order by created_at desc`.catch(() => []),
+      ]);
+      symptoms.push(...shSymptoms);
+      cycles.push(...shCycles);
+      labs.push(...shLabs);
+      correspondences.push(...shCorr);
+      discrepancies.push(...shDisc);
+      registrations.push(...shRegs);
+    }
+  }
+
+  const allClinicianConsents = [
+    ...patientConsents,
+    ...clinicianActiveConsents.filter((c) => !patientConsents.some((pc) => pc.id === c.id)),
+  ];
+
+  const consentAccessLogs = selfPatient
+    ? await listConsentAccessHistory(sql, userId, selfPatient.id).catch(() => [])
+    : [];
 
   const versionsOut: VersionRow[] = versionsFiltered.map((v) => ({
     ...(v as object),
@@ -518,6 +728,9 @@ export async function executeGetWorkspace(sql: Sql, rawUserId: string): Promise<
     discrepancies,
     reviews: allReviews,
     consents,
+    clinicianConsents: allClinicianConsents,
+    availableClinicians,
+    consentAccessLogs,
     uploads,
     audit: auditRows,
     extractions,
@@ -597,13 +810,6 @@ export const setRole = createServerFn({ method: "POST" })
 
 /**
  * Administrator-controlled role assignment (`promoteUser`).
- *
- * Security invariants:
- * - Only administrators can invoke `promoteUser`.
- * - Promoting a user to `'clinician'` NEVER bypasses the clinician verification workflow:
- *   the target user must already hold an approved (`'verified'` or `'approved'`) record in
- *   `clinician_verifications` with valid licence and registry details.
- * - Cannot demote the last remaining administrator.
  */
 export async function executePromoteUser(
   sql: Sql,
@@ -682,7 +888,13 @@ export const promoteUser = createServerFn({ method: "POST" })
   });
 
 export async function executeSetActivePatient(sql: Sql, rawUserId: string, patientId: string) {
-  const { auth } = await requirePatientRecordAccess(sql, rawUserId, patientId, "switch active record");
+  const { auth } = await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    patientId,
+    "switch active record",
+    "view_demographics",
+  );
   await sql`update profiles set active_patient_id = ${patientId} where user_id = ${auth.userId}`;
   return { ok: true };
 }
@@ -701,8 +913,15 @@ export async function executeSetMenarcheYear(
   data: { patientId: string; menarcheYear: number | null; reason: string },
   referenceYear = new Date().getFullYear(),
 ) {
-  const auth = await resolveUserAuthorization(sql, rawUserId);
-  const result = await applyMenarcheYear(sql, auth.userId, auth.effectiveRole, data, referenceYear);
+  const { auth, patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    data.patientId,
+    "set menarche year",
+    "add_annotations",
+  );
+  const effectiveRole = patientOwnerUserId !== auth.userId ? "clinician" : auth.effectiveRole;
+  const result = await applyMenarcheYear(sql, patientOwnerUserId, effectiveRole, data, referenceYear);
   return { ok: true, changed: result.changed };
 }
 
@@ -735,10 +954,16 @@ export async function executeAddSymptom(
   rawUserId: string,
   data: { patientId: string; region: string; intensity: number; cycleDay: number | null; description: string; recordedOn: string },
 ) {
-  const { auth } = await requirePatientRecordAccess(sql, rawUserId, data.patientId, "add symptoms");
+  const { auth, patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    data.patientId,
+    "add symptoms",
+    "add_annotations",
+  );
   const id = crypto.randomUUID();
   await sql`insert into symptoms (id, user_id, patient_id, recorded_on, region, intensity, cycle_day, description, source)
-    values (${id}, ${auth.userId}, ${data.patientId}, ${data.recordedOn}, ${data.region}, ${data.intensity}, ${data.cycleDay}, ${data.description}, ${"patient_reported"})`;
+    values (${id}, ${patientOwnerUserId}, ${data.patientId}, ${data.recordedOn}, ${data.region}, ${data.intensity}, ${data.cycleDay}, ${data.description}, ${"patient_reported"})`;
   await audit(sql, auth.userId, "add_symptom", "symptom", id, "Patient-reported symptom appended. Not a clinical finding.");
   return { ok: true, id };
 }
@@ -761,10 +986,16 @@ export async function executeAddCycle(
   rawUserId: string,
   data: { patientId: string; startDate: string; lengthDays: number; flow: string; note: string },
 ) {
-  const { auth } = await requirePatientRecordAccess(sql, rawUserId, data.patientId, "add cycles");
+  const { auth, patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    data.patientId,
+    "add cycles",
+    "add_annotations",
+  );
   const id = crypto.randomUUID();
   await sql`insert into cycles (id, user_id, patient_id, start_date, length_days, flow, note)
-    values (${id}, ${auth.userId}, ${data.patientId}, ${data.startDate}, ${data.lengthDays}, ${data.flow}, ${data.note})`;
+    values (${id}, ${patientOwnerUserId}, ${data.patientId}, ${data.startDate}, ${data.lengthDays}, ${data.flow}, ${data.note})`;
   await audit(sql, auth.userId, "add_cycle", "cycle", id, "Menstrual interval appended.");
   return { ok: true, id };
 }
@@ -785,10 +1016,16 @@ export async function executeAddLab(
   rawUserId: string,
   data: { patientId: string; observedOn: string; analyte: string; valueText: string; unit: string; referenceText: string },
 ) {
-  const { auth } = await requirePatientRecordAccess(sql, rawUserId, data.patientId, "add lab records");
+  const { auth, patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    data.patientId,
+    "add lab records",
+    "add_annotations",
+  );
   const id = crypto.randomUUID();
   await sql`insert into labs (id, user_id, patient_id, observed_on, analyte, value_text, unit, reference_text, source_note)
-    values (${id}, ${auth.userId}, ${data.patientId}, ${data.observedOn}, ${data.analyte}, ${data.valueText}, ${data.unit}, ${data.referenceText}, ${"Entered in the workspace. Not interpreted."})`;
+    values (${id}, ${patientOwnerUserId}, ${data.patientId}, ${data.observedOn}, ${data.analyte}, ${data.valueText}, ${data.unit}, ${data.referenceText}, ${"Entered in the workspace. Not interpreted."})`;
   await audit(sql, auth.userId, "add_lab", "lab", id, `${data.analyte} appended without interpretation.`);
   return { ok: true, id };
 }
@@ -816,16 +1053,45 @@ export async function executeAddReview(
   data: { targetType: string; targetId: string; status: string; note: string },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "recording a clinical review");
+  let patientId: string | null = null;
+  let ownerUserId = auth.userId;
+
   if (data.targetType === "finding_version") {
-    const v = await sql`select id from finding_versions where id = ${data.targetId} and user_id = ${auth.userId}`;
+    const v = await sql<{ id: string; user_id: string; patient_id: string }>`
+      select fv.id, fv.user_id, f.patient_id
+      from finding_versions fv
+      join findings f on f.id = fv.finding_id
+      where fv.id = ${data.targetId}
+    `;
     if (!v.length) throw new Error("Finding version not found or not owned.");
+    patientId = v[0].patient_id;
+    ownerUserId = v[0].user_id;
   } else if (data.targetType === "correspondence") {
-    const c = await sql`select id from correspondences where id = ${data.targetId} and user_id = ${auth.userId}`;
+    const c = await sql<{ id: string; user_id: string; patient_id: string }>`
+      select id, user_id, patient_id from correspondences where id = ${data.targetId}
+    `;
     if (!c.length) throw new Error("Correspondence proposal not found or not owned.");
+    patientId = c[0].patient_id;
+    ownerUserId = c[0].user_id;
   } else if (data.targetType === "discrepancy") {
-    const d = await sql`select id from discrepancies where id = ${data.targetId} and user_id = ${auth.userId}`;
+    const d = await sql<{ id: string; user_id: string; patient_id: string }>`
+      select id, user_id, patient_id from discrepancies where id = ${data.targetId}
+    `;
     if (!d.length) throw new Error("Discrepancy not found or not owned.");
+    patientId = d[0].patient_id;
+    ownerUserId = d[0].user_id;
   }
+
+  if (patientId && ownerUserId !== auth.userId) {
+    await requirePatientRecordAccess(
+      sql,
+      auth.userId,
+      patientId,
+      "recording a clinical review",
+      "review_ai_findings",
+    );
+  }
+
   const id = crypto.randomUUID();
   await sql`insert into reviews (id, user_id, target_type, target_id, status, note)
     values (${id}, ${auth.userId}, ${data.targetType}, ${data.targetId}, ${data.status}, ${data.note || "Reviewed."})`;
@@ -852,11 +1118,27 @@ export async function executeCorrectVersion(
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "editing a finding measurement");
   const rows = data.versionId
-    ? await sql<Record<string, unknown>>`select * from finding_versions where id = ${data.versionId} and user_id = ${auth.userId}`
-    : await sql<Record<string, unknown>>`select * from finding_versions where finding_id = ${data.findingId ?? ""} and user_id = ${auth.userId} order by version_no desc limit 1`;
+    ? await sql<Record<string, unknown>>`select * from finding_versions where id = ${data.versionId}`
+    : await sql<Record<string, unknown>>`select * from finding_versions where finding_id = ${data.findingId ?? ""} order by version_no desc limit 1`;
   const current = rows[0];
   if (!current) throw new Error("Version not found.");
-  const latest = await sql<{ version_no: number }>`select version_no from finding_versions where finding_id = ${current.finding_id as string} and user_id = ${auth.userId} order by version_no desc limit 1`;
+
+  const findingRows = await sql<{ patient_id: string; user_id: string }>`
+    select patient_id, user_id from findings where id = ${current.finding_id as string}
+  `;
+  if (!findingRows[0]) throw new Error("Finding not found.");
+  const ownerUserId = findingRows[0].user_id;
+  if (ownerUserId !== auth.userId) {
+    await requirePatientRecordAccess(
+      sql,
+      auth.userId,
+      findingRows[0].patient_id,
+      "editing a finding measurement",
+      "approve_or_reject_findings",
+    );
+  }
+
+  const latest = await sql<{ version_no: number }>`select version_no from finding_versions where finding_id = ${current.finding_id as string} and user_id = ${ownerUserId} order by version_no desc limit 1`;
   const id = crypto.randomUUID();
   const longest = Math.max(...data.axes);
   await sql`insert into finding_versions (
@@ -864,7 +1146,7 @@ export async function executeCorrectVersion(
     centroid_mm, axes_mm, longest_mm, measurement_basis, frame, segmentation_source, model_id, quality, modality,
     report_longest_mm, change_reason
   ) values (
-    ${id}, ${auth.userId}, ${current.finding_id as string}, ${asNumber(latest[0]?.version_no) + 1}, ${current.id as string},
+    ${id}, ${ownerUserId}, ${current.finding_id as string}, ${asNumber(latest[0]?.version_no) + 1}, ${current.id as string},
     ${current.study_id as string}, ${current.observed_on as string}, ${current.location_label as string}, ${current.figo as string | null},
     ${current.centroid_mm as string | null}, ${JSON.stringify(data.axes)}, ${longest}, ${current.measurement_basis as string},
     ${current.frame as string}, ${"clinician_edit"}, ${null}, ${current.quality as string}, ${current.modality as string},
@@ -872,7 +1154,7 @@ export async function executeCorrectVersion(
   )`;
   await sql`insert into evidence_links (id, user_id, finding_version_id, kind, study_id, series_id, report_id, quote, slice_index, note)
     select ${crypto.randomUUID()}, user_id, ${id}, kind, study_id, series_id, report_id, quote, slice_index, ${"Copied forward when a clinician edited the measurement. The previous version remains."}
-    from evidence_links where finding_version_id = ${current.id as string} and user_id = ${auth.userId} limit 1`;
+    from evidence_links where finding_version_id = ${current.id as string} and user_id = ${ownerUserId} limit 1`;
   await audit(sql, auth.userId, "new_version", "finding_version", id, data.reason);
   return { ok: true, id };
 }
@@ -895,9 +1177,9 @@ export async function executeSaveLabMeasurement(sql: Sql, rawUserId: string, dat
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "recording a Volume Lab measurement");
   const id = await insertLabVersion(sql, auth.userId, data);
   await audit(sql, auth.userId, "new_version", "finding_version", id, "Volume lab measurement recorded as a new version. Prior versions were not overwritten.");
-  const patientRow = await sql<{ patient_id: string }>`select patient_id from findings where id = ${data.findingId} and user_id = ${auth.userId}`;
+  const patientRow = await sql<{ patient_id: string; user_id: string }>`select patient_id, user_id from findings where id = ${data.findingId}`;
   if (patientRow[0]?.patient_id) {
-    await recomputeReproTrace(sql, auth.userId, patientRow[0].patient_id).catch(() => null);
+    await recomputeReproTrace(sql, patientRow[0].user_id, patientRow[0].patient_id).catch(() => null);
   }
   return { ok: true, id };
 }
@@ -962,8 +1244,19 @@ export async function executeDecideCorrespondence(
   data: { correspondenceId: string; decision: string; note: string },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "recording a correspondence decision");
-  const rows = await sql`select id from correspondences where id = ${data.correspondenceId} and user_id = ${auth.userId}`;
+  const rows = await sql<{ id: string; user_id: string; patient_id: string }>`
+    select id, user_id, patient_id from correspondences where id = ${data.correspondenceId}
+  `;
   if (!rows.length) throw new Error("Proposal not found.");
+  if (rows[0].user_id !== auth.userId) {
+    await requirePatientRecordAccess(
+      sql,
+      auth.userId,
+      rows[0].patient_id,
+      "recording a correspondence decision",
+      "approve_or_reject_findings",
+    );
+  }
   const id = crypto.randomUUID();
   await sql`insert into correspondence_decisions (id, user_id, correspondence_id, decision, note)
     values (${id}, ${auth.userId}, ${data.correspondenceId}, ${data.decision}, ${data.note || "Decision recorded. Findings were not merged."})`;
@@ -988,9 +1281,20 @@ export async function executeResolveDiscrepancy(
   data: { discrepancyId: string; resolution: string; note: string },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "resolving a discrepancy");
-  const rows = await sql`select id from discrepancies where id = ${data.discrepancyId} and user_id = ${auth.userId}`;
+  const rows = await sql<{ id: string; user_id: string; patient_id: string }>`
+    select id, user_id, patient_id from discrepancies where id = ${data.discrepancyId}
+  `;
   if (!rows.length) throw new Error("Discrepancy not found or not owned.");
-  await sql`update discrepancies set active = false where id = ${data.discrepancyId} and user_id = ${auth.userId}`;
+  if (rows[0].user_id !== auth.userId) {
+    await requirePatientRecordAccess(
+      sql,
+      auth.userId,
+      rows[0].patient_id,
+      "resolving a discrepancy",
+      "approve_or_reject_findings",
+    );
+  }
+  await sql`update discrepancies set active = false where id = ${data.discrepancyId}`;
   await audit(sql, auth.userId, "resolve_discrepancy", "discrepancy", data.discrepancyId, `${data.resolution}: ${data.note}`);
   return { ok: true };
 }
@@ -1013,7 +1317,7 @@ export async function executeSaveDicomMeta(
 ) {
   const userId = requireAuthenticatedUser(rawUserId);
   if (data.patientId) {
-    await requirePatientRecordAccess(sql, userId, data.patientId, "save DICOM metadata");
+    await requirePatientRecordAccess(sql, userId, data.patientId, "save DICOM metadata", "view_imaging");
   }
   const id = crypto.randomUUID();
   await sql`insert into dicom_uploads (id, user_id, patient_id, file_name, transfer_syntax, metadata, warnings, identifiers_withheld)
@@ -1035,13 +1339,24 @@ export const saveDicomMeta = createServerFn({ method: "POST" })
   });
 
 export async function executeExportRecord(sql: Sql, rawUserId: string, patientId: string): Promise<ExportPayload> {
-  const { auth, patient } = await requirePatientRecordAccess(sql, rawUserId, patientId, "export");
-  const studies = await sql`select * from studies where patient_id = ${patientId} and user_id = ${auth.userId}`;
-  const findings = await sql`select * from findings where patient_id = ${patientId} and user_id = ${auth.userId}`;
+  const { auth, patient, patientOwnerUserId, permissions } = await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    patientId,
+    "export",
+    "view_demographics",
+  );
+  const perms = new Set(permissions);
+  const studies = perms.has("view_imaging") || perms.has("view_reports")
+    ? await sql`select * from studies where patient_id = ${patientId} and user_id = ${patientOwnerUserId}`
+    : [];
+  const findings = perms.has("view_findings")
+    ? await sql`select * from findings where patient_id = ${patientId} and user_id = ${patientOwnerUserId}`
+    : [];
   const findingIds = (findings as { id: string }[]).map((f) => f.id);
   const versions = [];
   for (const findingId of findingIds) {
-    const rows = await sql`select * from finding_versions where user_id = ${auth.userId} and finding_id = ${findingId}`;
+    const rows = await sql`select * from finding_versions where user_id = ${patientOwnerUserId} and finding_id = ${findingId}`;
     versions.push(...rows);
   }
   await audit(sql, auth.userId, "export", "patient", patientId, "JSON export of the synthetic record.");
@@ -1087,9 +1402,17 @@ export async function executeUploadReport(sql: Sql, rawUserId: string, data: Ing
     "upload_report",
     "report",
     res.reportId,
-    `De-identified ${data.fileKind.toUpperCase()} text stored (sha256 ${data.sha256.slice(0, 12)}…). Original file not stored. ${res.extraction.measurements.length} measurement(s), ${res.extraction.findings.length} finding sentence(s) extracted by rules.`,
+    `De-identified ${data.fileKind.toUpperCase()} text stored (sha256 ${data.sha256.slice(0, 12)}…). ${res.reportObjectId ? `Original document persisted (${res.reportObjectId}).` : "Original file not stored."} ${res.extraction.measurements.length} measurement(s), ${res.extraction.findings.length} finding sentence(s) extracted (${res.extraction.extractionMethod}).`,
   );
-  return { ok: true, reportId: res.reportId, studyId: res.studyId };
+  return {
+    ok: true,
+    reportId: res.reportId,
+    studyId: res.studyId,
+    extractionId: res.extractionId,
+    reportObjectId: res.reportObjectId,
+    extraction: res.extraction,
+    reconciliationDiscrepancies: res.reconciliationDiscrepancies,
+  };
 }
 
 export const uploadReport = createServerFn({ method: "POST" })
@@ -1121,9 +1444,6 @@ export const linkReportEvidence = createServerFn({ method: "POST" })
 
 /**
  * Recomputes longitudinal ReproTrace correspondences and discrepancies from live database records.
- *
- * Unifies identifiers across studies, series, finding versions, evidence links, and volume registrations,
- * validates transformation matrices, and enforces registration quality thresholds.
  */
 export async function recomputeReproTrace(
   sql: Sql,
@@ -1196,7 +1516,6 @@ export async function recomputeReproTrace(
     order by observed_on, version_no
   `;
 
-  // Also query series_id, volume_mm3, uncertainty_mm3, segmentation_source from finding_versions (if migration 0009 was applied)
   const versionExtraRows = await sql<{
     id: string;
     series_id: string | null;
@@ -1306,7 +1625,6 @@ export async function recomputeReproTrace(
 
   const studyGroups = studies.map((s) => {
     const studyVersions = versions.filter((v) => v.study_id === s.id);
-    // Keep only the latest version of each finding per study for chronology matching
     const latestByFinding = new Map<string, (typeof studyVersions)[number]>();
     for (const v of studyVersions) {
       const prev = latestByFinding.get(v.finding_id);
@@ -1345,7 +1663,6 @@ export async function recomputeReproTrace(
     return { studyId: s.id, date: s.study_date, snaps };
   });
 
-  // Load any prior clinician correspondence decisions so accepted/rejected/deferred decisions are preserved
   const priorDecisionRows = await sql<{
     correspondence_id: string;
     from_version_id: string | null;
@@ -1571,13 +1888,6 @@ export const requestClinicianVerification = createServerFn({ method: "POST" })
 
 /**
  * Administrator-controlled clinician verification decision (`executeVerifyClinician`).
- *
- * Supports `verified`, `approved`, `rejected`, `suspended`, and `revoked` transitions:
- * - Only administrators can approve, reject, suspend, or revoke clinician verification.
- * - Approving (`verified` or `approved`) promotes a patient to `'clinician'` (preserving `'admin'` if already admin).
- * - Rejecting, suspending, or revoking immediately removes clinician privileges (`role -> 'patient'`),
- *   subject to the last-remaining-administrator guard.
- * - Writes an immutable audit event to `audit_events` for every verification status change.
  */
 export async function executeVerifyClinician(
   sql: Sql,
@@ -1756,24 +2066,25 @@ export async function executeSaveVolumeRegistration(
   },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "saving a volume registration");
-  const patientRows = await sql<{ id: string }>`
-    select id from patients where id = ${data.patientId} and user_id = ${auth.userId}
-  `;
-  if (!patientRows.length) {
-    throw new Error("Patient record not found or not owned.");
-  }
+  const { patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    auth.userId,
+    data.patientId,
+    "saving a volume registration",
+    "add_annotations",
+  );
 
   const fixedSeriesRows = await sql<{ id: string; study_id: string }>`
     select s.id, s.study_id
     from series s
     join studies st on st.id = s.study_id
-    where s.id = ${data.fixedSeriesId} and s.user_id = ${auth.userId} and st.patient_id = ${data.patientId}
+    where s.id = ${data.fixedSeriesId} and s.user_id = ${patientOwnerUserId} and st.patient_id = ${data.patientId}
   `;
   const movingSeriesRows = await sql<{ id: string; study_id: string }>`
     select s.id, s.study_id
     from series s
     join studies st on st.id = s.study_id
-    where s.id = ${data.movingSeriesId} and s.user_id = ${auth.userId} and st.patient_id = ${data.patientId}
+    where s.id = ${data.movingSeriesId} and s.user_id = ${patientOwnerUserId} and st.patient_id = ${data.patientId}
   `;
   if (!fixedSeriesRows.length || !movingSeriesRows.length) {
     throw new Error("Fixed or moving series not found for this patient record.");
@@ -1809,7 +2120,7 @@ export async function executeSaveVolumeRegistration(
         id, user_id, patient_id, fixed_series_id, moving_series_id, fixed_study_id, moving_study_id,
         ncc_score, residual_mm, transform_matrix_json, status, matrix_valid
       ) values (
-        ${id}, ${auth.userId}, ${data.patientId}, ${data.fixedSeriesId}, ${data.movingSeriesId},
+        ${id}, ${patientOwnerUserId}, ${data.patientId}, ${data.fixedSeriesId}, ${data.movingSeriesId},
         ${fixedStudyId}, ${movingStudyId},
         ${nccScore}, ${residualMm}, ${JSON.stringify(storedTransform)}, ${effectiveStatus}, ${validation.valid}
       )
@@ -1819,7 +2130,7 @@ export async function executeSaveVolumeRegistration(
       insert into registrations (
         id, user_id, patient_id, fixed_series_id, moving_series_id, ncc_score, residual_mm, transform_matrix_json, status
       ) values (
-        ${id}, ${auth.userId}, ${data.patientId}, ${data.fixedSeriesId}, ${data.movingSeriesId},
+        ${id}, ${patientOwnerUserId}, ${data.patientId}, ${data.fixedSeriesId}, ${data.movingSeriesId},
         ${nccScore}, ${residualMm}, ${JSON.stringify(storedTransform)}, ${effectiveStatus}
       )
     `;
@@ -1832,7 +2143,7 @@ export async function executeSaveVolumeRegistration(
     id,
     `Rigid volume registration stored (${data.fixedSeriesId} -> ${data.movingSeriesId}, status: ${effectiveStatus}, NCC: ${nccScore.toFixed(3)}, Residual: ${residualMm.toFixed(2)} mm)`,
   );
-  await recomputeReproTrace(sql, auth.userId, data.patientId).catch(() => null);
+  await recomputeReproTrace(sql, patientOwnerUserId, data.patientId).catch(() => null);
   return { ok: true, id, status: effectiveStatus };
 }
 
@@ -1859,14 +2170,19 @@ export async function executeSaveEndometriosisRecord(
   data: { patientId: string; lesionSites: string[]; surgicalHistory: string; stagingRASRM?: string; imagingNote: string },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "entering endometriosis clinical records");
-  const owned = await sql`select id from patients where id = ${data.patientId} and user_id = ${auth.userId}`;
-  if (!owned.length) throw new Error("Record not found.");
+  const { patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    auth.userId,
+    data.patientId,
+    "entering endometriosis clinical records",
+    "add_annotations",
+  );
   const id = crypto.randomUUID();
   await sql`
     insert into pathway_endometriosis_records (
       id, user_id, patient_id, lesion_sites_json, surgical_history, staging_rASRM, imaging_note
     ) values (
-      ${id}, ${auth.userId}, ${data.patientId}, ${JSON.stringify(data.lesionSites)},
+      ${id}, ${patientOwnerUserId}, ${data.patientId}, ${JSON.stringify(data.lesionSites)},
       ${data.surgicalHistory}, ${data.stagingRASRM ?? null}, ${data.imagingNote}
     )
   `;
@@ -1884,11 +2200,17 @@ export const saveEndometriosisRecord = createServerFn({ method: "POST" })
   });
 
 export async function executeGetEndometriosisRecords(sql: Sql, rawUserId: string, patientId: string) {
-  const { auth } = await requirePatientRecordAccess(sql, rawUserId, patientId, "view endometriosis records");
+  const { patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    patientId,
+    "view endometriosis records",
+    "view_findings",
+  );
   return sql<EndometriosisRecordItem>`
     select id, lesion_sites_json, surgical_history, staging_rASRM, imaging_note, created_at
     from pathway_endometriosis_records
-    where patient_id = ${patientId} and user_id = ${auth.userId}
+    where patient_id = ${patientId} and user_id = ${patientOwnerUserId}
     order by created_at desc
   `;
 }
@@ -1908,14 +2230,19 @@ export async function executeSaveOvarianCystRecord(
   data: { patientId: string; laterality: "left" | "right" | "bilateral"; maxDiameterMm: number; featuresText: string; followUpMonths?: number; clinicalNote: string },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "entering ovarian cyst clinical records");
-  const owned = await sql`select id from patients where id = ${data.patientId} and user_id = ${auth.userId}`;
-  if (!owned.length) throw new Error("Record not found.");
+  const { patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    auth.userId,
+    data.patientId,
+    "entering ovarian cyst clinical records",
+    "add_annotations",
+  );
   const id = crypto.randomUUID();
   await sql`
     insert into pathway_ovarian_cyst_records (
       id, user_id, patient_id, laterality, max_diameter_mm, features_text, follow_up_months, clinical_note
     ) values (
-      ${id}, ${auth.userId}, ${data.patientId}, ${data.laterality},
+      ${id}, ${patientOwnerUserId}, ${data.patientId}, ${data.laterality},
       ${data.maxDiameterMm}, ${data.featuresText}, ${data.followUpMonths ?? null}, ${data.clinicalNote}
     )
   `;
@@ -1933,11 +2260,17 @@ export const saveOvarianCystRecord = createServerFn({ method: "POST" })
   });
 
 export async function executeGetOvarianCystRecords(sql: Sql, rawUserId: string, patientId: string) {
-  const { auth } = await requirePatientRecordAccess(sql, rawUserId, patientId, "view ovarian cyst records");
+  const { patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    patientId,
+    "view ovarian cyst records",
+    "view_findings",
+  );
   return sql<OvarianCystRecordItem>`
     select id, laterality, max_diameter_mm, features_text, follow_up_months, clinical_note, created_at
     from pathway_ovarian_cyst_records
-    where patient_id = ${patientId} and user_id = ${auth.userId}
+    where patient_id = ${patientId} and user_id = ${patientOwnerUserId}
     order by created_at desc
   `;
 }
@@ -1964,8 +2297,13 @@ export async function executeSavePcosAssessment(
   },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "entering PCOS assessments");
-  const owned = await sql`select id from patients where id = ${data.patientId} and user_id = ${auth.userId}`;
-  if (!owned.length) throw new Error("Record not found.");
+  const { patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    auth.userId,
+    data.patientId,
+    "entering PCOS assessments",
+    "add_annotations",
+  );
   const hyperandrogenism = data.hyperandrogenismClinical || data.hyperandrogenismBiochemical;
   const criteriaCount = [data.cycleIrregularity, hyperandrogenism, data.ultrasoundOrAmhFeatures].filter(Boolean).length;
   const rotterdamMet = criteriaCount >= 2;
@@ -1976,7 +2314,7 @@ export async function executeSavePcosAssessment(
       id, user_id, patient_id, cycle_irregularity, hyperandrogenism_clinical, hyperandrogenism_biochemical,
       ultrasound_or_amh_features, rotterdam_criteria_met, notes
     ) values (
-      ${id}, ${auth.userId}, ${data.patientId}, ${data.cycleIrregularity}, ${data.hyperandrogenismClinical},
+      ${id}, ${patientOwnerUserId}, ${data.patientId}, ${data.cycleIrregularity}, ${data.hyperandrogenismClinical},
       ${data.hyperandrogenismBiochemical}, ${data.ultrasoundOrAmhFeatures}, ${rotterdamMet}, ${data.notes}
     )
   `;
@@ -2001,12 +2339,18 @@ export const savePcosAssessment = createServerFn({ method: "POST" })
   });
 
 export async function executeGetPcosAssessments(sql: Sql, rawUserId: string, patientId: string) {
-  const { auth } = await requirePatientRecordAccess(sql, rawUserId, patientId, "view PCOS assessments");
+  const { patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    rawUserId,
+    patientId,
+    "view PCOS assessments",
+    "view_findings",
+  );
   return sql<PcosAssessmentItem>`
     select id, cycle_irregularity, hyperandrogenism_clinical, hyperandrogenism_biochemical,
            ultrasound_or_amh_features, rotterdam_criteria_met, notes, created_at
     from pathway_pcos_assessments
-    where patient_id = ${patientId} and user_id = ${auth.userId}
+    where patient_id = ${patientId} and user_id = ${patientOwnerUserId}
     order by created_at desc
   `;
 }
@@ -2048,7 +2392,7 @@ export async function executeStoreImagingArtifact(
     rawUserId,
     "uploading or persisting a medical imaging artifact",
   );
-  await requirePatientRecordAccess(sql, auth.userId, data.patientId, "store imaging artifact");
+  await requirePatientRecordAccess(sql, auth.userId, data.patientId, "store imaging artifact", "add_annotations");
   const buffer = Buffer.from(data.dataBase64, "base64");
   return storeImagingArtifact(sql, {
     userId: auth.userId,
@@ -2146,6 +2490,7 @@ export async function executeListImagingArtifacts(
     rawUserId,
     filter.patientId,
     "list imaging artifacts",
+    "view_imaging",
   );
   return listImagingArtifacts(sql, auth.userId, filter);
 }
@@ -2223,13 +2568,7 @@ export const getFindingImagingEvidence = createServerFn({ method: "POST" })
   });
 
 /**
- * Retrieve complete longitudinal comparison provenance for a correspondence record (Task 2E):
- * - Source and target examinations (`fromStudy`, `toStudy`, `fromSeries`, `toSeries`)
- * - Original finding references and full version measurements (`fromVersion`, `toVersion`)
- * - Registration information and quality metrics (`registration`)
- * - Matching confidence, physical distance, and uncertainty (`correspondence`)
- * - Discrepancy attribution explanation (`discrepancies`)
- * - Clinician review decisions, review dates, reviewer identities, and immutable audit history (`decisions`, `reviews`, `auditHistory`)
+ * Retrieve complete longitudinal comparison provenance for a correspondence record (Task 2E).
  */
 export async function executeGetLongitudinalComparisonProvenance(
   sql: Sql,
@@ -2238,14 +2577,20 @@ export async function executeGetLongitudinalComparisonProvenance(
 ) {
   const userId = requireAuthenticatedUser(rawUserId);
   const corrRows = await sql<Record<string, unknown>>`
-    select * from correspondences where id = ${correspondenceId} and user_id = ${userId}
+    select * from correspondences where id = ${correspondenceId}
   `;
   if (!corrRows.length) {
     throw new Error("Longitudinal correspondence not found or access denied.");
   }
   const correspondence = corrRows[0];
   const patientId = correspondence.patient_id as string;
-  await requirePatientRecordAccess(sql, userId, patientId, "view longitudinal comparison provenance");
+  const { patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    userId,
+    patientId,
+    "view longitudinal comparison provenance",
+    "view_longitudinal_history",
+  );
 
   const fromVersionId = correspondence.from_version_id as string | null;
   const toVersionId = correspondence.to_version_id as string | null;
@@ -2260,19 +2605,19 @@ export async function executeGetLongitudinalComparisonProvenance(
   const regId = correspondence.registration_id as string | null;
   const regRows = regId
     ? await sql<Record<string, unknown>>`
-        select * from registrations where id = ${regId} and user_id = ${userId}
+        select * from registrations where id = ${regId} and user_id = ${patientOwnerUserId}
       `.catch(() => [])
     : [];
 
   const decisions = await sql<Record<string, unknown>>`
     select * from correspondence_decisions
-    where correspondence_id = ${correspondenceId} and user_id = ${userId}
+    where correspondence_id = ${correspondenceId}
     order by created_at desc
   `.catch(() => []);
 
   const reviews = await sql<Record<string, unknown>>`
     select * from reviews
-    where target_type = 'correspondence' and target_id = ${correspondenceId} and user_id = ${userId}
+    where target_type = 'correspondence' and target_id = ${correspondenceId}
     order by created_at desc
   `.catch(() => []);
 
@@ -2280,7 +2625,7 @@ export async function executeGetLongitudinalComparisonProvenance(
     fromVersionId && toVersionId
       ? await sql<Record<string, unknown>>`
           select * from discrepancies
-          where user_id = ${userId}
+          where user_id = ${patientOwnerUserId}
             and patient_id = ${patientId}
             and ((left_ref = ${fromVersionId} and right_ref = ${toVersionId})
               or (left_ref = ${toVersionId} and right_ref = ${fromVersionId}))
@@ -2290,7 +2635,7 @@ export async function executeGetLongitudinalComparisonProvenance(
 
   const auditHistory = await sql<Record<string, unknown>>`
     select * from audit_events
-    where user_id = ${userId} and entity_id = ${correspondenceId}
+    where entity_id = ${correspondenceId}
     order by at desc
   `.catch(() => []);
 
@@ -2314,7 +2659,7 @@ export async function executeGetLongitudinalComparisonProvenance(
           series: toEvidence.series,
           finding: toEvidence.finding,
           findingVersion: toEvidence.findingVersion,
-          segmentationRun: toEvidence.segmentationRun,
+          segmentationRun: fromEvidence?.segmentationRun ?? null,
           sourceDicomObjects: toEvidence.sourceDicomObjects,
           maskObjects: toEvidence.maskObjects,
           integritySummary: toEvidence.integritySummary,
@@ -2334,4 +2679,525 @@ export const getLongitudinalComparisonProvenance = createServerFn({ method: "POS
   .handler(async ({ context, data: correspondenceId }) => {
     const sql = await getSql();
     return executeGetLongitudinalComparisonProvenance(sql, context.userId, correspondenceId);
+  });
+
+
+// ============================================================================
+// Sprint 4 Task 1: Patient–Clinician Collaboration & Granular Consent APIs
+// ============================================================================
+
+export async function executeGrantClinicianConsent(
+  sql: Sql,
+  rawUserId: string,
+  input: {
+    patientId: string;
+    clinicianUserId: string;
+    permissions?: readonly string[] | null;
+    scopeNote?: string | null;
+    expiresAt?: string | null;
+  },
+) {
+  const userId = requireAuthenticatedUser(rawUserId);
+  return grantClinicianConsent(sql, userId, input);
+}
+
+export const grantPatientConsent = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator(
+    (input: {
+      patientId: string;
+      clinicianUserId: string;
+      permissions?: string[] | null;
+      scopeNote?: string | null;
+      expiresAt?: string | null;
+    }) => {
+      if (!input || typeof input.patientId !== "string" || !input.patientId.trim()) {
+        throw new Error("patientId is required.");
+      }
+      if (typeof input.clinicianUserId !== "string" || !input.clinicianUserId.trim()) {
+        throw new Error("clinicianUserId is required.");
+      }
+      return input;
+    },
+  )
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeGrantClinicianConsent(sql, context.userId, data);
+  });
+
+export async function executeRevokeClinicianConsent(
+  sql: Sql,
+  rawUserId: string,
+  input: {
+    consentId?: string;
+    patientId?: string;
+    clinicianUserId?: string;
+    reason?: string;
+  },
+) {
+  const userId = requireAuthenticatedUser(rawUserId);
+  return revokeClinicianConsent(sql, userId, input);
+}
+
+export const revokePatientConsent = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator(
+    (input: {
+      consentId?: string;
+      patientId?: string;
+      clinicianUserId?: string;
+      reason?: string;
+    }) => input,
+  )
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeRevokeClinicianConsent(sql, context.userId, data);
+  });
+
+export async function executeListPatientConsents(
+  sql: Sql,
+  rawUserId: string,
+  patientId: string,
+) {
+  const userId = requireAuthenticatedUser(rawUserId);
+  return listConsentsForPatient(sql, userId, patientId);
+}
+
+export const getPatientConsents = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((patientId: string) => patientId)
+  .handler(async ({ context, data: patientId }) => {
+    const sql = await getSql();
+    return executeListPatientConsents(sql, context.userId, patientId);
+  });
+
+export async function executeListClinicianConsents(sql: Sql, rawUserId: string) {
+  const userId = requireAuthenticatedUser(rawUserId);
+  return listConsentsForClinician(sql, userId);
+}
+
+export const getClinicianConsents = createServerFn({ method: "GET" })
+  .middleware([authMiddleware])
+  .handler(async ({ context }) => {
+    const sql = await getSql();
+    return executeListClinicianConsents(sql, context.userId);
+  });
+
+export async function executeListApprovedClinicians(sql: Sql, rawUserId: string) {
+  requireAuthenticatedUser(rawUserId);
+  return listApprovedCliniciansDirectory(sql);
+}
+
+export const getApprovedClinicians = createServerFn({ method: "GET" })
+  .middleware([authMiddleware])
+  .handler(async ({ context }) => {
+    const sql = await getSql();
+    return executeListApprovedClinicians(sql, context.userId);
+  });
+
+export async function executeGetConsentAccessHistory(
+  sql: Sql,
+  rawUserId: string,
+  patientId: string,
+) {
+  const userId = requireAuthenticatedUser(rawUserId);
+  return listConsentAccessHistory(sql, userId, patientId);
+}
+
+export const getConsentAccessHistory = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((patientId: string) => patientId)
+  .handler(async ({ context, data: patientId }) => {
+    const sql = await getSql();
+    return executeGetConsentAccessHistory(sql, context.userId, patientId);
+  });
+
+
+// ============================================================================
+// Sprint 4 Task 2: Clinical Report Intelligence, OCR, LLM & Review APIs
+// ============================================================================
+
+/**
+ * Parse a clinical report file (TXT, DOCX, native PDF, or scanned PDF with OCR fallback),
+ * de-identify it, and return structured clinical extraction with page numbers and provenance.
+ */
+export async function executeExtractReportDocument(
+  sql: Sql,
+  rawUserId: string,
+  input: {
+    fileName: string;
+    dataBase64: string;
+  },
+) {
+  requireAuthenticatedUser(rawUserId);
+  const bytes = new Uint8Array(Buffer.from(input.dataBase64, "base64"));
+  const textRes = await extractReportText(input.fileName, bytes);
+  const deid = deidentify(textRes.text);
+  const extraction = extractReport(deid.text, {
+    rawTextForMetadata: textRes.text,
+    extractionMethod: textRes.extractionMethod,
+    pageCount: textRes.pageCount,
+    pages: textRes.pages,
+  });
+  return {
+    fileName: input.fileName,
+    fileKind: textRes.kind,
+    extractionMethod: textRes.extractionMethod,
+    pageCount: textRes.pageCount,
+    pages: textRes.pages,
+    ocrUsed: textRes.ocrUsed,
+    ocrAccuracyClaimed: textRes.ocrAccuracyClaimed,
+    warnings: textRes.warnings,
+    deidentifiedText: deid.text,
+    redactionsCount: deid.redactions.length,
+    extraction,
+  };
+}
+
+export const parseReportDocument = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { fileName: string; dataBase64: string }) => {
+    if (!input || !input.fileName || !input.dataBase64) {
+      throw new Error("fileName and dataBase64 are required.");
+    }
+    return input;
+  })
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeExtractReportDocument(sql, context.userId, data);
+  });
+
+/**
+ * Run source-grounded LLM interpretation on a stored report (Task 2D).
+ * Enforces `view_reports` access, de-identification/privacy gates, and stores the validated
+ * interpretation JSON on `report_extractions` while clearly marking it as unreviewed AI output.
+ */
+export async function executeInterpretReportWithLlm(
+  sql: Sql,
+  rawUserId: string,
+  input: {
+    reportId: string;
+    allowExternalDeidentified?: boolean;
+  },
+): Promise<LlmInterpretationResult> {
+  const userId = requireAuthenticatedUser(rawUserId);
+  const rRows = await sql<{
+    id: string;
+    user_id: string;
+    study_id: string;
+    body: string;
+    patient_id: string;
+  }>`
+    select r.id, r.user_id, r.study_id, r.body, s.patient_id
+    from reports r
+    join studies s on s.id = r.study_id
+    where r.id = ${input.reportId}
+  `;
+  const report = rRows[0];
+  if (!report) {
+    throw new Error("Report not found.");
+  }
+
+  await requirePatientRecordAccess(
+    sql,
+    userId,
+    report.patient_id,
+    "interpret clinical report",
+    "view_reports",
+  );
+
+  const extRows = await sql<{ id: string; extraction: string }>`
+    select id, extraction
+    from report_extractions
+    where report_id = ${input.reportId}
+    order by created_at desc
+    limit 1
+  `.catch(() => []);
+
+  const structuredExtraction = extRows[0]?.extraction
+    ? (JSON.parse(extRows[0].extraction) as ReturnType<typeof extractReport>)
+    : extractReport(report.body);
+
+  const interpretation = await interpretReportWithLlm({
+    reportId: report.id,
+    deidentifiedText: report.body,
+    structuredExtraction,
+    configOverrides: input.allowExternalDeidentified
+      ? { privacyGateAllowExternalDeidentified: true }
+      : undefined,
+  });
+
+  if (extRows[0]?.id) {
+    await sql`
+      update report_extractions
+      set llm_interpretation_json = ${JSON.stringify(interpretation)}
+      where id = ${extRows[0].id}
+    `.catch(() => null);
+  }
+
+  await audit(
+    sql,
+    userId,
+    "llm_interpret_report",
+    "report",
+    report.id,
+    `Source-grounded report interpretation (${interpretation.status}, provider: ${interpretation.provider}, claims: ${interpretation.claims.length}).`,
+  );
+
+  return interpretation;
+}
+
+export const interpretClinicalReport = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { reportId: string; allowExternalDeidentified?: boolean }) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeInterpretReportWithLlm(sql, context.userId, data);
+  });
+
+/**
+ * Answer a question strictly grounded in the stored clinical report (Task 2D).
+ * Refuses unsupported questions (`status: "insufficient_evidence"`).
+ */
+export async function executeAnswerReportQuestion(
+  sql: Sql,
+  rawUserId: string,
+  input: {
+    reportId: string;
+    question: string;
+  },
+): Promise<ReportQuestionAnswerResult> {
+  const userId = requireAuthenticatedUser(rawUserId);
+  const rRows = await sql<{
+    id: string;
+    body: string;
+    patient_id: string;
+  }>`
+    select r.id, r.body, s.patient_id
+    from reports r
+    join studies s on s.id = r.study_id
+    where r.id = ${input.reportId}
+  `;
+  const report = rRows[0];
+  if (!report) {
+    throw new Error("Report not found.");
+  }
+
+  await requirePatientRecordAccess(
+    sql,
+    userId,
+    report.patient_id,
+    "ask question about clinical report",
+    "view_reports",
+  );
+
+  const extRows = await sql<{ extraction: string }>`
+    select extraction
+    from report_extractions
+    where report_id = ${input.reportId}
+    order by created_at desc
+    limit 1
+  `.catch(() => []);
+
+  const structuredExtraction = extRows[0]?.extraction
+    ? (JSON.parse(extRows[0].extraction) as ReturnType<typeof extractReport>)
+    : extractReport(report.body);
+
+  return answerQuestionFromSourceReport({
+    reportId: report.id,
+    deidentifiedText: report.body,
+    structuredExtraction,
+    question: input.question,
+  });
+}
+
+export const askClinicalReportQuestion = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { reportId: string; question: string }) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeAnswerReportQuestion(sql, context.userId, data);
+  });
+
+/**
+ * Clinician review and editing of extracted report fields or OCR text (Task 2F).
+ */
+export async function executeReviewAndEditReportExtraction(
+  sql: Sql,
+  rawUserId: string,
+  input: Parameters<typeof reviewAndEditReportExtraction>[2],
+) {
+  const auth = await requireVerifiedClinicianOrAdmin(
+    sql,
+    rawUserId,
+    "reviewing or editing a clinical report extraction",
+  );
+  return reviewAndEditReportExtraction(sql, auth.userId, input);
+}
+
+export const reviewReportExtraction = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: Parameters<typeof reviewAndEditReportExtraction>[2]) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeReviewAndEditReportExtraction(sql, context.userId, data);
+  });
+
+/**
+ * Clinician approval or rejection of a proposed finding extracted from a report (Task 2F).
+ */
+export async function executeDecideExtractedFinding(
+  sql: Sql,
+  rawUserId: string,
+  input: Parameters<typeof decideExtractedFinding>[2],
+) {
+  const auth = await requireVerifiedClinicianOrAdmin(
+    sql,
+    rawUserId,
+    "approving or rejecting an extracted report finding",
+  );
+  return decideExtractedFinding(sql, auth.userId, input);
+}
+
+export const decideReportFinding = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: Parameters<typeof decideExtractedFinding>[2]) => input)
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    return executeDecideExtractedFinding(sql, context.userId, data);
+  });
+
+/**
+ * Retrieve the original uploaded report document (Task 2A & 2F) with integrity verification
+ * and strict patient/consent access checks (never publicly exposed).
+ */
+export async function executeGetOriginalReportDocument(
+  sql: Sql,
+  rawUserId: string,
+  reportId: string,
+) {
+  const userId = requireAuthenticatedUser(rawUserId);
+  const rRows = await sql<{
+    id: string;
+    study_id: string;
+    patient_id: string;
+    report_object_id?: string | null;
+  }>`
+    select r.id, r.study_id, s.patient_id, r.report_object_id
+    from reports r
+    join studies s on s.id = r.study_id
+    where r.id = ${reportId}
+  `.catch(async () => {
+    return sql<{
+      id: string;
+      study_id: string;
+      patient_id: string;
+      report_object_id?: string | null;
+    }>`
+      select r.id, r.study_id, s.patient_id
+      from reports r
+      join studies s on s.id = r.study_id
+      where r.id = ${reportId}
+    `;
+  });
+  const report = rRows[0];
+  if (!report) {
+    throw new Error("Report not found.");
+  }
+
+  await requirePatientRecordAccess(
+    sql,
+    userId,
+    report.patient_id,
+    "retrieve original report document",
+    "view_reports",
+  );
+
+  let objectId = report.report_object_id ?? null;
+  if (!objectId) {
+    const extRows = await sql<{ report_object_id: string | null }>`
+      select report_object_id from report_extractions where report_id = ${reportId} order by created_at desc limit 1
+    `.catch(() => []);
+    objectId = extRows[0]?.report_object_id ?? null;
+  }
+
+  if (!objectId) {
+    throw new Error("No original report binary artifact is stored for this report.");
+  }
+
+  const artifact = await getImagingArtifact(sql, userId, objectId, true);
+  if (!artifact) {
+    throw new Error("Original report artifact not found or access denied.");
+  }
+
+  return {
+    reportId,
+    objectId,
+    record: artifact.record,
+    integrity: artifact.integrity,
+    dataBase64: artifact.data ? artifact.data.toString("base64") : undefined,
+  };
+}
+
+export const getOriginalReportDocument = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((reportId: string) => reportId)
+  .handler(async ({ context, data: reportId }) => {
+    const sql = await getSql();
+    return executeGetOriginalReportDocument(sql, context.userId, reportId);
+  });
+
+/**
+ * Retrieve the full append-only revision history and finding review history for a report (Task 2E & 2F).
+ */
+export async function executeGetReportRevisions(
+  sql: Sql,
+  rawUserId: string,
+  reportId: string,
+) {
+  const userId = requireAuthenticatedUser(rawUserId);
+  const rRows = await sql<{ id: string; patient_id: string }>`
+    select r.id, s.patient_id
+    from reports r
+    join studies s on s.id = r.study_id
+    where r.id = ${reportId}
+  `;
+  if (!rRows[0]) {
+    throw new Error("Report not found.");
+  }
+
+  await requirePatientRecordAccess(
+    sql,
+    userId,
+    rRows[0].patient_id,
+    "view report revision history",
+    "view_reports",
+  );
+
+  const [revisions, findingReviews] = await Promise.all([
+    sql<Record<string, unknown>>`
+      select * from report_extraction_revisions
+      where report_id = ${reportId}
+      order by revision_no desc
+    `.catch(() => []),
+    sql<Record<string, unknown>>`
+      select * from report_finding_reviews
+      where report_id = ${reportId}
+      order by created_at desc
+    `.catch(() => []),
+  ]);
+
+  return {
+    reportId,
+    revisions,
+    findingReviews,
+  };
+}
+
+export const getReportRevisions = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((reportId: string) => reportId)
+  .handler(async ({ context, data: reportId }) => {
+    const sql = await getSql();
+    return executeGetReportRevisions(sql, context.userId, reportId);
   });
