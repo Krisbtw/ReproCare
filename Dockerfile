@@ -11,6 +11,7 @@ RUN npm ci
 COPY . .
 ENV NODE_ENV=production
 ENV VITE_AUTH_ENABLED=true
+ENV NITRO_PRESET=node-server
 
 # Pure build step (database migrations are decoupled and run at release/startup time)
 RUN npm run build
