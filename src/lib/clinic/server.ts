@@ -20,6 +20,14 @@ const VALID_VERIFICATION_DECISIONS = new Set<string>([
 ]);
 
 const REGIONS = [
+  // Body regions offered by the Context form (clinic-app.tsx) and accepted by executeAddSymptom.
+  "Lower abdomen — midline",
+  "Right lower quadrant",
+  "Left lower quadrant",
+  "Low back",
+  "Deep pelvis",
+  // Anatomical regions (kept for API callers that send them).
+
   "uterus",
   "left_ovary",
   "right_ovary",

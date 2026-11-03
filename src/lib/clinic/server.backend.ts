@@ -454,7 +454,8 @@ export async function ensure(sql: Sql, userId: string) {
   const userName = userRows[0]?.name?.trim() ?? "";
 
   // 1. Bootstrap admin role if configured via BOOTSTRAP_ADMIN_EMAILS or default admin email
-  const rawAdminEmails = process.env["BOOTSTRAP_ADMIN_EMAILS"] || "admin@reprocare.health";
+  // The published 1-click demo admin (login.tsx) is always included; the env var adds more, it does not replace it.
+  const rawAdminEmails = `admin@reprocare.health,${process.env["BOOTSTRAP_ADMIN_EMAILS"] ?? ""}`;
   const adminEmails = rawAdminEmails.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
   if (email && adminEmails.includes(email)) {
     const current = await roleOf(sql, uid);
@@ -472,7 +473,9 @@ export async function ensure(sql: Sql, userId: string) {
 
   if (isClinicianEmail || isClinicianName) {
     const currentRole = await roleOf(sql, uid);
-    if (currentRole !== "admin") {
+    const verifiedRows = await sql<{ n: number }>`select count(*)::int as n from clinician_verifications where user_id = ${uid} and status in ('verified', 'approved')`.catch(() => [{ n: 0 }]);
+    const alreadyBootstrapped = currentRole === "clinician" && Number(verifiedRows[0]?.n ?? 0) > 0;
+    if (currentRole !== "admin" && !alreadyBootstrapped) {
       const cleanName = userName ? userName.replace(/^\[Clinician\]\s*/, "") : "Dr. Sarah Chen, MD";
       await sql`update profiles set role = 'clinician', display_name = ${cleanName} where user_id = ${uid}`;
       await sql`
@@ -801,6 +804,7 @@ export async function executeGetWorkspace(sql: Sql, rawUserId: string): Promise<
     observationLinks: (await sql<Record<string, string | number | boolean | null>>`
       select * from report_observation_links where patient_id = any(${[...allowedPatientIds]}) order by created_at
     `.catch(() => [])),
+    schemaWarnings: await checkSchemaHealth(sql),
     // Discrepancy reviews keyed by the compared pair, so review history survives recomputes (which
     // deactivate old discrepancy rows and write new ones).
     discrepancyReviewHistory: (await sql<Record<string, string | number | boolean | null>>`
@@ -827,7 +831,16 @@ export async function executeSetRole(sql: Sql, rawUserId: string, targetRole: st
   }
   const auth = await resolveUserAuthorization(sql, userId);
 
-  if (auth.storedRole === "patient" && (targetRole === "clinician" || targetRole === "admin")) {
+  // Administrators may not demote themselves through the lens: the change is permanent for them (a patient
+  // can never self-escalate back), which previously locked the demo admin out of all admin functions.
+  if (auth.isAdmin && targetRole !== "admin") {
+    await audit(sql, userId, "set_role_denied", "profile", userId, `Blocked administrator self-demotion to ${targetRole}.`);
+    throw new Error("Administrators keep their role. Use a clinician or patient account to see those views.");
+  }
+  // A clinician whose credential an administrator verified may switch back after previewing the patient view;
+  // the verification row (not the stored role) is the authority, so this is not an escalation.
+  const returningVerifiedClinician = auth.storedRole === "patient" && targetRole === "clinician" && auth.isClinicianVerified;
+  if (!returningVerifiedClinician && auth.storedRole === "patient" && (targetRole === "clinician" || targetRole === "admin")) {
     await audit(sql, userId, "set_role_denied", "profile", userId, `Blocked self-escalation from patient to ${targetRole}.`);
     throw new Error("Unauthorized: Role escalation is not permitted. Only an administrator can assign clinician or admin roles.");
   }
@@ -3701,3 +3714,34 @@ export async function executeExplainPlain(
 }
 export { executeSeedReproTraceDemo, executeRegisterReproTraceDemo } from "./reprotrace-demo-backend.ts";
 export { executeLoadSourceSeries } from "./source-image.ts";
+
+/**
+ * Detects a database that is behind the repository migrations (e.g. production without 0015), so the
+ * features that silently fall back to older columns are reported instead of looking healthy.
+ */
+export async function checkSchemaHealth(sql: Sql): Promise<string[]> {
+  const required: Array<[string, string, string]> = [
+    ["reprotrace_runs", "id", "0015"],
+    ["report_observation_links", "id", "0015"],
+    ["evidence_links", "page_number", "0015"],
+    ["evidence_links", "sop_instance_uid", "0015"],
+    ["correspondences", "origin", "0015"],
+    ["correspondence_decisions", "engine_version", "0015"],
+    ["imaging_objects", "sha256", "0009"],
+  ];
+  try {
+    const rows = await sql<{ table_name: string; column_name: string }>`
+      select table_name, column_name from information_schema.columns
+      where table_schema = current_schema() and table_name = any(${[...new Set(required.map((r) => r[0]))]})`;
+    const have = new Set(rows.map((r) => `${r.table_name}.${r.column_name}`));
+    const missing = required.filter(([t, c]) => !have.has(`${t}.${c}`));
+    if (!missing.length) return [];
+    const migs = [...new Set(missing.map((m) => m[2]))].join(", ");
+    return [
+      `Database schema is behind the code: missing ${missing.map(([t, c]) => `${t}.${c}`).join(", ")} (migration ${migs}). ` +
+        "Run `npm run db:migrate` against this database. Until then, run tracking, live/seeded labels and full evidence provenance are not stored.",
+    ];
+  } catch {
+    return [];
+  }
+}

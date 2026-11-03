@@ -455,6 +455,8 @@ export type Workspace = {
   observationLinks?: Array<Record<string, string | number | boolean | null>>;
   /** Discrepancy reviews joined to the compared pair (left_ref/right_ref), across recomputes. */
   discrepancyReviewHistory?: Array<Record<string, string | number | boolean | null>>;
+  /** Present when the connected database is missing columns/tables the code expects (unapplied migrations). */
+  schemaWarnings?: string[];
 };
 
 export type ExportPayload = {

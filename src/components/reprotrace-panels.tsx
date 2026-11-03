@@ -108,7 +108,7 @@ export function EvidenceTrail({
         <li>Examination: {chain.study ? `${chain.study.date} · ${chain.study.modality}${chain.study.studyInstanceUid ? ` · StudyUID …${chain.study.studyInstanceUid.slice(-10)}` : ""}` : "not linked"}</li>
         <li>Series: {chain.series ? `${chain.series.description ?? ""}${chain.series.seriesInstanceUid ? ` · SeriesUID …${chain.series.seriesInstanceUid.slice(-10)}` : ""}${chain.series.frameOfReferenceUid ? ` · FoR …${chain.series.frameOfReferenceUid.slice(-6)}` : ""}` : "not linked"}</li>
         <li>Source image: {chain.imageAnchor ? `slice ${chain.imageAnchor.sliceIndex ?? "?"}${chain.imageAnchor.sopInstanceUid ? ` · SOP …${chain.imageAnchor.sopInstanceUid.slice(-8)}` : ""}` : "not recorded"}</li>
-        <li>Patient-space position: {chain.imageAnchor?.centroidLps ? `[${chain.imageAnchor.centroidLps.map((x) => x.toFixed(1)).join(", ")}] mm (${chain.imageAnchor.coordinateFrame})` : "none stored"}</li>
+        <li>Patient-space position: {(chain.imageAnchor?.centroidLps ?? chain.patientCentroidLps) ? `[${(chain.imageAnchor?.centroidLps ?? chain.patientCentroidLps)!.map((x) => x.toFixed(1)).join(", ")}] mm (${chain.imageAnchor?.coordinateFrame ?? "dicom_lps"})` : "none stored"}</li>
         <li>Registrations touching this series: {chain.registrationIds.length || "none"}</li>
       </ol>
       {chain.study && chain.series ? (
@@ -334,7 +334,7 @@ export function TraceReview({
         <p className="max-w-3xl text-sm text-ink-soft">Proposals are never merges. Accepting records a relationship between two finding versions; both histories stay intact. Thresholds are unvalidated heuristics and synthetic tests are not evidence of clinical accuracy.</p>
         <div className="flex flex-wrap items-center gap-2">
           {clinician && <Btn testId="recompute-correspondence" disabled={busy} onClick={() => run(() => recompute(pid))}>Recompute correspondence</Btn>}
-          {clinician && !isDemoPatient(pid) && <Btn tone="ghost" disabled={busy} onClick={() => run(seedDemo)}>Load synthetic ReproTrace demo patient</Btn>}
+          {clinician && <Btn tone="ghost" disabled={busy} testId="seed-demo" onClick={() => run(seedDemo)}>{isDemoPatient(pid) ? "Check / repair synthetic demo data" : "Load synthetic ReproTrace demo patient"}</Btn>}
           {clinician && isDemoPatient(pid) && <Btn tone="ghost" disabled={busy} testId="register-demo" onClick={() => run(() => registerDemo(pid))}>Run rigid registration on demo series (moment-based prototype)</Btn>}
         </div>
         <div className="rounded-md border border-line bg-card p-3 text-xs text-ink-soft" data-testid="run-summary">
@@ -372,7 +372,7 @@ export function TraceReview({
                   <p className="tabular-nums">Score {n(row, "score")?.toFixed(2) ?? "—"}{n(row, "uncertainty_mm") != null ? ` · ±${n(row, "uncertainty_mm")!.toFixed(1)} mm` : ""}</p>
                   <p className="tabular-nums">{n(row, "distance_mm") != null ? `Registered distance ${n(row, "distance_mm")!.toFixed(1)} mm` : "Spatial distance not valid / not computed"}</p>
                   {n(row, "registration_ncc") != null && <p className="text-xs text-muted">NCC {n(row, "registration_ncc")!.toFixed(2)} · residual {n(row, "registration_residual_mm")?.toFixed(1)} mm</p>}
-                  {n(row, "volume_delta_pct") != null && <p className="text-xs text-muted">Volume change {n(row, "volume_delta_pct")!.toFixed(0)}% ({s(row, "attribution_category").replaceAll("_", " ")})</p>}
+                  {n(row, "volume_delta_pct") != null && <p className="text-xs text-muted">Volume change {n(row, "volume_delta_pct")!.toFixed(0)}% ({s(row, "attribution_category") === "genuine_anatomical_change" && (row.provisional === true || s(row, "registration_status") !== "verified") ? "possible change; not confirmable without a verified registration" : s(row, "attribution_category").replaceAll("_", " ")})</p>}
                 </div>
               </div>
               <p className="text-sm text-ink-soft">{s(row, "rationale")}</p>

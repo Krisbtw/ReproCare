@@ -49,6 +49,8 @@ export type EvidenceChain = {
     centroidLps: [number, number, number] | null;
     sourceArtifactRef: string | null;
   } | null;
+  /** Version centroid when it is in a patient frame (DICOM LPS or registered); null otherwise. */
+  patientCentroidLps: [number, number, number] | null;
   spatialStatus: SpatialStatus;
   verificationStatus: "clinician_verified" | "needs_review";
   registrationIds: string[];
@@ -109,7 +111,7 @@ export function buildEvidenceChain(ws: EvidenceWorkspace, versionId: string): Ev
     ? "no_coordinates"
     : frame === "schematic"
       ? "schematic_only"
-      : seriesRow && (frame === "dicom_lps" || frame === "image_registered")
+      : seriesRow && (frame === "dicom_lps" || frame === "image_registered") && imageLink && numOr(imageLink, "slice_index") != null
         ? "spatially_anchored"
         : "coordinates_without_image";
 
@@ -123,7 +125,7 @@ export function buildEvidenceChain(ws: EvidenceWorkspace, versionId: string): Ev
   if (imageLink && !str(imageLink, "sop_instance_uid")) gaps.push("No SOP Instance UID recorded for the source image.");
   if (spatialStatus === "no_coordinates") gaps.push("No patient-space coordinate: the finding has a report link but no verified imaging anchor.");
   if (spatialStatus === "schematic_only") gaps.push("Coordinates are schematic teaching placements, not a spatial anchor in source images.");
-  if (spatialStatus === "coordinates_without_image") gaps.push("Coordinates exist but the source series is not linked, so the anchor cannot be verified.");
+  if (spatialStatus === "coordinates_without_image") gaps.push("Patient-space coordinates exist but no source series slice is linked, so the anchor cannot be checked against the original image.");
 
   const registrationIds = (ws.registrations ?? [])
     .filter((r) => seriesId && (str(r, "fixed_series_id") === seriesId || str(r, "moving_series_id") === seriesId))
@@ -157,6 +159,7 @@ export function buildEvidenceChain(ws: EvidenceWorkspace, versionId: string): Ev
           sourceArtifactRef: str(imageLink, "source_artifact_ref") ?? str(imageLink, "imaging_object_id"),
         }
       : null,
+    patientCentroidLps: frame === "dicom_lps" || frame === "image_registered" ? centroid : null,
     spatialStatus,
     verificationStatus: reportLinks.some((r) => r.reviewStatus === "clinician_verified") ? "clinician_verified" : "needs_review",
     registrationIds,

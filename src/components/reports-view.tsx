@@ -621,7 +621,7 @@ export function ReportsView({
               onClick={() => void sample("scanned_pdf")}
               testId="report-sample-scanned-pdf"
             >
-              Sample · Scanned PDF (OCR)
+              Sample · Scanned PDF (built-in synthetic-font OCR)
             </Btn>
             <Btn
               tone="ghost"

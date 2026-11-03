@@ -72,7 +72,7 @@ cd imaging-service && ANATOMYBRIDGE_DEV_NO_AUTH=1 python -m pytest tests/ -v --t
 ```
 
 ### Verified Test Summary (2026-11-03, local Windows run)
-- **TypeScript Application Tests (`test:app`)**: **322 passed, 0 failed, 0 skipped** (includes `src/lib/clinic/reprotrace-workflow.test.ts`, 11 tests, and `src/lib/reprotrace/scenarios.test.ts`, 16 tests).
+- **TypeScript Application Tests (`test:app`)**: **326 passed, 0 failed, 0 skipped** (includes `src/lib/clinic/reprotrace-workflow.test.ts`, 13 tests, `src/lib/imaging/auto-seed.test.ts`, 2 tests, and `src/lib/reprotrace/scenarios.test.ts`, 16 tests).
 - **Scaffold Tests (`test:scaffold`)**: **201 passed, 0 failed**.
 - **TypeScript strict check (`tsc --noEmit`)** clean; **`npm run build`** succeeds.
 - **Python tests**: not re-run on 2026-11-03 (no Python interpreter on the verifying machine). Last recorded result below.

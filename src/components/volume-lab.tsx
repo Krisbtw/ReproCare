@@ -1,5 +1,6 @@
 import { DEMO_EXAMS, buildDemoSeriesFiles } from "@/lib/clinic/reprotrace-demo";
 import { loadSourceSeries } from "@/lib/clinic/server";
+import { findLesionSeed } from "@/lib/imaging/auto-seed";
 
 export type SourceRequest = {
   nonce: number;
@@ -620,30 +621,7 @@ export function VolumeLab({
   const manualProblem = params.mode === "manual" && (!manualWin || manualWin.lower >= manualWin.upper) ? "Enter a lower value that is below the upper value." : null;
 
   function findLesionCenterSeed(): Vec3 {
-    if (!volume) return [0, 0, 0];
-    const [dx, dy, dz] = volume.dims;
-    let maxVal = -Infinity;
-    let bestVoxel: Vec3 = [Math.floor(dx / 2), Math.floor(dy / 2), Math.floor(dz / 2)];
-
-    const xMin = Math.floor(dx * 0.2);
-    const xMax = Math.floor(dx * 0.8);
-    const yMin = Math.floor(dy * 0.2);
-    const yMax = Math.floor(dy * 0.8);
-    const zMin = Math.floor(dz * 0.2);
-    const zMax = Math.floor(dz * 0.8);
-
-    for (let z = zMin; z < zMax; z++) {
-      for (let y = yMin; y < yMax; y++) {
-        for (let x = xMin; x < xMax; x++) {
-          const val = voxelValue(volume, [x, y, z]);
-          if (val !== null && val > maxVal) {
-            maxVal = val;
-            bestVoxel = [x, y, z];
-          }
-        }
-      }
-    }
-    return bestVoxel;
+    return volume ? findLesionSeed(volume) : [0, 0, 0];
   }
 
   async function autoPlaceSeedAndSegment() {

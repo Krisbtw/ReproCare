@@ -315,6 +315,7 @@ export function ClinicApp() {
           <UserButton />
         </header>
         {error && <p className="bg-clay-soft px-4 py-2 text-sm text-clay">{error}</p>}
+        {isVerifiedClinician && (data?.schemaWarnings ?? []).map((w) => <p key={w} role="alert" data-testid="schema-warning" className="bg-clay-soft px-4 py-2 text-sm text-clay">{w}</p>)}
         <div className="space-y-6 p-4 lg:p-6">
           {view === "board" && <Board data={data} patients={visiblePatients} onOpen={(id) => { void run(() => setActivePatient({ data: id })); setView("studio"); }} />}
           {view === "people" && patient && <People data={data} patients={visiblePatients} active={patient} busy={busy} run={run} onOpen={(id) => { void run(() => setActivePatient({ data: id })); setView("studio"); }} />}

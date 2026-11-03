@@ -15,6 +15,8 @@ import {
   executeAddReview,
   executeDecideCorrespondence,
   executeGetWorkspace,
+  executeSetRole,
+  checkSchemaHealth,
   executeLoadSourceSeries,
   executeRecomputeReproTrace,
   executeRegisterReproTraceDemo,
@@ -297,4 +299,24 @@ test("Req 5/6/7: timeline, finding history and six-category summary are built fr
   assert.ok(sum.patientReported.some((i) => /laboratory record/.test(i.source)), "lab kept distinct by source");
   assert.ok(sum.missingEvidence.some((i) => /SYNTHETIC/.test(i.text)), "synthetic geometry disclosed");
   assert.ok(!sum.clinicianVerified.some((i) => /rule-based engine/.test(i.source)));
+});
+
+test("Lens: verified clinician can preview patient view and switch back; patient still cannot escalate", async () => {
+  await ready;
+  await executeSetRole(sql, DR, "patient");
+  await executeSetRole(sql, DR, "clinician");
+  const r = (await rows<{ role: string }>("select role from profiles where user_id = $1", [DR]))[0];
+  assert.equal(r.role, "clinician");
+  await assert.rejects(() => executeSetRole(sql, "pat_demo", "clinician"), /Unauthorized/);
+  await pg.exec(`insert into profiles (user_id, display_name, role) values ('adm_demo', 'Admin', 'admin'), ('adm_two', 'Admin 2', 'admin') on conflict do nothing`);
+  await assert.rejects(() => executeSetRole(sql, "adm_demo", "patient"), /keep their role/);
+});
+
+test("Schema health reports nothing on a fully migrated database and flags a missing 0015 column", async () => {
+  await ready;
+  assert.deepEqual(await checkSchemaHealth(sql), []);
+  const fake = (async (strings: TemplateStringsArray) => (strings.join("").includes("information_schema") ? [{ table_name: "imaging_objects", column_name: "sha256" }] : [])) as unknown as Sql;
+  const w = await checkSchemaHealth(fake);
+  assert.equal(w.length, 1);
+  assert.match(w[0], /migration 0015/);
 });
