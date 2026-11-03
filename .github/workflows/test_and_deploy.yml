@@ -30,7 +30,7 @@ jobs:
       - name: Install OCR & PDF system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng poppler-utils
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng poppler-utils python3-pil python3-numpy
 
       - name: Set up Node.js 22
         uses: actions/setup-node@v4
