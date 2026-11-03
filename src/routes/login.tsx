@@ -37,10 +37,13 @@ export function LoginPanel() {
           : await authClient.signIn.email({ email: email.trim(), password });
       setPending(false);
       if (result?.error) {
-        const rawMsg = result.error.message || "Authentication failed.";
+        const rawMsg =
+          result.error.message ||
+          (result.error as any).statusText ||
+          ((result.error as any).status ? `Authentication failed (${(result.error as any).status})` : "Authentication failed.");
         if (/invalid origin/i.test(rawMsg)) {
           setMessage("Origin validation failed. Please refresh the page or ensure you are on the secure domain.");
-        } else if (/user already exists/i.test(rawMsg)) {
+        } else if (/user already exists/i.test(rawMsg) || (result.error as any).code === "USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL") {
           setMessage("An account with this email already exists. Please sign in.");
           setMode("in");
         } else {

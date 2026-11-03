@@ -193,7 +193,7 @@ const trustedOrigins = (request?: Request): string[] => {
 };
 
 const defaultSupabaseDatabaseUrl =
-  "postgresql://postgres:vJihFnkCtLkADB20@db.mfbqdesghtvalkywzsdb.supabase.co:5432/postgres";
+  "postgresql://postgres.mfbqdesghtvalkywzsdb:vJihFnkCtLkADB20@aws-0-eu-west-1.pooler.supabase.com:5432/postgres";
 
 const rawDatabaseUrl =
   env("DATABASE_URL") ||

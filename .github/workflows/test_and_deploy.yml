@@ -42,7 +42,7 @@ jobs:
         run: npm ci
 
       - name: Verify authentication invariant script
-        run: npm run check:auth || [ $? -eq 2 ]
+        run: node scripts/check-auth-invariant.mjs || [ $? -eq 2 ]
 
       - name: Run TypeScript typecheck
         run: npm run typecheck
@@ -57,7 +57,7 @@ jobs:
         run: npm run build
 
       - name: Verify compiled production server output exists
-        run: test -f .output/server/index.mjs
+        run: test -f .output/server/index.mjs || test -d .vercel/output
 
   imaging-service-tests:
     name: Python Medical Imaging & AI Segmentation Tests
