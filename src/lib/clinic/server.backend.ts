@@ -65,6 +65,10 @@ import {
   type QuoteLinkInput,
 } from "../reports/store.ts";
 import { extractReportText } from "../reports/text.ts";
+import {
+  resolveReportObservation,
+  type ResolveObservationInput,
+} from "../reports/observation-links.ts";
 import { extractReport } from "../reports/extract.ts";
 import { deidentify } from "../reports/deidentify.ts";
 import {
@@ -424,6 +428,9 @@ async function seed(sql: Sql, userId: string) {
           ${p.fromStudyId ? kid(userId, p.fromStudyId) : null}, ${p.toStudyId ? kid(userId, p.toStudyId) : null},
           ${p.category}, ${p.score}, ${p.rationale}, ${p.provisional}, ${ENGINE_VERSION}, ${true})`;
     }
+    // Label seeded proposals honestly: they were precomputed for the demonstration, not by a live run.
+    await sql`update correspondences set origin = 'seeded_demo' where patient_id = ${kid(userId, patient.key)} and origin is null`.catch(() => null);
+    await sql`update correspondences set origin = 'seeded_demo' where patient_id = ${kid(userId, patient.key)} and origin = 'legacy_unlabelled'`.catch(() => null);
     for (const d of discrepanciesFor(patient.key)) {
       await sql`insert into discrepancies (id, user_id, patient_id, category, summary, detail, left_ref, right_ref, engine_version, active)
         values (${crypto.randomUUID()}, ${userId}, ${kid(userId, patient.key)}, ${d.category}, ${d.summary}, ${d.detail},
@@ -788,6 +795,12 @@ export async function executeGetWorkspace(sql: Sql, rawUserId: string): Promise<
       note: model.note,
     })),
     engineVersion: ENGINE_VERSION,
+    reprotraceRuns: (await sql<Record<string, string | number | boolean | null>>`
+      select * from reprotrace_runs where patient_id = any(${[...allowedPatientIds]}) order by created_at desc limit 50
+    `.catch(() => [])),
+    observationLinks: (await sql<Record<string, string | number | boolean | null>>`
+      select * from report_observation_links where patient_id = any(${[...allowedPatientIds]}) order by created_at
+    `.catch(() => [])),
   };
 }
 
@@ -1351,8 +1364,17 @@ export async function executeDecideCorrespondence(
   data: { correspondenceId: string; decision: string; note: string },
 ) {
   const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "recording a correspondence decision");
-  const rows = await sql<{ id: string; user_id: string; patient_id: string }>`
-    select id, user_id, patient_id from correspondences where id = ${data.correspondenceId}
+  const rows = await sql<{
+    id: string;
+    user_id: string;
+    patient_id: string;
+    from_version_id: string | null;
+    to_version_id: string | null;
+    category: string;
+    engine_version: string;
+  }>`
+    select id, user_id, patient_id, from_version_id, to_version_id, category, engine_version
+    from correspondences where id = ${data.correspondenceId}
   `;
   if (!rows.length) throw new Error("Proposal not found.");
   if (rows[0].user_id !== auth.userId) {
@@ -1365,8 +1387,20 @@ export async function executeDecideCorrespondence(
     );
   }
   const id = crypto.randomUUID();
-  await sql`insert into correspondence_decisions (id, user_id, correspondence_id, decision, note)
-    values (${id}, ${auth.userId}, ${data.correspondenceId}, ${data.decision}, ${data.note || "Decision recorded. Findings were not merged."})`;
+  const c = rows[0];
+  const note = data.note || "Decision recorded. Findings were not merged.";
+  const runRow = await sql<{ run_id: string | null }>`select run_id from correspondences where id = ${c.id}`.catch(() => []);
+  try {
+    await sql`insert into correspondence_decisions (
+        id, user_id, correspondence_id, decision, note, engine_version, from_version_id, to_version_id, category_at_decision, run_id
+      ) values (
+        ${id}, ${auth.userId}, ${data.correspondenceId}, ${data.decision}, ${note},
+        ${c.engine_version}, ${c.from_version_id}, ${c.to_version_id}, ${c.category}, ${runRow[0]?.run_id ?? null}
+      )`;
+  } catch {
+    await sql`insert into correspondence_decisions (id, user_id, correspondence_id, decision, note)
+      values (${id}, ${auth.userId}, ${data.correspondenceId}, ${data.decision}, ${note})`;
+  }
   await audit(sql, auth.userId, "correspondence_decision", "correspondence", data.correspondenceId, `${data.decision}. Records were not merged.`);
   return { ok: true, id };
 }
@@ -1556,7 +1590,16 @@ export async function recomputeReproTrace(
   sql: Sql,
   userId: string,
   patientId: string,
-): Promise<{ proposalsCount: number; discrepanciesCount: number }> {
+  options?: { triggeredBy?: string; trigger?: string },
+): Promise<{
+  proposalsCount: number;
+  discrepanciesCount: number;
+  runId?: string;
+  reviewRequiredCount?: number;
+  studyIds?: string[];
+  registrationNotes?: string[];
+  engineVersion?: string;
+}> {
   const studies = await sql<{ id: string; study_date: string }>`
     select id, study_date::text from studies where patient_id = ${patientId} and user_id = ${userId} order by study_date
   `;
@@ -1669,6 +1712,11 @@ export async function recomputeReproTrace(
     order by created_at desc
   `.catch(() => []);
 
+  const methodRows = await sql<{ id: string; method: string | null }>`
+    select id, method from registrations where patient_id = ${patientId} and user_id = ${userId}
+  `.catch(() => []);
+  const methodById = new Map(methodRows.map((m) => [m.id, m.method]));
+
   const regMap = new Map<string, RegistrationLookupEntry>();
   for (const r of regRows) {
     const fixedStudyId = seriesToStudy.get(r.fixed_series_id) ?? null;
@@ -1712,6 +1760,7 @@ export async function recomputeReproTrace(
       movingSeriesId: r.moving_series_id,
       fixedStudyId,
       movingStudyId,
+      method: methodById.get(r.id) ?? null,
     };
 
     const seriesKey = `${r.fixed_series_id}:${r.moving_series_id}`;
@@ -1796,11 +1845,31 @@ export async function recomputeReproTrace(
     decidedAt: d.at,
   }));
 
-  const proposals = matchChronology(
+  const allProposals = matchChronology(
     studyGroups,
     regMap.size > 0 ? regMap : undefined,
-    { clinicianDecisions },
+    { clinicianDecisions, includeNonSpatial: true },
   );
+  // A pair the clinician already decided keeps its decided correspondence row; do not duplicate it.
+  const decidedPairs = new Set(
+    priorDecisionRows.map((d) => `${d.from_version_id ?? ""}->${d.to_version_id ?? ""}`),
+  );
+  const proposals = allProposals.filter((p) => !decidedPairs.has(`${p.fromId ?? ""}->${p.toId ?? ""}`));
+  const runId = crypto.randomUUID();
+  const reviewRequired = proposals.filter((p) => p.provisional || p.category !== "likely_same").length;
+  const registrationNotes = [
+    ...new Set(proposals.map((p) => p.registrationAvailability?.label).filter((x): x is string => Boolean(x))),
+  ];
+  await sql`
+    insert into reprotrace_runs (
+      id, user_id, patient_id, triggered_by, trigger, origin, engine_version, study_ids_json,
+      proposals_count, review_required_count, registration_notes_json
+    ) values (
+      ${runId}, ${userId}, ${patientId}, ${options?.triggeredBy ?? userId}, ${options?.trigger ?? "data_change"},
+      'live_recompute', ${ENGINE_VERSION}, ${JSON.stringify(studies.map((s) => s.id))},
+      ${proposals.length}, ${reviewRequired}, ${JSON.stringify(registrationNotes)}
+    )
+  `.catch(() => null);
 
   try {
     await sql`
@@ -1818,6 +1887,33 @@ export async function recomputeReproTrace(
   for (const p of proposals) {
     const corrId = crypto.randomUUID();
     const rq = p.registrationQuality;
+    const rationale = p.registrationAvailability
+      ? `${p.rationale} [Spatial basis: ${p.registrationAvailability.label}. ${p.registrationAvailability.explanation}]`
+      : p.rationale;
+    try {
+      await sql`
+        insert into correspondences (
+          id, user_id, patient_id, from_version_id, to_version_id, from_study_id, to_study_id,
+          from_series_id, to_series_id, registration_id, registration_status, registration_ncc, registration_residual_mm,
+          category, score, rationale, provisional,
+          attribution_category, uncertainty_mm, distance_mm, volume_delta_pct, elapsed_days, growth_rate_mm3_per_month,
+          engine_version, active, origin, run_id, alternatives_json
+        ) values (
+          ${corrId}, ${userId}, ${patientId},
+          ${p.fromId}, ${p.toId}, ${p.fromStudyId}, ${p.toStudyId},
+          ${p.fromSeriesId ?? null}, ${p.toSeriesId ?? null},
+          ${rq?.registrationId ?? rq?.id ?? null}, ${rq?.status ?? null}, ${rq?.nccScore ?? null}, ${rq?.residualMm ?? null},
+          ${p.category}, ${p.score}, ${rationale}, ${p.provisional},
+          ${p.attributionCategory ?? null}, ${p.uncertaintyMm ?? null},
+          ${p.registrationAvailability?.spatialComparisonValid === false ? null : (p.distanceMm ?? null)},
+          ${p.volumeDeltaPct ?? null}, ${p.elapsedDays ?? null}, ${p.growthRateMm3PerMonth ?? null},
+          ${ENGINE_VERSION}, true, 'live_recompute', ${runId}, ${p.alternatives ? JSON.stringify(p.alternatives) : null}
+        )
+      `;
+      continue;
+    } catch {
+      // Older schema without run columns: fall through.
+    }
     try {
       await sql`
         insert into correspondences (
@@ -1942,8 +2038,41 @@ export async function recomputeReproTrace(
     }
   }
 
-  await audit(sql, userId, "recompute_reprotrace", "patient", patientId, `ReproTrace updated: ${proposals.length} proposal(s), ${discrepanciesCount} discrepancy(ies).`);
-  return { proposalsCount: proposals.length, discrepanciesCount };
+  await audit(sql, options?.triggeredBy ?? userId, "recompute_reprotrace", "patient", patientId, `ReproTrace run ${runId} (${ENGINE_VERSION}): ${proposals.length} proposal(s), ${reviewRequired} need review, ${discrepanciesCount} discrepancy(ies).`);
+  return {
+    proposalsCount: proposals.length,
+    discrepanciesCount,
+    runId,
+    reviewRequiredCount: reviewRequired,
+    studyIds: studies.map((s) => s.id),
+    registrationNotes,
+    engineVersion: ENGINE_VERSION,
+  };
+}
+
+/** Explicit, authenticated clinician-triggered recomputation from live stored records. */
+export async function executeRecomputeReproTrace(sql: Sql, rawUserId: string, patientId: string) {
+  const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "recomputing ReproTrace correspondence");
+  const { patientOwnerUserId } = await requirePatientRecordAccess(
+    sql,
+    auth.userId,
+    patientId,
+    "recomputing ReproTrace correspondence",
+    "view_longitudinal_history",
+  );
+  return recomputeReproTrace(sql, patientOwnerUserId, patientId, {
+    triggeredBy: auth.userId,
+    trigger: "clinician_request",
+  });
+}
+
+export async function executeResolveReportObservation(
+  sql: Sql,
+  rawUserId: string,
+  data: ResolveObservationInput,
+) {
+  const auth = await requireVerifiedClinicianOrAdmin(sql, rawUserId, "resolving a report observation");
+  return resolveReportObservation(sql, auth.userId, data);
 }
 
 export async function executeRequestClinicianVerification(
@@ -2221,7 +2350,24 @@ export async function executeSaveVolumeRegistration(
   const id = crypto.randomUUID();
   const fixedStudyId = fixedSeriesRows[0].study_id;
   const movingStudyId = movingSeriesRows[0].study_id;
+  let stored = false;
   try {
+    await sql`
+      insert into registrations (
+        id, user_id, patient_id, fixed_series_id, moving_series_id, fixed_study_id, moving_study_id,
+        ncc_score, residual_mm, transform_matrix_json, status, matrix_valid, method
+      ) values (
+        ${id}, ${patientOwnerUserId}, ${data.patientId}, ${data.fixedSeriesId}, ${data.movingSeriesId},
+        ${fixedStudyId}, ${movingStudyId},
+        ${nccScore}, ${residualMm}, ${JSON.stringify(storedTransform)}, ${effectiveStatus}, ${validation.valid},
+        ${data.method ?? null}
+      )
+    `;
+    stored = true;
+  } catch {
+    stored = false;
+  }
+  if (!stored) try {
     await sql`
       insert into registrations (
         id, user_id, patient_id, fixed_series_id, moving_series_id, fixed_study_id, moving_study_id,
@@ -3542,3 +3688,4 @@ export async function executeExplainPlain(
     };
   }
 }
+export { executeSeedReproTraceDemo, executeRegisterReproTraceDemo } from "./reprotrace-demo-backend.ts";

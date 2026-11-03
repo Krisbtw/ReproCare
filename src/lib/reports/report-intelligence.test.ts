@@ -353,8 +353,10 @@ describe("Sprint 4 Task 2 — Clinical Report Intelligence, OCR, LLM Grounding &
       const reportLines = [
         "Pelvic MRI Report",
         "Study date: 2025-11-08",
-        "Posterior uterine wall intramural fibroid (FIGO 4) measuring 52 x 44 x 40 mm.",
-        "Impression: Enlarging posterior wall intramural fibroid.",
+        // Anterior: the recorded F-01 is "FIGO 4 anterior intramural". (Previously "Posterior", which the old
+        // FIGO-only matcher silently attached to the anterior fibroid; that is now refused, asserted below.)
+        "Anterior uterine wall intramural fibroid (FIGO 4) measuring 52 x 44 x 40 mm.",
+        "Impression: Enlarging anterior wall intramural fibroid.",
         "Recommendation: Gynaecology follow-up in 6 months.",
       ];
       const pdfBytes = await buildPdf(reportLines, { uncompressed: true });
@@ -387,6 +389,24 @@ describe("Sprint 4 Task 2 — Clinical Report Intelligence, OCR, LLM Grounding &
         uploadRes.reconciliationDiscrepancies[0].category,
         "reporting_inconsistency",
       );
+
+      // A posterior FIGO 4 fibroid must NOT be attached to the anterior FIGO 4 finding.
+      const postText = deidentify(
+        ["Pelvic MRI Report", "Study date: 2025-11-08", "Posterior uterine wall intramural fibroid (FIGO 4) measuring 52 x 44 x 40 mm."].join("\n"),
+      ).text;
+      const postRes = await executeUploadReport(sql, "clin-u", {
+        patientId,
+        studyId: "clin-u:meera-mr1",
+        newStudy: null,
+        fileName: "posterior.txt",
+        fileKind: "txt",
+        sha256: sha256(Buffer.from(postText)),
+        text: postText,
+        warnings: [],
+      });
+      assert.equal(postRes.reconciliationDiscrepancies.length >= 1, true);
+      assert.equal(postRes.reconciliationDiscrepancies[0].category, "report_vs_image");
+      assert.equal(postRes.reconciliationDiscrepancies[0].findingVersionId, null);
 
       // Retrieve original persisted report document and verify SHA-256 integrity
       const origDoc = await executeGetOriginalReportDocument(

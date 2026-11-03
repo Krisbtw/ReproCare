@@ -383,6 +383,59 @@ export const saveVolumeRegistration = createServerFn({ method: "POST" })
     return b.executeSaveVolumeRegistration(sql, context.userId, data);
   });
 
+/** Live, authenticated ReproTrace recomputation from stored records (never replays seeded proposals). */
+export const recomputeCorrespondence = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((patientId: string) => {
+    if (typeof patientId !== "string" || !patientId.trim()) throw new Error("Choose a record.");
+    return patientId;
+  })
+  .handler(async ({ context, data }) => {
+    const b = await import("./server.backend.ts");
+    const sql = await b.getSql();
+    return b.executeRecomputeReproTrace(sql, context.userId, data);
+  });
+
+/** Clinician decision on one extracted report observation: confirm a match, create provisional, or leave unlinked. */
+export const resolveReportObservation = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator(
+    (input: {
+      reportId: string;
+      observationIndex: number;
+      decision: "link_existing" | "create_provisional" | "leave_unlinked";
+      targetVersionId?: string | null;
+      note: string;
+    }) => {
+      if (!Number.isInteger(input.observationIndex) || input.observationIndex < 0) throw new Error("Observation is not valid.");
+      return { ...input, note: String(input.note ?? "").trim().slice(0, 600) };
+    },
+  )
+  .handler(async ({ context, data }) => {
+    const b = await import("./server.backend.ts");
+    const sql = await b.getSql();
+    return b.executeResolveReportObservation(sql, context.userId, data);
+  });
+
+/** Load the clearly-labelled synthetic ReproTrace demonstration patient (idempotent). */
+export const seedReproTraceDemo = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .handler(async ({ context }) => {
+    const b = await import("./server.backend.ts");
+    const sql = await b.getSql();
+    return b.executeSeedReproTraceDemo(sql, context.userId);
+  });
+
+/** Run the existing moment-based rigid registration on the two synthetic demo series and store the result. */
+export const registerReproTraceDemo = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((patientId: string) => patientId)
+  .handler(async ({ context, data }) => {
+    const b = await import("./server.backend.ts");
+    const sql = await b.getSql();
+    return b.executeRegisterReproTraceDemo(sql, context.userId, data);
+  });
+
 export const saveEndometriosisRecord = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .validator((input: { patientId: string; lesionSites: string[]; surgicalHistory: string; stagingRASRM?: string; imagingNote: string }) => input)

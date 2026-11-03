@@ -1,3 +1,4 @@
+import { DEMO_EXAMS, buildDemoSeriesFiles } from "@/lib/clinic/reprotrace-demo";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { loadDicomParser, type DataSetLike } from "@/lib/dicom/codec";
 import { loadSeries, type LoadedSeries } from "@/lib/dicom/series-loader";
@@ -249,7 +250,10 @@ export function VolumeLab({
   patientId,
   onRecord,
   recordFinding,
+  openDemo,
 }: {
+  /** Request to open a SYNTHETIC ReproTrace demo series at a stored source slice (from an evidence trail). */
+  openDemo?: { examKey: string; slice: number | null; nonce: number } | null;
   findings?: FindingChoice[];
   patientId?: string;
   onRecord?: (task: () => Promise<unknown>) => Promise<void>;
@@ -493,6 +497,19 @@ export function VolumeLab({
     await ingest(items, "upload");
     if (skippedLarge > 0) setError((prev) => prev ?? `${skippedLarge} file${skippedLarge === 1 ? " was" : "s were"} larger than ${MAX_FILE_BYTES / 1e6} MB and were not read.`);
   }
+
+  useEffect(() => {
+    if (!openDemo) return;
+    const exam = DEMO_EXAMS.find((e) => e.key === openDemo.examKey);
+    if (!exam) return;
+    void (async () => {
+      setStatus("Regenerating the synthetic demo series…");
+      await tick();
+      await ingest(buildDemoSeriesFiles(exam), "sample");
+      if (openDemo.slice != null) setCursor((c) => [c[0], c[1], openDemo.slice as number]);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openDemo?.nonce]);
 
   async function loadSample() {
     setStatus("Building the synthetic sample…");
@@ -752,9 +769,10 @@ export function VolumeLab({
     const record = makeRecord();
     if (!opened || !seg || !record || !recordFinding || !onRecord || !recFinding) return;
 
+    // Only a DICOM patient frame yields patient-space coordinates. Image-index millimetres are never stored as a centroid.
     const patientCentroidMm = (patientFrame && seg.measurement.centroidMm)
       ? imageMmToPatient(seg.measurement.centroidMm, patientFrame)
-      : (seg.measurement.centroidMm ?? null);
+      : null;
     const frame = patientFrame ? "dicom_lps" : "unavailable";
 
     const linked = versionFromLab({

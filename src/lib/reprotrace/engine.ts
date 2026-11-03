@@ -72,6 +72,8 @@ export type RegistrationQualityInfo = {
   fixedSeriesId: string | null;
   movingSeriesId: string | null;
   notes: string[];
+  /** How the transform was obtained, when recorded (e.g. "ncc_moments_3d", "externally_supplied"). */
+  method?: string | null;
 };
 
 export type RegistrationLookupEntry = {
@@ -89,6 +91,7 @@ export type RegistrationLookupEntry = {
   fixedSeriesId?: string | null;
   movingSeriesId?: string | null;
   notes?: string[];
+  method?: string | null;
 };
 
 export interface ClinicianCorrespondenceDecision {
@@ -124,11 +127,124 @@ export type Proposal = {
   reviewedByUserId?: string | null;
   reviewedAt?: string | null;
   registrationQuality?: RegistrationQualityInfo | null;
+  /** Other plausible counterparts when the match is ambiguous. Never auto-selected. */
+  alternatives?: string[];
+  /** Plain description of how (or whether) the two coordinate frames were aligned. */
+  registrationAvailability?: RegistrationAvailability;
 };
+
+export type RegistrationAvailabilityKind =
+  | "available_verified"
+  | "externally_supplied"
+  | "unavailable"
+  | "failed"
+  | "insufficient_quality"
+  | "not_required"
+  | "schematic_frame"
+  | "no_coordinates";
+
+export type RegistrationAvailability = {
+  kind: RegistrationAvailabilityKind;
+  label: string;
+  spatialComparisonValid: boolean;
+  explanation: string;
+};
+
+const EXTERNAL_REGISTRATION_METHODS = new Set([
+  "manual",
+  "external",
+  "externally_supplied",
+  "synthetic_ground_truth",
+]);
+
+/**
+ * Classifies the spatial basis of a comparison so the UI can say plainly whether the distance is meaningful.
+ * Pure: does not compute or claim any registration that was not supplied.
+ */
+export function describeRegistrationAvailability(
+  a: Pick<Snap, "frame" | "centroidMm" | "studyId" | "seriesId">,
+  b: Pick<Snap, "frame" | "centroidMm" | "studyId" | "seriesId">,
+  quality: RegistrationQualityInfo | null | undefined,
+  method?: string | null,
+): RegistrationAvailability {
+  if (!a.centroidMm || !b.centroidMm || a.frame === "unavailable" || b.frame === "unavailable") {
+    return {
+      kind: "no_coordinates",
+      label: "No spatial coordinates",
+      spatialComparisonValid: false,
+      explanation:
+        "At least one observation has no stored patient-space coordinate, so no spatial distance can be computed. Matching relies on anatomical labels and measurements only.",
+    };
+  }
+  if (a.frame === "schematic" || b.frame === "schematic") {
+    return {
+      kind: "schematic_frame",
+      label: "Schematic coordinates only",
+      spatialComparisonValid: false,
+      explanation:
+        "Coordinates are teaching-schematic placements, not positions measured in source images. The distance is illustrative and cannot establish correspondence.",
+    };
+  }
+  const sameSeries = a.studyId === b.studyId && (a.seriesId ?? null) === (b.seriesId ?? null);
+  if (sameSeries && !quality) {
+    return {
+      kind: "not_required",
+      label: "Same series — no registration needed",
+      spatialComparisonValid: true,
+      explanation: "Both observations are in the same image series and therefore the same coordinate frame.",
+    };
+  }
+  if (!quality || quality.status === "missing") {
+    return {
+      kind: "unavailable",
+      label: "Registration unavailable",
+      spatialComparisonValid: false,
+      explanation:
+        "The examinations are in different coordinate frames and no registration transform is stored. Unregistered patient-space coordinates are not treated as aligned.",
+    };
+  }
+  if (quality.status === "failed" || quality.status === "invalid_transform" || quality.status === "series_mismatch") {
+    return {
+      kind: "failed",
+      label: "Registration failed",
+      spatialComparisonValid: false,
+      explanation: `Registration could not be used (${quality.status.replaceAll("_", " ")}). ${quality.notes.join(" ")}`.trim(),
+    };
+  }
+  if (!quality.supported || quality.status === "insufficient_quality") {
+    return {
+      kind: "insufficient_quality",
+      label: "Registration quality insufficient",
+      spatialComparisonValid: false,
+      explanation: `A transform exists but its quality is below the configured threshold. ${quality.notes.join(" ")}`.trim(),
+    };
+  }
+  if (method && EXTERNAL_REGISTRATION_METHODS.has(method)) {
+    return {
+      kind: "externally_supplied",
+      label: "Registration supplied externally",
+      spatialComparisonValid: true,
+      explanation:
+        "The transform was entered or supplied from outside this application; ReproCare did not compute it. Distance is shown in the fixed study's frame after applying it.",
+    };
+  }
+  return {
+    kind: "available_verified",
+    label: quality.status === "verified" ? "Registration available (quality checks passed)" : "Registration available (unverified)",
+    spatialComparisonValid: true,
+    explanation: `Distance is measured after applying the stored rigid transform. ${quality.notes.join(" ")}`.trim(),
+  };
+}
 
 const DIST_SAME = REPROTRACE_PARAMS.DIST_SAME_MM;
 const DIST_FAR = REPROTRACE_PARAMS.DIST_FAR_MM;
 const PAIR_FLOOR = REPROTRACE_PARAMS.PAIR_FLOOR_SCORE;
+/** Competing candidates within this score margin make a pairing ambiguous (unvalidated heuristic). */
+export const AMBIGUITY_MARGIN = 0.1;
+/** Only candidates at or above this score are considered plausible rivals (unvalidated heuristic). */
+export const AMBIGUITY_MIN_SCORE = 0.6;
+/** Floor for anatomy-and-measurement-only comparison of observations without coordinates (unvalidated). */
+export const NON_SPATIAL_FLOOR = 0.45;
 
 export const MIN_REGISTRATION_NCC_VERIFIED = 0.5;
 export const MIN_REGISTRATION_NCC_UNVERIFIED = 0.5;
@@ -426,6 +542,7 @@ export function evaluateRegistrationEntry(
       fixedSeriesId,
       movingSeriesId,
       notes,
+      method: entry.method ?? null,
     },
     transform: validation.transform,
   };
@@ -543,6 +660,12 @@ function hasContradictoryLocation(labelA: string, labelB: string): boolean {
   return false;
 }
 
+function hasOpposingLaterality(a?: string | null, b?: string | null): boolean {
+  const x = (a ?? "").trim().toLowerCase();
+  const y = (b ?? "").trim().toLowerCase();
+  return (x === "left" && y === "right") || (x === "right" && y === "left");
+}
+
 function pairScore(
   a: Snap,
   b: Snap,
@@ -555,6 +678,9 @@ function pairScore(
 } | null {
   if (a.organ !== b.organ || a.structure !== b.structure) return null;
   if (hasContradictoryLocation(a.locationLabel, b.locationLabel)) {
+    return null;
+  }
+  if (hasOpposingLaterality(a.laterality, b.laterality)) {
     return null;
   }
 
@@ -578,7 +704,9 @@ function pairScore(
     else score -= 0.25;
   } else {
     score -= 0.2;
-    notes.push("at least one observation has no centroid");
+    notes.push(
+      "at least one observation has no centroid (no stored patient-space coordinate), so spatial distance was not computed",
+    );
   }
 
   const la = longestOf(a.axesMm, a.longestMm);
@@ -604,7 +732,12 @@ function pairScore(
   }
   if (a.modality !== b.modality) {
     score -= 0.08;
-    notes.push("modalities differ");
+    notes.push(
+      `modalities differ (${a.modality} vs ${b.modality}); sizes from different modalities are not treated as a before-and-after of one measurement`,
+    );
+  }
+  if (a.laterality && b.laterality && a.laterality === b.laterality) {
+    notes.push(`same laterality (${a.laterality})`);
   }
   if (a.quality !== "adequate" || b.quality !== "adequate") {
     score -= 0.12;
@@ -660,6 +793,8 @@ export function matchStudies(
     notes: string[];
     evalA: Snap;
     evalB: Snap;
+    rawA: Snap;
+    rawB: Snap;
     separationMm: number | null;
     regQuality: RegistrationQualityInfo | null;
     decision?: ClinicianCorrespondenceDecision;
@@ -718,6 +853,8 @@ export function matchStudies(
         notes,
         evalA,
         evalB,
+        rawA,
+        rawB,
         separationMm: scored.separationMm,
         regQuality: resolved?.quality ?? null,
         decision,
@@ -726,6 +863,24 @@ export function matchStudies(
   });
 
   candidates.sort((a, b) => b.score - a.score);
+
+  // Ambiguity: when several plausible counterparts score within a small margin of each other,
+  // the engine must not pick one. The greedy pairing below still emits one proposal for review,
+  // but it is downgraded to "uncertain" and lists the competing candidates.
+  const plausible = candidates.filter(
+    (c) =>
+      (c.category === "likely_same" || c.category === "uncertain") &&
+      c.score >= AMBIGUITY_MIN_SCORE &&
+      c.decision?.decision !== "accept",
+  );
+  const rivalsOf = (c: (typeof candidates)[number]) => {
+    const forNext = plausible.filter((x) => x.j === c.j && x.i !== c.i && x.score >= c.score - AMBIGUITY_MARGIN);
+    const forPrior = plausible.filter((x) => x.i === c.i && x.j !== c.j && x.score >= c.score - AMBIGUITY_MARGIN);
+    return { forNext, forPrior };
+  };
+  const contestedPrior = new Map<number, string>();
+  const contestedNext = new Map<number, string>();
+
   const usedPrior = new Set<number>();
   const usedNext = new Set<number>();
   const proposals: Proposal[] = [];
@@ -735,11 +890,25 @@ export function matchStudies(
     usedNext.add(c.j);
     const a = c.evalA;
     const b = c.evalB;
+    let alternatives: string[] = [];
+    if (c.decision?.decision !== "accept" && (c.category === "likely_same" || c.category === "uncertain")) {
+      const { forNext, forPrior } = rivalsOf(c);
+      if (forNext.length > 0 || forPrior.length > 0) {
+        alternatives = [...forNext.map((x) => x.rawA.id), ...forPrior.map((x) => x.rawB.id)];
+        c.category = "uncertain";
+        c.notes.push(
+          `Ambiguous: ${alternatives.length} other plausible candidate(s) (${alternatives.join(", ")}) scored within ${AMBIGUITY_MARGIN.toFixed(2)} of this pairing; ReproTrace does not choose between them and requires clinician review`,
+        );
+        for (const x of forNext) contestedPrior.set(x.i, b.id);
+        for (const x of forPrior) contestedNext.set(x.j, a.id);
+      }
+    }
     const regSupported = c.regQuality ? c.regQuality.supported : false;
     const isProvisional =
       c.decision?.decision === "accept"
         ? false
-        : a.frame !== "image_registered" ||
+        : alternatives.length > 0 ||
+          a.frame !== "image_registered" ||
           b.frame !== "image_registered" ||
           (c.regQuality ? !regSupported : true);
 
@@ -820,10 +989,36 @@ export function matchStudies(
           movingSeriesId: b.seriesId ?? null,
           notes: ["Unregistered coordinate frame; proposal remains provisional"],
         },
+      alternatives: alternatives.length > 0 ? alternatives : undefined,
+      registrationAvailability: describeRegistrationAvailability(
+        c.rawA,
+        c.rawB,
+        c.regQuality,
+        c.regQuality?.method ?? null,
+      ),
     });
   }
   prior.forEach((a, i) => {
     if (usedPrior.has(i)) return;
+    const contestedBy = contestedPrior.get(i);
+    if (contestedBy) {
+      proposals.push({
+        fromId: a.id,
+        toId: null,
+        fromStudyId: a.studyId,
+        toStudyId: next[0]?.studyId ?? null,
+        fromSeriesId: a.seriesId ?? null,
+        toSeriesId: next[0]?.seriesId ?? null,
+        category: "uncertain",
+        outcome: "uncertain_correspondence",
+        score: 0.4,
+        rationale: `Competes with another earlier observation for the same later observation (${contestedBy}). Left unpaired pending clinician review; it is not called resolved.`,
+        provisional: true,
+        attributionCategory: "insufficient_evidence",
+        alternatives: [contestedBy],
+      });
+      return;
+    }
     const small = (longestOf(a.axesMm, a.longestMm) ?? 99) < 20;
     const cat: MatchCategory = small ? "needs_review" : "possible_resolved";
     proposals.push({
@@ -845,6 +1040,25 @@ export function matchStudies(
   });
   next.forEach((b, j) => {
     if (usedNext.has(j)) return;
+    const contestedBy = contestedNext.get(j);
+    if (contestedBy) {
+      proposals.push({
+        fromId: null,
+        toId: b.id,
+        fromStudyId: prior[0]?.studyId ?? null,
+        toStudyId: b.studyId,
+        fromSeriesId: prior[0]?.seriesId ?? null,
+        toSeriesId: b.seriesId ?? null,
+        category: "uncertain",
+        outcome: "uncertain_correspondence",
+        score: 0.4,
+        rationale: `Competes with another later observation for the same earlier observation (${contestedBy}). Not called new until a clinician reviews it.`,
+        provisional: true,
+        attributionCategory: "insufficient_evidence",
+        alternatives: [contestedBy],
+      });
+      return;
+    }
     proposals.push({
       fromId: null,
       toId: b.id,
@@ -880,6 +1094,12 @@ export function matchChronology(
   options?: {
     clinicianDecisions?: ClinicianCorrespondenceDecision[];
     thresholds?: ReproTraceThresholds;
+    /**
+     * When true, observations without stored coordinates are not silently dropped: each is compared by
+     * anatomy and measurement against earlier observations and reported as needing review (or as a
+     * potential new observation). Default false keeps the original spatial-only behaviour.
+     */
+    includeNonSpatial?: boolean;
   },
 ): Proposal[] {
   let groups: StudyGroup[];
@@ -928,6 +1148,84 @@ export function matchChronology(
         options,
       ),
     );
+  }
+  if (options?.includeNonSpatial) {
+    out.push(
+      ...matchNonSpatial(groups, options?.thresholds ?? DEFAULT_REPROTRACE_THRESHOLDS, options?.clinicianDecisions ?? []),
+    );
+  }
+  return out;
+}
+
+/**
+ * Observations without coordinates (for example a single-plane ultrasound measurement) cannot be paired
+ * spatially. Rather than dropping them, compare each against earlier observations of the same structure by
+ * anatomy and measurement only, and always leave the outcome for clinician review.
+ */
+function matchNonSpatial(
+  groups: StudyGroup[],
+  thresholds: ReproTraceThresholds,
+  decisions: ClinicianCorrespondenceDecision[],
+): Proposal[] {
+  const rejected = new Set(
+    decisions.filter((d) => d.decision === "reject" && d.fromVersionId && d.toVersionId).map((d) => `${d.fromVersionId}->${d.toVersionId}`),
+  );
+  const dated = groups
+    .map((g, index) => ({ g, ms: parseExaminationDateMs(g.date), index }))
+    .filter((x): x is { g: StudyGroup; ms: number; index: number } => x.ms !== null)
+    .sort((a, b) => (a.ms !== b.ms ? a.ms - b.ms : a.index - b.index));
+  const out: Proposal[] = [];
+  for (let k = 1; k < dated.length; k += 1) {
+    const current = dated[k];
+    const nonSpatial = current.g.snaps.filter((s) => !s.centroidMm || s.frame === "unavailable");
+    if (nonSpatial.length === 0) continue;
+    const earlier = dated.slice(0, k).flatMap((d) => d.g.snaps);
+    for (const b of nonSpatial) {
+      const scored = earlier
+        .filter((a) => !rejected.has(`${a.id}->${b.id}`))
+        .map((a) => ({ a, r: pairScore(a, b, thresholds) }))
+        .filter((x): x is { a: Snap; r: NonNullable<ReturnType<typeof pairScore>> } => x.r !== null)
+        .sort((x, y) => y.r.score - x.r.score);
+      const top = scored[0];
+      // Without coordinates the spatial bonus is impossible, so use a lower floor; the result is always review-only.
+      if (!top || top.r.score < NON_SPATIAL_FLOOR) {
+        out.push({
+          fromId: null,
+          toId: b.id,
+          fromStudyId: dated[k - 1].g.studyId,
+          toStudyId: b.studyId,
+          fromSeriesId: null,
+          toSeriesId: b.seriesId ?? null,
+          category: "potentially_new",
+          outcome: "possible_new_finding",
+          score: 0.4,
+          rationale:
+            "Missing anatomical coordinates: this observation has no stored patient-space position, and no earlier observation of the same structure with a compatible label was found. A potential new observation, not a confirmed new lesion.",
+          provisional: true,
+          attributionCategory: "insufficient_evidence",
+          registrationAvailability: describeRegistrationAvailability(b, b, null),
+        });
+        continue;
+      }
+      const rivals = scored.slice(1).filter((x) => x.r.score >= top.r.score - AMBIGUITY_MARGIN);
+      out.push({
+        fromId: top.a.id,
+        toId: b.id,
+        fromStudyId: top.a.studyId,
+        toStudyId: b.studyId,
+        fromSeriesId: top.a.seriesId ?? null,
+        toSeriesId: b.seriesId ?? null,
+        category: "needs_review",
+        outcome: "uncertain_correspondence",
+        score: Number(top.r.score.toFixed(2)),
+        rationale: `Missing anatomical coordinates: compared on anatomical label and measurement only. ${top.r.notes.join(". ")}.${rivals.length ? ` ${rivals.length} other earlier observation(s) are similarly compatible (${rivals.map((x) => x.a.id).join(", ")}).` : ""}`,
+        provisional: true,
+        distanceMm: null,
+        attributionCategory: "insufficient_evidence",
+        alternatives: rivals.length ? rivals.map((x) => x.a.id) : undefined,
+        registrationAvailability: describeRegistrationAvailability(top.a, b, null),
+      });
+    }
   }
   return out;
 }

@@ -29,6 +29,7 @@ export const KNOWN_MIGRATION_FILES = [
   "0012_sprint4_collaboration_and_report_intelligence.sql",
   "0013_sprint5_dicom_and_condition_workflows.sql",
   "0014_supabase_storage_integration.sql",
+  "0015_reprotrace_evidence_and_correspondence_runs.sql",
 ];
 
 /**

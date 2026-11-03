@@ -449,6 +449,10 @@ export type Workspace = {
     created_at: string;
   }>;
   engineVersion: string;
+  /** ReproTrace computation runs (live recomputes), newest first. */
+  reprotraceRuns?: Array<Record<string, string | number | boolean | null>>;
+  /** Clinician decisions on extracted report observations (append-only). */
+  observationLinks?: Array<Record<string, string | number | boolean | null>>;
 };
 
 export type ExportPayload = {

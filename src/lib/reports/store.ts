@@ -19,6 +19,12 @@ import {
 import type { PdfPageExtraction } from "./ocr.ts";
 import { storeImagingArtifact } from "../imaging/storage.ts";
 import {
+  assessReportObservation,
+  observationFromExtraction,
+  type CandidateAssessment,
+  type CandidateVersion,
+} from "./candidates.ts";
+import {
   evaluateClinicianConsentForPatient,
   type ClinicianPermission,
 } from "../clinic/collaboration.ts";
@@ -75,7 +81,7 @@ function isIsoDate(s: string): boolean {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 
-async function resolvePatientAccessForReportAction(
+export async function resolvePatientAccessForReportAction(
   sql: Sql,
   userId: string,
   patientId: string,
@@ -252,21 +258,55 @@ export async function reconcileReportWithImaging(
 
   for (const fm of fibroidMeas) {
     if (fm.negated) continue;
-    // Match candidate imaging version by FIGO or location substring
-    const matchingVersion = activeVersions.find((v) => {
+    // Deterministic candidate scoring. Never attaches to a single incompatible candidate, never picks among ambiguous ones.
+    const obsIndex = extraction.findings.findIndex(
+      (f) => fm.start >= f.sentence.start && fm.end <= f.sentence.end,
+    );
+    const obs = obsIndex >= 0 ? observationFromExtraction(extraction, obsIndex) : null;
+    const candidates: CandidateVersion[] = activeVersions.map((v) => {
       const f = findings.find((x) => x.id === v.finding_id);
-      if (f && f.structure !== "fibroid") return false;
-      if (fm.figo && v.figo && fm.figo === v.figo) return true;
-      if (
-        fm.location &&
-        v.location_label &&
-        (v.location_label.toLowerCase().includes(fm.location.toLowerCase()) ||
-          fm.location.toLowerCase().includes(v.location_label.toLowerCase()))
-      ) {
-        return true;
-      }
-      return activeVersions.length === 1;
+      return {
+        versionId: v.id,
+        findingId: v.finding_id,
+        findingCode: f?.code ?? v.finding_id,
+        patientId,
+        structure: f?.structure ?? "",
+        organ: f?.organ ?? "",
+        locationLabel: v.location_label ?? "",
+        figo: v.figo,
+        studyId: v.study_id,
+        studyDate: null,
+        modality: null,
+        versionNo: Number(v.version_no),
+        longestMm: v.longest_mm != null ? Number(v.longest_mm) : null,
+        axesMm: v.axes_mm ? (JSON.parse(v.axes_mm) as [number, number, number]) : null,
+        volumeMm3: null,
+      };
     });
+    const assessment = obs
+      ? assessReportObservation(obs, candidates, { patientId, reportStudyId: studyId, reportDate: null })
+      : null;
+    const single =
+      assessment && (assessment.state === "strong" || assessment.state === "possible")
+        ? assessment.candidates[0]
+        : null;
+    const matchingVersion = single ? activeVersions.find((v) => v.id === single.versionId) : undefined;
+
+    if (assessment?.state === "ambiguous") {
+      discrepancies.push({
+        id: crypto.randomUUID(),
+        category: "report_vs_image",
+        summary: `Report fibroid (${fm.text}) matches several recorded findings; clinician must choose`,
+        detail: `${assessment.explanation} Nothing was linked automatically.`,
+        reportId,
+        findingVersionId: null,
+        reportedLongestMm: fm.longestMm,
+        imagingLongestMm: null,
+        reportedVolumeMm3: fm.volumeMm3,
+        imagingVolumeMm3: null,
+      });
+      continue;
+    }
 
     if (!matchingVersion) {
       const disc: ReportImagingDiscrepancy = {

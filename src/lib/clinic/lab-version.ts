@@ -228,7 +228,14 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
       }
     }
   } else if (data.studyId) {
-    const studyCheck = await sql<{ id: string; study_date: string }>`select id, study_date from studies where id = ${data.studyId} and user_id = ${recordOwnerUserId}`;
+    // Accept either the stored study id or the DICOM StudyInstanceUID of a study on this patient.
+    let studyCheck = await sql<{ id: string; study_date: string }>`select id, study_date from studies where id = ${data.studyId} and user_id = ${recordOwnerUserId}`;
+    if (!studyCheck.length && patientId) {
+      studyCheck = await sql<{ id: string; study_date: string }>`
+        select id, study_date from studies
+        where study_instance_uid = ${data.studyId} and patient_id = ${patientId} and user_id = ${recordOwnerUserId}
+      `.catch(() => []);
+    }
     if (!studyCheck.length) {
       throw new Error(`Invalid studyId: Study ${data.studyId} does not exist or does not belong to user.`);
     }
@@ -237,7 +244,14 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
   }
 
   if (targetSeriesId) {
-    const seriesCheck = await sql<{ id: string }>`select id from series where id = ${targetSeriesId} and user_id = ${recordOwnerUserId}`;
+    let seriesCheck = await sql<{ id: string }>`select id from series where id = ${targetSeriesId} and user_id = ${recordOwnerUserId}`;
+    if (!seriesCheck.length) {
+      // DICOM SeriesInstanceUID of a series in the target study.
+      seriesCheck = await sql<{ id: string }>`
+        select id from series where series_instance_uid = ${targetSeriesId} and study_id = ${targetStudyId} and user_id = ${recordOwnerUserId}
+      `.catch(() => []);
+      if (seriesCheck.length) targetSeriesId = seriesCheck[0].id;
+    }
     if (!seriesCheck.length) {
       throw new Error(`Invalid seriesId: Series ${targetSeriesId} does not exist or does not belong to user.`);
     }
@@ -378,7 +392,28 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
     `.catch(() => null);
   }
 
+  const sopRows = targetSeriesId
+    ? await sql<{ sop_instance_uid: string | null }>`
+        select sop_instance_uid from imaging_objects
+        where series_id = ${targetSeriesId} and kind = 'dicom' and instance_number = ${data.sliceIndex + 1}
+        limit 1
+      `.catch(() => [])
+    : [];
+  const anchored = Boolean(data.centroidMm && targetSeriesId && (frameVal === "dicom_lps" || frameVal === "image_registered"));
   try {
+    await sql`insert into evidence_links (
+      id, user_id, finding_version_id, kind, study_id, series_id, report_id, quote, slice_index, note,
+      imaging_object_id, mask_object_id, sop_instance_uid, coordinate_frame, centroid_lps_json, link_status,
+      review_status, source_artifact_ref
+    ) values (
+      ${crypto.randomUUID()}, ${recordOwnerUserId}, ${versionId}, ${"lab_segmentation"},
+      ${targetStudyId}, ${targetSeriesId}, ${null}, ${null}, ${data.sliceIndex}, ${data.evidenceNote},
+      ${primaryDicomObjectId}, ${storedMaskObjectId}, ${sopRows[0]?.sop_instance_uid ?? null}, ${frameVal},
+      ${anchored ? centroidJson : null}, ${anchored ? "spatially_anchored" : "anatomically_linked"},
+      ${data.clinicianConfirmed ? "clinician_verified" : "needs_review"}, ${storedMaskObjectId ?? primaryDicomObjectId}
+    )`;
+  } catch {
+   try {
     await sql`insert into evidence_links (
       id, user_id, finding_version_id, kind, study_id, series_id, report_id, quote, slice_index, note,
       imaging_object_id, mask_object_id
@@ -390,6 +425,7 @@ export async function insertLabVersion(sql: Sql, userId: string, data: LabVersio
   } catch {
     await sql`insert into evidence_links (id, user_id, finding_version_id, kind, study_id, series_id, report_id, quote, slice_index, note)
       values (${crypto.randomUUID()}, ${recordOwnerUserId}, ${versionId}, ${"lab_segmentation"}, ${targetStudyId}, ${targetSeriesId}, ${null}, ${null}, ${data.sliceIndex}, ${data.evidenceNote})`;
+  }
   }
 
   return versionId;

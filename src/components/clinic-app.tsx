@@ -13,6 +13,10 @@ import {
   correctVersion,
   saveLabMeasurement,
   decideCorrespondence,
+  recomputeCorrespondence,
+  resolveReportObservation,
+  seedReproTraceDemo,
+  registerReproTraceDemo,
   exportRecord,
   getWorkspace,
   resetWorkspace,
@@ -48,6 +52,7 @@ import { ResearchView } from "./research-view";
 import { SliceBoard } from "./slice-board";
 import { VolumeLab } from "./volume-lab";
 import { ReportsView } from "./reports-view";
+import { EvidenceTrail, TraceReview, demoExamKeyForStudy } from "./reprotrace-panels";
 import { LongitudinalTrends, type FindingHistoryPoint, type DiscrepancyItem } from "./longitudinal-trends";
 import type { SliceMark } from "@/lib/imaging/phantom";
 import type { Workspace } from "@/lib/clinic/types";
@@ -169,6 +174,11 @@ export function ClinicApp() {
   const [view, setView] = useState<View>("board");
   const [busy, setBusy] = useState(false);
   const [labOpened, setLabOpened] = useState(false);
+  // Must be declared before any early return (React hook order).
+  const [lens, setLens] = useState<string | null>(null);
+  const [reportFocus, setReportFocus] = useState<{ reportId: string; start: number | null; end: number | null; nonce: number } | null>(null);
+  const [labDemo, setLabDemo] = useState<{ examKey: string; slice: number | null; nonce: number } | null>(null);
+  const [studioVersion, setStudioVersion] = useState<{ id: string; nonce: number } | null>(null);
 
   async function reload() {
     setData(await getWorkspace());
@@ -226,7 +236,6 @@ export function ClinicApp() {
 
   const patients = data.patients as Bag[];
   const role = data.profile?.role ?? "clinician";
-  const [lens, setLens] = useState<string | null>(null);
   const activeLens = lens ?? role;
   const isVerifiedClinician =
     (role === "admin" && (activeLens === "admin" || activeLens === "clinician")) ||
@@ -309,7 +318,26 @@ export function ClinicApp() {
         <div className="space-y-6 p-4 lg:p-6">
           {view === "board" && <Board data={data} patients={visiblePatients} onOpen={(id) => { void run(() => setActivePatient({ data: id })); setView("studio"); }} />}
           {view === "people" && patient && <People data={data} patients={visiblePatients} active={patient} busy={busy} run={run} onOpen={(id) => { void run(() => setActivePatient({ data: id })); setView("studio"); }} />}
-          {view === "studio" && patient && <Studio data={data} patient={patient} clinician={isVerifiedClinician} busy={busy} run={run} />}
+          {view === "studio" && patient && (
+            <Studio
+              data={data}
+              patient={patient}
+              clinician={isVerifiedClinician}
+              busy={busy}
+              run={run}
+              focusVersion={studioVersion}
+              onOpenReport={(reportId, start, end) => {
+                setReportFocus({ reportId, start, end, nonce: Date.now() });
+                setView("reports");
+              }}
+              onOpenSlice={(studyId, slice) => {
+                const examKey = demoExamKeyForStudy(studyId);
+                if (!examKey) return;
+                setLabDemo({ examKey, slice, nonce: Date.now() });
+                setView("lab");
+              }}
+            />
+          )}
           {labOpened && isVerifiedClinician && (
             <div hidden={view !== "lab"}>
               <VolumeLab
@@ -323,6 +351,7 @@ export function ClinicApp() {
                 }
                 onRecord={(task) => run(task)}
                 recordFinding={(input) => saveLabMeasurement({ data: input })}
+                openDemo={labDemo}
               />
             </div>
           )}
@@ -342,10 +371,28 @@ export function ClinicApp() {
               onDecideFinding={(input) => decideReportFinding({ data: input })}
               onInterpretReport={(reportId) => interpretClinicalReport({ data: { reportId } })}
               onAskReportQuestion={(reportId, question) => askClinicalReportQuestion({ data: { reportId, question } })}
+              onResolveObservation={(input) => resolveReportObservation({ data: input })}
+              focus={reportFocus}
             />
           )}
           {view === "course" && patient && <CourseView data={data} patient={patient} onStudio={() => setView("studio")} />}
-          {view === "trace" && patient && <Trace data={data} patient={patient} clinician={isVerifiedClinician} busy={busy} run={run} />}
+          {view === "trace" && patient && (
+            <TraceReview
+              data={data}
+              patient={patient}
+              clinician={isVerifiedClinician}
+              busy={busy}
+              run={run}
+              recompute={(patientId) => recomputeCorrespondence({ data: patientId })}
+              decide={(input) => decideCorrespondence({ data: input })}
+              seedDemo={() => seedReproTraceDemo()}
+              registerDemo={(patientId) => registerReproTraceDemo({ data: patientId })}
+              onOpenVersion={(id) => {
+                setStudioVersion({ id, nonce: Date.now() });
+                setView("studio");
+              }}
+            />
+          )}
           {view === "context" && patient && <Context data={data} patient={patient} clinician={isVerifiedClinician} busy={busy} run={run} />}
           {view === "methods" && <ResearchView />}
           {view === "admin" && <Admin data={data} role={role} busy={busy} run={run} patientId={s(patient, "id")} />}
@@ -674,12 +721,18 @@ function Studio({
   clinician,
   busy,
   run,
+  focusVersion,
+  onOpenReport,
+  onOpenSlice,
 }: {
   data: Workspace;
   patient: Bag;
   clinician: boolean;
   busy: boolean;
   run: (task: () => Promise<unknown>) => Promise<void>;
+  focusVersion?: { id: string; nonce: number } | null;
+  onOpenReport?: (reportId: string, start: number | null, end: number | null) => void;
+  onOpenSlice?: (studyId: string, slice: number | null) => void;
 }) {
   const studies = (data.studies as Bag[]).filter((st) => s(st, "patient_id") === s(patient, "id"));
   const [studyId, setStudyId] = useState(s(studies[studies.length - 1], "id"));
@@ -719,6 +772,15 @@ function Studio({
     // patient switch only
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s(patient, "id")]);
+
+  useEffect(() => {
+    if (!focusVersion) return;
+    const v = versions.find((x) => s(x, "id") === focusVersion.id);
+    if (!v) return;
+    setStudyId(s(v, "study_id"));
+    setSelected(focusVersion.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusVersion?.nonce]);
 
   const surface = useMemo(() => {
     const ax = triple(chosen, "axes_mm");
@@ -1073,6 +1135,14 @@ function Studio({
           </article>
         </div>
       )}
+      {chosen && (
+        <EvidenceTrail
+          data={data}
+          versionId={s(chosen, "id")}
+          onOpenReport={(reportId, start, end) => onOpenReport?.(reportId, start, end)}
+          onOpenSlice={(studyId, slice) => onOpenSlice?.(studyId, slice)}
+        />
+      )}
       {chosen && trendHistory.length > 0 && (
         <div className="mt-6">
           <LongitudinalTrends
@@ -1119,7 +1189,8 @@ function DicomCard({ read, onSave }: { read: DicomRead; onSave: () => void }) {
   );
 }
 
-function Trace({
+/** Legacy ReproTrace list, superseded by TraceReview (kept for reference). */
+export function LegacyTrace({
   data,
   patient,
   clinician,

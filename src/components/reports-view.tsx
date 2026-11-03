@@ -1,4 +1,5 @@
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { ObservationLinker, demoReportFile, isDemoPatient } from "./reprotrace-panels";
 import { extractReportText, kindFromName, type TextResult } from "@/lib/reports/text";
 import { deidentify, type DeidResult } from "@/lib/reports/deidentify";
 import {
@@ -341,7 +342,17 @@ export function ReportsView({
   onDecideFinding,
   onInterpretReport,
   onAskReportQuestion,
+  onResolveObservation,
+  focus,
 }: {
+  onResolveObservation?: (input: {
+    reportId: string;
+    observationIndex: number;
+    decision: "link_existing" | "create_provisional" | "leave_unlinked";
+    targetVersionId?: string | null;
+    note: string;
+  }) => Promise<unknown>;
+  focus?: { reportId: string; start: number | null; end: number | null; nonce: number } | null;
   data: Workspace;
   patient: Bag;
   clinician: boolean;
@@ -506,6 +517,18 @@ export function ReportsView({
     });
   }
 
+  // Navigation from an evidence trail: open the report and highlight the exact quote.
+  useEffect(() => {
+    if (!focus) return;
+    setOpenReport(focus.reportId);
+    if (focus.start != null && focus.end != null) {
+      const r = reports.find((x) => s(x, "id") === focus.reportId);
+      const body = s(r, "body");
+      setPicked({ start: focus.start, end: focus.end, text: body.slice(focus.start, focus.end) });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus?.nonce]);
+
   const shownReport = reports.find((r) => s(r, "id") === openReport) ?? null;
   const shownExtractionRow = shownReport ? extractionByReport.get(s(shownReport, "id")) : undefined;
   const shownExtraction: Extraction | null = useMemo(() => {
@@ -614,6 +637,25 @@ export function ReportsView({
             <Btn tone="ghost" disabled={reading || busy} onClick={() => void sample("txt")}>
               Sample · TXT
             </Btn>
+            {isDemoPatient(pid) &&
+              (["rtdemo-ex1", "rtdemo-ex2"] as const).map((key, i) => (
+                <Btn
+                  key={key}
+                  tone="ghost"
+                  disabled={reading || busy}
+                  testId={`demo-report-${i + 1}`}
+                  onClick={() => {
+                    const file = demoReportFile(key);
+                    const study = studies.find((st) => s(st, "id").endsWith(`:${key}`));
+                    if (!file) return;
+                    void readFile(file.name, file.bytes).then(() => {
+                      if (study) setTarget(s(study, "id"));
+                    });
+                  }}
+                >
+                  {`Synthetic demo report · exam ${i + 1}`}
+                </Btn>
+              ))}
           </div>
           <p className="text-xs text-muted">
             Limits: 15 MB. Native PDF pages are read directly; scanned PDF pages invoke page-aware
@@ -823,7 +865,14 @@ export function ReportsView({
             </div>
             <Highlighted
               text={s(shownReport, "body")}
-              spans={spansOf(shownExtraction)}
+              spans={[
+                ...spansOf(shownExtraction).filter(
+                  (sp) => !picked || sp.end <= picked.start || sp.start >= picked.end,
+                ),
+                ...(picked && !spansOf(shownExtraction).some((sp) => sp.start === picked.start && sp.end === picked.end)
+                  ? [{ ...picked, tone: "rec" as const }]
+                  : []),
+              ]}
               picked={picked}
               onPick={clinician ? setPicked : undefined}
             />
@@ -846,6 +895,27 @@ export function ReportsView({
                     }
                   : undefined
               }
+            />
+
+            <ObservationLinker
+              data={data}
+              patientId={pid}
+              report={shownReport}
+              extraction={shownExtraction}
+              clinician={clinician && Boolean(onResolveObservation)}
+              busy={busy}
+              onFocusQuote={(start, end) =>
+                setPicked({ start, end, text: s(shownReport, "body").slice(start, end) })
+              }
+              onResolve={(input) => {
+                if (!onResolveObservation) return;
+                void run(async () => {
+                  await onResolveObservation(input);
+                  setSaved(
+                    `Observation #${input.observationIndex + 1}: ${input.decision.replaceAll("_", " ")}. Decision, candidate state and source offsets were recorded; findings were not merged.`,
+                  );
+                });
+              }}
             />
 
             {/* Clinician Review & Field Correction Panel (Task 2F) */}

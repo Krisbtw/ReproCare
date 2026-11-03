@@ -16,7 +16,40 @@ export type SyntheticSeriesSpec = {
   noise?: number;
   /** Series description written to the header. */
   description?: string;
+  /** Optional LPS ImagePositionPatient of the first slice (default [0, 0, 0]). */
+  originMm?: [number, number, number];
+  /** Optional lesion centre in image millimetres (default: volume centre). */
+  lesionCenterMm?: [number, number, number];
+  /** Optional background organ ellipsoid (image millimetres), drawn below the lesion. */
+  organ?: { centerMm: [number, number, number]; radiiMm: [number, number, number]; intensity: number };
+  studyUid?: string;
+  sopRoot?: string;
+  studyDate?: string;
 };
+
+/** Real (calibrated) intensity of one voxel of a synthetic series. Shared by the writer and in-memory volume builders. */
+export function syntheticIntensity(spec: SyntheticSeriesSpec, x: number, y: number, k: number): number {
+  const c = spec.lesionCenterMm ?? [
+    ((spec.cols - 1) / 2) * spec.pixelSpacingMm[1],
+    ((spec.rows - 1) / 2) * spec.pixelSpacingMm[0],
+    ((spec.slices - 1) / 2) * spec.sliceStepMm,
+  ];
+  const px = x * spec.pixelSpacingMm[1];
+  const py = y * spec.pixelSpacingMm[0];
+  const pz = k * spec.sliceStepMm;
+  const dx = (px - c[0]) / spec.lesionRadiiMm[0];
+  const dy = (py - c[1]) / spec.lesionRadiiMm[1];
+  const dz = (pz - c[2]) / spec.lesionRadiiMm[2];
+  if (dx * dx + dy * dy + dz * dz <= 1) return 400;
+  if (spec.organ) {
+    const o = spec.organ;
+    const ox = (px - o.centerMm[0]) / o.radiiMm[0];
+    const oy = (py - o.centerMm[1]) / o.radiiMm[1];
+    const oz = (pz - o.centerMm[2]) / o.radiiMm[2];
+    if (ox * ox + oy * oy + oz * oz <= 1) return o.intensity;
+  }
+  return 100;
+}
 
 /** Small seeded generator so a noisy synthetic series is identical on every run. */
 function mulberry32(seed: number): () => number {
@@ -48,17 +81,14 @@ export function buildSyntheticSeries(spec: SyntheticSeriesSpec): { name: string;
     const dv = new DataView(px.buffer);
     for (let y = 0; y < spec.rows; y += 1) {
       for (let x = 0; x < spec.cols; x += 1) {
-        const dx = (x * spec.pixelSpacingMm[1] - cx) / spec.lesionRadiiMm[0];
-        const dy = (y * spec.pixelSpacingMm[0] - cy) / spec.lesionRadiiMm[1];
-        const dz = (k * spec.sliceStepMm - cz) / spec.lesionRadiiMm[2];
-        const inside = dx * dx + dy * dy + dz * dz <= 1;
+        void cx; void cy; void cz;
         // Stored value = (real intensity - intercept) / slope, so real intensity is 400 inside and 100 outside.
-        const real = (inside ? 400 : 100) + (noise > 0 ? (rand() * 2 - 1) * noise : 0);
+        const real = syntheticIntensity(spec, x, y, k) + (noise > 0 ? (rand() * 2 - 1) * noise : 0);
         dv.setUint16((y * spec.cols + x) * 2, Math.max(0, Math.round((real - intercept) / slope)), true);
       }
     }
     const sopClass = "1.2.840.10008.5.1.4.1.1.4";
-    const sopInstance = `${ROOT}.${1000 + k}`;
+    const sopInstance = `${spec.sopRoot ?? ROOT}.${1000 + k}`;
     const metaBody = concat([
       element(0x0002, 0x0001, "OB", Uint8Array.from([0, 1])),
       element(0x0002, 0x0002, "UI", sopClass),
@@ -69,6 +99,7 @@ export function buildSyntheticSeries(spec: SyntheticSeriesSpec): { name: string;
     const preamble = new Uint8Array(132);
     preamble.set(new TextEncoder().encode("DICM"), 128);
     const z = k * spec.sliceStepMm;
+    const o = spec.originMm ?? [0, 0, 0];
     out.push({
       name: `synthetic-slice-${String(k + 1).padStart(3, "0")}.dcm`,
       bytes: concat([
@@ -77,16 +108,16 @@ export function buildSyntheticSeries(spec: SyntheticSeriesSpec): { name: string;
         metaBody,
         element(0x0008, 0x0016, "UI", sopClass),
         element(0x0008, 0x0018, "UI", sopInstance),
-        element(0x0008, 0x0020, "DA", "20251102"),
+        element(0x0008, 0x0020, "DA", spec.studyDate ?? "20251102"),
         element(0x0008, 0x0060, "CS", "MR"),
         element(0x0008, 0x103e, "LO", spec.description ?? "Synthetic sagittal T2 series"),
         element(0x0010, 0x0010, "PN", "SYNTHETIC^SERIES"),
         element(0x0010, 0x0020, "LO", "SERIES-ONLY"),
         element(0x0018, 0x0050, "DS", String(spec.sliceStepMm)),
-        element(0x0020, 0x000d, "UI", `${ROOT}.100`),
+        element(0x0020, 0x000d, "UI", spec.studyUid ?? `${ROOT}.100`),
         element(0x0020, 0x000e, "UI", seriesUid),
         element(0x0020, 0x0013, "IS", String(k + 1)),
-        element(0x0020, 0x0032, "DS", `0\\0\\${z}`),
+        element(0x0020, 0x0032, "DS", `${o[0]}\\${o[1]}\\${o[2] + z}`),
         element(0x0020, 0x0037, "DS", "1\\0\\0\\0\\1\\0"),
         element(0x0028, 0x0002, "US", u16(1)),
         element(0x0028, 0x0004, "CS", "MONOCHROME2"),
