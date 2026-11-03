@@ -195,14 +195,29 @@ const trustedOrigins = (request?: Request): string[] => {
 const defaultSupabaseDatabaseUrl =
   "postgresql://postgres.mfbqdesghtvalkywzsdb:vJihFnkCtLkADB20@aws-0-eu-west-1.pooler.supabase.com:5432/postgres";
 
-const rawDatabaseUrl =
+function normalizeSupabaseDatabaseUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  let n = url.trim();
+  if (n.includes("db.mfbqdesghtvalkywzsdb.supabase.co")) {
+    n = n.replace("db.mfbqdesghtvalkywzsdb.supabase.co", "aws-0-eu-west-1.pooler.supabase.com");
+    if (n.includes("://postgres:")) {
+      n = n.replace("://postgres:", "://postgres.mfbqdesghtvalkywzsdb:");
+    }
+  } else if (n.includes("aws-0-ap-south-1.pooler.supabase.com")) {
+    n = n.replace("aws-0-ap-south-1.pooler.supabase.com", "aws-0-eu-west-1.pooler.supabase.com");
+  }
+  return n;
+}
+
+const rawDatabaseUrl = normalizeSupabaseDatabaseUrl(
   env("DATABASE_URL") ||
   env("POSTGRES_URL") ||
   env("SUPABASE_DATABASE_URL") ||
   env("POSTGRES_PRISMA_URL") ||
   env("POSTGRES_URL_NON_POOLING") ||
   env("SUPABASE_POSTGRES_URL") ||
-  env("SUPABASE_DB_URL");
+  env("SUPABASE_DB_URL")
+);
 
 const databaseUrl = rawDatabaseUrl || (isProductionDatabaseRuntime() ? defaultSupabaseDatabaseUrl : undefined);
 

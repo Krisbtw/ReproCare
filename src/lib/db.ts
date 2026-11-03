@@ -255,7 +255,21 @@ export function resolveDatabaseConfig(
 const defaultSupabaseDatabaseUrl =
   "postgresql://postgres.mfbqdesghtvalkywzsdb:vJihFnkCtLkADB20@aws-0-eu-west-1.pooler.supabase.com:5432/postgres";
 
-const rawDatabaseUrl =
+function normalizeSupabaseDatabaseUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  let n = url.trim();
+  if (n.includes("db.mfbqdesghtvalkywzsdb.supabase.co")) {
+    n = n.replace("db.mfbqdesghtvalkywzsdb.supabase.co", "aws-0-eu-west-1.pooler.supabase.com");
+    if (n.includes("://postgres:")) {
+      n = n.replace("://postgres:", "://postgres.mfbqdesghtvalkywzsdb:");
+    }
+  } else if (n.includes("aws-0-ap-south-1.pooler.supabase.com")) {
+    n = n.replace("aws-0-ap-south-1.pooler.supabase.com", "aws-0-eu-west-1.pooler.supabase.com");
+  }
+  return n;
+}
+
+const rawDatabaseUrl = normalizeSupabaseDatabaseUrl(
   typeof process !== "undefined"
     ? process.env.DATABASE_URL ||
       process.env.POSTGRES_URL ||
@@ -264,7 +278,8 @@ const rawDatabaseUrl =
       process.env.POSTGRES_URL_NON_POOLING ||
       process.env.SUPABASE_POSTGRES_URL ||
       process.env.SUPABASE_DB_URL
-    : undefined;
+    : undefined
+);
 const databaseUrl =
   (rawDatabaseUrl && rawDatabaseUrl.trim() ? rawDatabaseUrl.trim() : undefined) ||
   (isProductionDatabaseRuntime() ? defaultSupabaseDatabaseUrl : undefined);
