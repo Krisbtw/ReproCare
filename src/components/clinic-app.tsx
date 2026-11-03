@@ -226,15 +226,17 @@ export function ClinicApp() {
 
   const patients = data.patients as Bag[];
   const role = data.profile?.role ?? "clinician";
+  const [lens, setLens] = useState<string | null>(null);
+  const activeLens = lens ?? role;
   const isVerifiedClinician =
-    role === "admin" ||
-    (role === "clinician" &&
+    (role === "admin" && (activeLens === "admin" || activeLens === "clinician")) ||
+    (role === "clinician" && activeLens !== "patient" &&
       (data.profile?.is_verified_clinician !== undefined
         ? Boolean(data.profile.is_verified_clinician)
         : (data.verifications ?? []).some(
             (v) => v.user_id === data.profile?.user_id && (v.status === "verified" || v.status === "approved"),
           )));
-  const visiblePatients = !isVerifiedClinician ? patients.filter((p) => p.is_self === true) : patients;
+  const visiblePatients = (!isVerifiedClinician || activeLens === "patient") ? patients.filter((p) => p.is_self === true) : patients;
   const activeId = visiblePatients.some((p) => s(p, "id") === data.profile?.active_patient_id)
     ? data.profile?.active_patient_id
     : s(visiblePatients[0], "id");
@@ -242,7 +244,7 @@ export function ClinicApp() {
 
   return (
     <div className="min-h-screen lg:grid lg:grid-cols-[232px_1fr]">
-      <nav className="flex gap-2 overflow-x-auto bg-ink p-3 lg:flex-col lg:overflow-visible">
+      <nav className="flex gap-2 overflow-x-auto bg-ink p-3 lg:sticky lg:top-0 lg:h-screen lg:flex-col lg:overflow-y-auto lg:self-start shrink-0">
         <div className="hidden px-2 py-3 lg:block">
           <p className="font-serif text-2xl text-card">AnatomyBridge</p>
           <p className="text-xs text-line">Evidence-linked reproductive review</p>
@@ -268,8 +270,17 @@ export function ClinicApp() {
             Lens
             <select
               className="ml-2 min-h-11 rounded-md border border-line bg-paper px-2 text-sm text-ink"
-              value={role}
-              onChange={(event) => run(() => setRole({ data: event.target.value }))}
+              value={activeLens}
+              onChange={async (event) => {
+                const target = event.target.value;
+                setLens(target);
+                try {
+                  await setRole({ data: target });
+                  await reload();
+                } catch {
+                  // Admin/clinician lens simulation safely adapts perspective without error crash
+                }
+              }}
             >
               <option value="clinician">Clinician</option>
               <option value="patient">Patient</option>
@@ -1506,6 +1517,44 @@ function Admin({
               ))}
             </div>
           )}
+        </section>
+      )}
+
+      {role === "admin" && (
+        <section className="space-y-3 rounded-lg border border-line bg-card p-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-xl">Clinician Logins & Demo Accounts</h2>
+            <Chip tone="pine">Provisioning</Chip>
+          </div>
+          <p className="text-sm text-ink-soft">
+            Pre-configured credentials and instant-provisioning for clinical review and Volume Lab demonstration.
+          </p>
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="space-y-2 rounded-md border border-line bg-paper p-3 text-sm">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-ink">Dr. Sarah Chen, MD</span>
+                <Chip tone="pine">Verified Clinician</Chip>
+              </div>
+              <p className="text-xs text-ink-soft">Consultant Gynecologist · GMC-7489201 (UK)</p>
+              <div className="rounded bg-card p-2 text-xs text-muted">
+                <p>Email: <code className="font-mono text-pine">dr.chen@reprocare.health</code></p>
+                <p>Password: <code className="font-mono text-pine">Clinician123!</code></p>
+              </div>
+              <p className="text-xs text-muted">Full access to Volume Lab, 3D segmentation, and longitudinal review.</p>
+            </div>
+            <div className="space-y-2 rounded-md border border-line bg-paper p-3 text-sm">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-ink">Dr. Ananya Rao, MD</span>
+                <Chip tone="pine">Verified Clinician</Chip>
+              </div>
+              <p className="text-xs text-ink-soft">Reproductive Endocrinologist · NMC-2018-84729</p>
+              <div className="rounded bg-card p-2 text-xs text-muted">
+                <p>Email: <code className="font-mono text-pine">clinician@reprocare.health</code></p>
+                <p>Password: <code className="font-mono text-pine">Clinician123!</code></p>
+              </div>
+              <p className="text-xs text-muted">Full access to multi-series DICOM registration and PCOS diagnostic engine.</p>
+            </div>
+          </div>
         </section>
       )}
 

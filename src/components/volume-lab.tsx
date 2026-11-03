@@ -544,8 +544,44 @@ export function VolumeLab({
   const segWindow = params.mode === "auto" ? autoWin : manualWin;
   const manualProblem = params.mode === "manual" && (!manualWin || manualWin.lower >= manualWin.upper) ? "Enter a lower value that is below the upper value." : null;
 
-  async function runSegmentation() {
-    if (!volume || !seed) return;
+  function findLesionCenterSeed(): Vec3 {
+    if (!volume) return [0, 0, 0];
+    const [dx, dy, dz] = volume.dims;
+    let maxVal = -Infinity;
+    let bestVoxel: Vec3 = [Math.floor(dx / 2), Math.floor(dy / 2), Math.floor(dz / 2)];
+
+    const xMin = Math.floor(dx * 0.2);
+    const xMax = Math.floor(dx * 0.8);
+    const yMin = Math.floor(dy * 0.2);
+    const yMax = Math.floor(dy * 0.8);
+    const zMin = Math.floor(dz * 0.2);
+    const zMax = Math.floor(dz * 0.8);
+
+    for (let z = zMin; z < zMax; z++) {
+      for (let y = yMin; y < yMax; y++) {
+        for (let x = xMin; x < xMax; x++) {
+          const val = voxelValue(volume, [x, y, z]);
+          if (val !== null && val > maxVal) {
+            maxVal = val;
+            bestVoxel = [x, y, z];
+          }
+        }
+      }
+    }
+    return bestVoxel;
+  }
+
+  async function autoPlaceSeedAndSegment() {
+    if (!volume) return;
+    const bestSeed = findLesionCenterSeed();
+    setSeed(bestSeed);
+    setCursor(bestSeed);
+    await runSegmentation(bestSeed);
+  }
+
+  async function runSegmentation(targetSeed?: Vec3) {
+    const activeSeed = targetSeed ?? seed;
+    if (!volume || !activeSeed) return;
     if (manualProblem) {
       setError(manualProblem);
       return;
@@ -555,7 +591,7 @@ export function VolumeLab({
     await tick();
     try {
       const result = segmentFromSeed(volume, {
-        seed,
+        seed: activeSeed,
         seedRadiusVoxels: params.radius,
         kSigma: params.k,
         closeIterations: params.close,
@@ -568,7 +604,8 @@ export function VolumeLab({
         await tick();
         mesh = meshFromMask(result.mask, { blurIterations: 1, taubinIterations: params.smooth });
       }
-      setSeg({ result, measurement, mesh, seed, seedValue, smooth: params.smooth, at: new Date() });
+      const val = voxelValue(volume, activeSeed);
+      setSeg({ result, measurement, mesh, seed: activeSeed, seedValue: val, smooth: params.smooth, at: new Date() });
       setRecDone(null);
       setShowSteps(false);
     } catch (e) {
@@ -1183,6 +1220,26 @@ export function VolumeLab({
                 </label>
               </div>
               <p className="text-xs text-muted">Brightness and contrast change only what you see. They never change the segmentation.</p>
+              <div className="mt-3 flex flex-wrap items-center gap-2 rounded-md border border-line bg-paper p-3">
+                {seed ? (
+                  <>
+                    <Btn tone="pine" onClick={() => void runSegmentation()} disabled={busy}>
+                      ▶ Run Segmentation & Build 3D Surface
+                    </Btn>
+                    <Btn tone="ghost" onClick={() => void autoPlaceSeedAndSegment()} disabled={busy}>
+                      🎯 Re-detect Lesion Center
+                    </Btn>
+                    <span className="text-xs text-muted">Seed voxel: ({seed.join(", ")})</span>
+                  </>
+                ) : (
+                  <>
+                    <Btn tone="pine" onClick={() => void autoPlaceSeedAndSegment()} disabled={busy}>
+                      🎯 Auto-Place Seed at Lesion & Run Segmentation
+                    </Btn>
+                    <span className="text-xs text-muted">Or click directly inside the lesion on the slice above.</span>
+                  </>
+                )}
+              </div>
             </Card>
 
             <Card
@@ -1273,7 +1330,14 @@ export function VolumeLab({
               <p className="text-xs text-muted">
                 Drag to rotate, wheel to zoom, right-drag to pan. The box is the scanned volume ({extentMm.map((n) => n.toFixed(0)).join(" × ")} mm). The grey plane is the slice on the left; the clay dot is the seed. Axes: x columns red, y rows green, z slices blue. Coordinates are image millimetres, not patient coordinates.
               </p>
-              {!seg && <p className="rounded-md bg-paper px-3 py-2 text-sm text-ink-soft">No surface yet. Place a seed, then run the segmentation.</p>}
+              {!seg && (
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-md bg-paper p-3 text-sm text-ink-soft">
+                  <span>No surface yet. Place a seed on the slice, or auto-detect lesion:</span>
+                  <Btn tone="pine" onClick={() => void autoPlaceSeedAndSegment()} disabled={busy}>
+                    🎯 Auto-Place Seed & Segment
+                  </Btn>
+                </div>
+              )}
               {seg && !seg.mesh && <p className="rounded-md bg-clay-soft px-3 py-2 text-sm text-clay">No surface was built because the result was not accepted or was empty.</p>}
             </Card>
           </div>

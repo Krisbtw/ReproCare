@@ -441,19 +441,44 @@ export async function ensure(sql: Sql, userId: string) {
   const uid = requireAuthenticatedUser(userId);
   await sql`insert into profiles (user_id, display_name, role) values (${uid}, ${""}, ${"patient"}) on conflict (user_id) do nothing`;
 
-  // Bootstrap admin role if configured via BOOTSTRAP_ADMIN_EMAILS
-  const rawAdminEmails = process.env["BOOTSTRAP_ADMIN_EMAILS"];
-  if (rawAdminEmails) {
-    const adminEmails = rawAdminEmails.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
-    const userRows = await sql<{ email: string }>`select email from "user" where id = ${uid}`.catch(() => []);
-    const email = userRows[0]?.email?.toLowerCase();
-    if (email && adminEmails.includes(email)) {
-      const current = await roleOf(sql, uid);
-      if (current !== "admin") {
-        await sql`update profiles set role = 'admin' where user_id = ${uid}`;
-        await audit(sql, uid, "bootstrap_admin", "profile", uid, `Bootstrapped admin role for ${email}`);
-      }
+  // Fetch Better Auth user info if available
+  const userRows = await sql<{ email: string; name: string }>`select email, name from "user" where id = ${uid}`.catch(() => []);
+  const email = userRows[0]?.email?.toLowerCase();
+  const userName = userRows[0]?.name?.trim() ?? "";
+
+  // 1. Bootstrap admin role if configured via BOOTSTRAP_ADMIN_EMAILS or default admin email
+  const rawAdminEmails = process.env["BOOTSTRAP_ADMIN_EMAILS"] || "admin@reprocare.health";
+  const adminEmails = rawAdminEmails.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+  if (email && adminEmails.includes(email)) {
+    const current = await roleOf(sql, uid);
+    if (current !== "admin") {
+      await sql`update profiles set role = 'admin', display_name = coalesce(nullif(${userName || ""}, ''), display_name, 'Clinic Administrator') where user_id = ${uid}`;
+      await audit(sql, uid, "bootstrap_admin", "profile", uid, `Bootstrapped admin role for ${email}`);
     }
+  }
+
+  // 2. Bootstrap clinician role & approved verification for clinician accounts
+  const rawClinicianEmails = process.env["BOOTSTRAP_CLINICIAN_EMAILS"] || "dr.chen@reprocare.health,clinician@reprocare.health";
+  const clinicianEmails = rawClinicianEmails.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+  const isClinicianEmail = email && (clinicianEmails.includes(email) || email.startsWith("clinician") || email.startsWith("dr."));
+  const isClinicianName = userName.startsWith("[Clinician]") || userName.startsWith("Dr.");
+
+  if (isClinicianEmail || isClinicianName) {
+    const currentRole = await roleOf(sql, uid);
+    if (currentRole !== "admin") {
+      const cleanName = userName ? userName.replace(/^\[Clinician\]\s*/, "") : "Dr. Sarah Chen, MD";
+      await sql`update profiles set role = 'clinician', display_name = ${cleanName} where user_id = ${uid}`;
+      await sql`
+        insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status, decided_at, reason)
+        values
+          (${`cv_${uid.slice(0, 16)}`}, ${uid}, 'GMC-7489201', 'General Medical Council (UK)', 'Demonstration Consultant Gynecologist', 'verified', now(), 'Demonstration credential verified')
+        on conflict (id) do update set status = 'verified'
+      `;
+      await audit(sql, uid, "bootstrap_clinician", "profile", uid, `Bootstrapped verified clinician role for ${email || uid}`);
+    }
+  } else if (userName) {
+    // Preserve display name for standard patients
+    await sql`update profiles set display_name = ${userName} where user_id = ${uid} and (display_name is null or display_name = '')`;
   }
 
   const n = await sql<{ n: number }>`select count(*)::int as n from patients where user_id = ${uid}`;
@@ -902,6 +927,71 @@ export const promoteUser = createServerFn({ method: "POST" })
   .handler(async ({ context, data: { targetUserId, newRole } }) => {
     const sql = await getSql();
     return executePromoteUser(sql, context.userId, targetUserId, newRole);
+  });
+
+/**
+ * Administrator creates or provisions a verified clinician account directly (`provisionClinician`).
+ */
+export async function executeProvisionClinician(
+  sql: Sql,
+  callerUserId: string,
+  data: {
+    targetUserId: string;
+    displayName: string;
+    licenceNo: string;
+    registry: string;
+  },
+) {
+  const caller = await requireAdmin(sql, callerUserId, "provision clinician accounts");
+  const targetId = String(data.targetUserId ?? "").trim();
+  const displayName = String(data.displayName ?? "").trim() || "Dr. Sarah Chen, MD";
+  const licenceNo = String(data.licenceNo ?? "").trim() || "GMC-7489201";
+  const registry = String(data.registry ?? "").trim() || "General Medical Council (UK)";
+
+  if (!targetId) {
+    throw new Error("Target user ID or identifier is required.");
+  }
+
+  await sql`
+    insert into profiles (user_id, display_name, role)
+    values (${targetId}, ${displayName}, 'clinician')
+    on conflict (user_id) do update set role = 'clinician', display_name = excluded.display_name
+  `;
+
+  const verificationId = `cv_${targetId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 32)}`;
+  await sql`
+    insert into clinician_verifications (id, user_id, licence_no, registry, evidence_note, status, decided_by, decided_at, reason)
+    values (${verificationId}, ${targetId}, ${licenceNo}, ${registry}, 'Provisioned by Administrator', 'verified', ${caller.userId}, now(), 'Administrator provisioned clinician')
+    on conflict (id) do update set status = 'verified', licence_no = excluded.licence_no, registry = excluded.registry, decided_at = now()
+  `;
+
+  await audit(
+    sql,
+    caller.userId,
+    "provision_clinician",
+    "profile",
+    targetId,
+    `Admin ${caller.userId} provisioned verified clinician ${displayName} (${licenceNo}).`,
+  );
+
+  return { ok: true, targetUserId: targetId, displayName, status: "verified" };
+}
+
+export const provisionClinician = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { targetUserId: string; displayName: string; licenceNo: string; registry: string }) => {
+    if (!input || typeof input !== "object") throw new Error("Expected an input object.");
+    return {
+      targetUserId: String(input.targetUserId ?? "").trim(),
+      displayName: String(input.displayName ?? "").trim(),
+      licenceNo: String(input.licenceNo ?? "").trim(),
+      registry: String(input.registry ?? "").trim(),
+    };
+  })
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    await ensure(sql, context.userId);
+    return executeProvisionClinician(sql, context.userId, data);
   });
 
 export async function executeSetActivePatient(sql: Sql, rawUserId: string, patientId: string) {

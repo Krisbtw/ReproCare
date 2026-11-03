@@ -70,6 +70,24 @@ export const promoteUser = createServerFn({ method: "POST" })
     return b.executePromoteUser(sql, context.userId, targetUserId, newRole);
   });
 
+export const provisionClinician = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { targetUserId: string; displayName: string; licenceNo: string; registry: string }) => {
+    if (!input || typeof input !== "object") throw new Error("Expected an input object.");
+    return {
+      targetUserId: String(input.targetUserId ?? "").trim(),
+      displayName: String(input.displayName ?? "").trim(),
+      licenceNo: String(input.licenceNo ?? "").trim(),
+      registry: String(input.registry ?? "").trim(),
+    };
+  })
+  .handler(async ({ context, data }) => {
+    const b = await import("./server.backend.ts");
+    const sql = await b.getSql();
+    await b.ensure(sql, context.userId);
+    return b.executeProvisionClinician(sql, context.userId, data);
+  });
+
 export const setActivePatient = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .validator((patientId: string) => patientId)
