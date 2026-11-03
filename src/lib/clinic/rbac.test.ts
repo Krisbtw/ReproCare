@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import type { Sql } from "../db.ts";
 import { insertLabVersion } from "./lab-version.ts";
-import { executeExplainPlain } from "./plain.ts";
+import { executeExplainPlain } from "./server.backend.ts";
 import { requireClinicianOrAdmin as requireProxyClinicianOrAdmin } from "../imaging/proxy.server.ts";
 import { updateMenarcheYear } from "./menarche.ts";
 import { ingestReport, linkReportQuote } from "../reports/store.ts";
@@ -44,7 +44,7 @@ import {
   executeGetOvarianCystRecords,
   executeSavePcosAssessment,
   executeGetPcosAssessments,
-} from "./server.ts";
+} from "./server.backend.ts";
 
 const MIGRATION_FILES = [
   new URL("../../../migrations/0002_anatomybridge.sql", import.meta.url),

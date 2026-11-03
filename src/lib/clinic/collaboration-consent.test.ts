@@ -38,7 +38,7 @@ import {
   requirePatientRecordAccess,
   DEFAULT_CLINICIAN_PERMISSIONS,
   ALL_CLINICIAN_PERMISSIONS,
-} from "./server.ts";
+} from "./server.backend.ts";
 
 const MIGRATION_FILES = [
   "migrations/0002_anatomybridge.sql",

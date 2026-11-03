@@ -39,7 +39,7 @@ import {
 import {
   ALL_CLINICIAN_PERMISSIONS,
   DEFAULT_CLINICIAN_PERMISSIONS,
-} from "@/lib/clinic/collaboration";
+} from "@/lib/clinic/types";
 import { explainPlain } from "@/lib/clinic/plain";
 import { checkMenarcheYear, cycleBand, outsideBand, pcosContext } from "@/lib/clinic/pcos-context";
 import { AnatomyStage, type AnatomyItem } from "./anatomy-stage";

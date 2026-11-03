@@ -6,16 +6,6 @@
  */
 import { createServerFn } from "@tanstack/react-start";
 import { authMiddleware } from "../../lib/auth/middleware.ts";
-import {
-  imagingServiceUrl,
-  resolveImagingServiceEndpoint,
-  requireClinicianOrAdmin,
-  serviceHeaders,
-  auditProxyAction,
-  proxyFetch,
-} from "../../lib/imaging/proxy.server.ts";
-
-
 
 const MAX_PROXY_FILES = 1000;
 const MAX_TOTAL_BYTES = 64 * 1024 * 1024; // 64MB
@@ -46,6 +36,9 @@ export type ProxyFile = { name: string; base64: string };
 export const proxyListModels = createServerFn({ method: "GET" })
   .middleware([authMiddleware])
   .handler(async ({ context }) => {
+    const { requireClinicianOrAdmin, proxyFetch, serviceHeaders } = await import(
+      "../../lib/imaging/proxy.server.ts"
+    );
     await requireClinicianOrAdmin(context.userId);
     let res: Response;
     try {
@@ -83,6 +76,9 @@ export const proxyInspectSeries = createServerFn({ method: "POST" })
     return input as ProxyFile[];
   })
   .handler(async ({ data: files, context }) => {
+    const { requireClinicianOrAdmin, proxyFetch, serviceHeaders, auditProxyAction } = await import(
+      "../../lib/imaging/proxy.server.ts"
+    );
     await requireClinicianOrAdmin(context.userId);
     const form = new FormData();
     for (let i = 0; i < files.length; i++) {
@@ -135,6 +131,9 @@ export const proxySegment = createServerFn({ method: "POST" })
     return { modelId: o["modelId"] as string, files: o["files"] as ProxyFile[] };
   })
   .handler(async ({ data: { modelId, files }, context }) => {
+    const { requireClinicianOrAdmin, proxyFetch, serviceHeaders, auditProxyAction } = await import(
+      "../../lib/imaging/proxy.server.ts"
+    );
     await requireClinicianOrAdmin(context.userId);
     const form = new FormData();
     for (let i = 0; i < files.length; i++) {
@@ -182,6 +181,9 @@ export const proxyCalculateTrends = createServerFn({ method: "POST" })
     };
   })
   .handler(async ({ data, context }) => {
+    const { requireClinicianOrAdmin, proxyFetch, serviceHeaders, auditProxyAction } = await import(
+      "../../lib/imaging/proxy.server.ts"
+    );
     await requireClinicianOrAdmin(context.userId);
     let res: Response;
     try {

@@ -18,7 +18,7 @@ import {
   executeSaveFibroidAssessment,
   executeSaveOvarianCystRecord,
   executeSavePcosAssessment,
-} from "./server.ts";
+} from "./server.backend.ts";
 
 const MIGRATION_FILES = [
   new URL("../../../migrations/0002_anatomybridge.sql", import.meta.url),
