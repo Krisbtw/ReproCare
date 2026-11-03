@@ -193,7 +193,7 @@ const trustedOrigins = (request?: Request): string[] => {
 };
 
 const defaultSupabaseDatabaseUrl =
-  "postgresql://postgres.mfbqdesghtvalkywzsdb:vJihFnkCtLkADB20@aws-0-eu-west-1.pooler.supabase.com:5432/postgres";
+  "postgresql://postgres.mfbqdesghtvalkywzsdb:vJihFnkCtLkADB20@aws-0-eu-west-1.pooler.supabase.com:6543/postgres?pgbouncer=true";
 
 function normalizeSupabaseDatabaseUrl(url: string | undefined): string | undefined {
   if (!url) return undefined;
@@ -202,6 +202,12 @@ function normalizeSupabaseDatabaseUrl(url: string | undefined): string | undefin
     n = n.replace("db.mfbqdesghtvalkywzsdb.supabase.co", "aws-0-eu-west-1.pooler.supabase.com");
     if (n.includes("://postgres:")) {
       n = n.replace("://postgres:", "://postgres.mfbqdesghtvalkywzsdb:");
+    }
+    if (n.includes(":5432")) {
+      n = n.replace(":5432", ":6543");
+      if (!n.includes("pgbouncer=")) {
+        n += (n.includes("?") ? "&" : "?") + "pgbouncer=true";
+      }
     }
   } else if (n.includes("aws-0-ap-south-1.pooler.supabase.com")) {
     n = n.replace("aws-0-ap-south-1.pooler.supabase.com", "aws-0-eu-west-1.pooler.supabase.com");

@@ -253,7 +253,7 @@ export function resolveDatabaseConfig(
 // "unset" — and in production/Vercel runtime createSql() fails closed rather than
 // silently running on the in-memory PGLite fallback.
 const defaultSupabaseDatabaseUrl =
-  "postgresql://postgres.mfbqdesghtvalkywzsdb:vJihFnkCtLkADB20@aws-0-eu-west-1.pooler.supabase.com:5432/postgres";
+  "postgresql://postgres.mfbqdesghtvalkywzsdb:vJihFnkCtLkADB20@aws-0-eu-west-1.pooler.supabase.com:6543/postgres?pgbouncer=true";
 
 function normalizeSupabaseDatabaseUrl(url: string | undefined): string | undefined {
   if (!url) return undefined;
@@ -262,6 +262,12 @@ function normalizeSupabaseDatabaseUrl(url: string | undefined): string | undefin
     n = n.replace("db.mfbqdesghtvalkywzsdb.supabase.co", "aws-0-eu-west-1.pooler.supabase.com");
     if (n.includes("://postgres:")) {
       n = n.replace("://postgres:", "://postgres.mfbqdesghtvalkywzsdb:");
+    }
+    if (n.includes(":5432")) {
+      n = n.replace(":5432", ":6543");
+      if (!n.includes("pgbouncer=")) {
+        n += (n.includes("?") ? "&" : "?") + "pgbouncer=true";
+      }
     }
   } else if (n.includes("aws-0-ap-south-1.pooler.supabase.com")) {
     n = n.replace("aws-0-ap-south-1.pooler.supabase.com", "aws-0-eu-west-1.pooler.supabase.com");
@@ -448,7 +454,7 @@ async function createSql(): Promise<Sql> {
   }
   const currentUrl = process.env.DATABASE_URL?.trim();
   if (currentUrl || isProductionDatabaseRuntime()) {
-    const cfg = resolveDatabaseConfig();
+    const cfg = resolveDatabaseConfig(process.env, databaseUrl);
     return createPostgresSql(cfg ?? undefined);
   }
   return createPgliteSql();
