@@ -100,7 +100,11 @@ export function loadSeries(
 
   const report = analyzeSeries(geoms);
   let volume: Volume | null = null;
-  if (report.volumeReady) volume = buildVolume(report, pixels);
+  if (report.volumeReady) {
+    volume = buildVolume(report, pixels);
+    // Explicitly free intermediate individual slice buffers immediately to reduce peak heap pressure
+    pixels.clear();
+  }
 
   let patientFrame: PatientFrame | null = null;
   if (report.volumeReady && report.orderedIds.length > 0 && report.pixelSpacingMm && report.sliceSpacingMm != null) {

@@ -11,12 +11,59 @@ function getNodeSpawnSync(): ((command: string, args?: readonly string[], option
 }
 
 /**
+ * Searches standard execution paths for the Tesseract binary across Linux, macOS, and Windows.
+ */
+export function resolveTesseractBinary(
+  spawnSync?: ((command: string, args?: readonly string[], options?: any) => any) | null,
+): string | null {
+  const runner = spawnSync ?? getNodeSpawnSync();
+  if (!runner) return null;
+
+  if (typeof process !== "undefined" && process.env?.TESSERACT_PATH) {
+    try {
+      const res = runner(process.env.TESSERACT_PATH, ["--version"], { timeout: 2000 });
+      if (res.status === 0) return process.env.TESSERACT_PATH;
+    } catch (_) {}
+  }
+
+  // Check default PATH binary
+  try {
+    const res = runner("tesseract", ["--version"], { timeout: 2000 });
+    if (res.status === 0) return "tesseract";
+  } catch (_) {}
+
+  const isWin = typeof process !== "undefined" && process.platform === "win32";
+  const candidatePaths: string[] = isWin
+    ? [
+        "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+        "C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe",
+        `${process.env?.LOCALAPPDATA || ""}\\Programs\\Tesseract-OCR\\tesseract.exe`,
+      ]
+    : [
+        "/usr/bin/tesseract",
+        "/usr/local/bin/tesseract",
+        "/opt/homebrew/bin/tesseract",
+      ];
+
+  for (const cand of candidatePaths) {
+    if (!cand) continue;
+    try {
+      const res = runner(cand, ["--version"], { timeout: 2000 });
+      if (res.status === 0) return cand;
+    } catch (_) {}
+  }
+
+  return null;
+}
+
+/**
  * Checks whether an image payload starts with a standard PNG, JPEG, TIFF, BMP, or Netpbm (P4/P5/P6) header
  * and runs local `/usr/bin/tesseract` OCR when available.
  * Never claims handwriting recognition (`handwritingSupported: false`).
  */
 export interface OcrRuntimeCapabilities {
   tesseractInstalled: boolean;
+  tesseractPath: string | null;
   tesseractVersion: string | null;
   englishTrainedDataAvailable: boolean;
   handwritingSupported: false;
@@ -32,48 +79,54 @@ export function checkOcrRuntimeCapabilities(): OcrRuntimeCapabilities {
   const spawnSync = getNodeSpawnSync();
 
   if (!spawnSync) {
-
     return {
-
       tesseractInstalled: false,
-
+      tesseractPath: null,
       tesseractVersion: null,
-
       englishTrainedDataAvailable: false,
-
       handwritingSupported: false,
-
       ocrAccuracyClaimed: false,
-
       warning:
-
         "tesseract-ocr is not available in the current browser/serverless environment; scanned PDF/image OCR will fall back to embedded PDF text and bitmap glyph layers.",
-
     };
+  }
 
+  const tessBin = resolveTesseractBinary(spawnSync);
+  if (!tessBin) {
+    return {
+      tesseractInstalled: false,
+      tesseractPath: null,
+      tesseractVersion: null,
+      englishTrainedDataAvailable: false,
+      handwritingSupported: false,
+      ocrAccuracyClaimed: false,
+      warning:
+        "tesseract-ocr binary is not installed in the runtime environment; scanned PDF/image OCR will fall back to embedded PDF text and bitmap glyph layers only.",
+    };
   }
 
   try {
-
-    const verRes = spawnSync("tesseract", ["--version"], { timeout: 3000 });
+    const verRes = spawnSync(tessBin, ["--version"], { timeout: 3000 });
     if (verRes.status !== 0) {
       return {
         tesseractInstalled: false,
+        tesseractPath: null,
         tesseractVersion: null,
         englishTrainedDataAvailable: false,
         handwritingSupported: false,
         ocrAccuracyClaimed: false,
         warning:
-          "tesseract-ocr binary is not installed in the runtime environment; scanned PDF/image OCR will fall back to embedded PDF text and bitmap glyph layers only.",
+          "tesseract-ocr binary execution failed; scanned PDF/image OCR will fall back to embedded PDF text and bitmap glyph layers only.",
       };
     }
     const verOut = (verRes.stdout?.toString("utf8") || verRes.stderr?.toString("utf8") || "").trim();
     const firstLine = verOut.split(/\r?\n/)[0]?.trim() || "tesseract";
-    const langRes = spawnSync("tesseract", ["--list-langs"], { timeout: 3000 });
+    const langRes = spawnSync(tessBin, ["--list-langs"], { timeout: 3000 });
     const langOut = (langRes.stdout?.toString("utf8") || langRes.stderr?.toString("utf8") || "").toLowerCase();
     const hasEng = langOut.includes("eng");
     return {
       tesseractInstalled: true,
+      tesseractPath: tessBin,
       tesseractVersion: firstLine,
       englishTrainedDataAvailable: hasEng,
       handwritingSupported: false,
@@ -85,6 +138,7 @@ export function checkOcrRuntimeCapabilities(): OcrRuntimeCapabilities {
   } catch {
     return {
       tesseractInstalled: false,
+      tesseractPath: null,
       tesseractVersion: null,
       englishTrainedDataAvailable: false,
       handwritingSupported: false,
@@ -95,15 +149,26 @@ export function checkOcrRuntimeCapabilities(): OcrRuntimeCapabilities {
   }
 }
 
-export function recognizeImageWithTesseract(imgBytes: Uint8Array): {
-  recognized: boolean;
+export interface OcrWordToken {
   text: string;
   confidence: number;
+  bbox?: { left: number; top: number; width: number; height: number };
+  lineNum?: number;
+}
+
+export interface ImageOcrResult {
+  recognized: boolean;
+  text: string;
+  confidence: number | null;
   engine: "tesseract_cli" | "unavailable";
   handwritingSupported: false;
-} {
+  words?: OcrWordToken[];
+  warning?: string | null;
+}
+
+export function recognizeImageWithTesseract(imgBytes: Uint8Array): ImageOcrResult {
   if (!imgBytes || imgBytes.byteLength < 16) {
-    return { recognized: false, text: "", confidence: 0, engine: "unavailable", handwritingSupported: false };
+    return { recognized: false, text: "", confidence: null, engine: "unavailable", handwritingSupported: false };
   }
   const isPng = imgBytes[0] === 0x89 && imgBytes[1] === 0x50 && imgBytes[2] === 0x4e && imgBytes[3] === 0x47;
   const isJpeg = imgBytes[0] === 0xff && imgBytes[1] === 0xd8;
@@ -114,45 +179,90 @@ export function recognizeImageWithTesseract(imgBytes: Uint8Array): {
   const isPnm = imgBytes[0] === 0x50 && (imgBytes[1] === 0x34 || imgBytes[1] === 0x35 || imgBytes[1] === 0x36);
 
   if (!isPng && !isJpeg && !isTiff && !isBmp && !isPnm) {
-    return { recognized: false, text: "", confidence: 0, engine: "unavailable", handwritingSupported: false };
+    return { recognized: false, text: "", confidence: null, engine: "unavailable", handwritingSupported: false };
   }
 
   const spawnSync = getNodeSpawnSync();
-
-
   if (!spawnSync) {
-
-
-    return { recognized: false, text: "", confidence: 0, engine: "unavailable", handwritingSupported: false };
-
-
+    return { recognized: false, text: "", confidence: null, engine: "unavailable", handwritingSupported: false };
   }
 
+  const tessBin = resolveTesseractBinary(spawnSync);
+  if (!tessBin) {
+    return { recognized: false, text: "", confidence: null, engine: "unavailable", handwritingSupported: false };
+  }
 
   try {
-
-
-    const res = spawnSync("tesseract", ["stdin", "stdout", "--psm", "6", "-l", "eng"], {
+    // Request TSV output from Tesseract to calculate actual word-level and document confidence
+    const res = spawnSync(tessBin, ["stdin", "stdout", "--psm", "6", "-l", "eng", "tsv"], {
       input: Buffer.from(imgBytes.buffer, imgBytes.byteOffset, imgBytes.byteLength),
       timeout: 8000,
       maxBuffer: 4 * 1024 * 1024,
     });
     if (res.status === 0 && res.stdout) {
-      const text = res.stdout.toString("utf8").replace(/\f/g, "").trim();
-      if (text.length >= 3) {
+      const rawTsv = res.stdout.toString("utf8");
+      const lines = rawTsv.split(/\r?\n/);
+      const words: OcrWordToken[] = [];
+      const linesMap = new Map<number, string[]>();
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const cols = line.split("\t");
+        // TSV level 5 corresponds to word tokens
+        if (cols.length >= 12 && cols[0].trim() === "5") {
+          const wText = cols.slice(11).join("\t").trim();
+          const confVal = parseFloat(cols[10]);
+          if (wText.length > 0) {
+            const left = parseInt(cols[6], 10) || 0;
+            const top = parseInt(cols[7], 10) || 0;
+            const width = parseInt(cols[8], 10) || 0;
+            const height = parseInt(cols[9], 10) || 0;
+            const lineNum = parseInt(cols[4], 10) || 1;
+
+            if (!linesMap.has(lineNum)) linesMap.set(lineNum, []);
+            linesMap.get(lineNum)!.push(wText);
+
+            // Tesseract reports -1 for tokens without measurable confidence
+            if (!isNaN(confVal) && confVal >= 0) {
+              words.push({
+                text: wText,
+                confidence: Math.min(1.0, Math.max(0.0, confVal / 100)),
+                bbox: { left, top, width, height },
+                lineNum,
+              });
+            }
+          }
+        }
+      }
+
+      const reconstructedText = Array.from(linesMap.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([, wordsInLine]) => wordsInLine.join(" "))
+        .join("\n")
+        .trim();
+
+      if (reconstructedText.length >= 3) {
+        const meanConfidence =
+          words.length > 0
+            ? Number((words.reduce((sum, w) => sum + w.confidence, 0) / words.length).toFixed(3))
+            : null;
+
         return {
           recognized: true,
-          text,
-          confidence: 0.88,
+          text: reconstructedText,
+          confidence: meanConfidence,
           engine: "tesseract_cli",
           handwritingSupported: false,
+          words,
+          warning:
+            "Optical recognition confidence is an optical measurement and does not imply clinical validity or verification.",
         };
       }
     }
   } catch {
-    // Fall through if tesseract binary is not installed in the runtime environment
+    // Fall through if tesseract execution fails
   }
-  return { recognized: false, text: "", confidence: 0, engine: "unavailable", handwritingSupported: false };
+  return { recognized: false, text: "", confidence: null, engine: "unavailable", handwritingSupported: false };
 }
 
 /**
@@ -238,8 +348,10 @@ export const defaultOcrPageRecognizer: OcrPageRecognizer = async ({
     const tessRes = recognizeImageWithTesseract(imgBytes);
     if (tessRes.recognized && tessRes.text) {
       recognizedParts.push(tessRes.text);
-      totalConfidence += tessRes.confidence;
-      count += 1;
+      if (tessRes.confidence != null) {
+        totalConfidence += tessRes.confidence;
+        count += 1;
+      }
     }
   }
 
@@ -250,8 +362,7 @@ export const defaultOcrPageRecognizer: OcrPageRecognizer = async ({
       const cleaned = m[1].replace(/\\n/g, "\n").replace(/\\([()\\])/g, "$1").trim();
       if (cleaned) {
         recognizedParts.push(cleaned);
-        totalConfidence += 0.85;
-        count += 1;
+        // Note: accessibility layer text carries unmeasured confidence
       }
     }
   }
@@ -267,8 +378,8 @@ export const defaultOcrPageRecognizer: OcrPageRecognizer = async ({
 
   return {
     text: recognizedParts.join("\n").trim(),
-    confidence: count > 0 ? Number((totalConfidence / count).toFixed(2)) : 0.85,
+    confidence: count > 0 ? Number((totalConfidence / count).toFixed(3)) : null,
     failed: false,
-    warning: `Page ${pageNumber}: Text was recovered via OCR from a scanned image stream (unvalidated OCR heuristic — requires clinician verification against the original report).`,
+    warning: `Page ${pageNumber}: Text was recovered via OCR from a scanned image stream (unvalidated OCR heuristic — requires clinician verification against the original report). Optical recognition confidence does not imply clinical validity.`,
   };
 };

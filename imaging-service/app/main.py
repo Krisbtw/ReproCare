@@ -332,10 +332,17 @@ def _download_storage_objects(refs: list[StorageObjectRef]) -> list[bytes]:
         raise HTTPException(503, detail={"error": "supabase_storage_not_configured", "reason": str(e)}) from e
 
     blobs: list[bytes] = []
+    total_bytes = 0
+    max_aggregate_bytes = storage_client.MAX_STORAGE_OBJECT_BYTES  # 512 MB
     for ref in refs:
         try:
             blob = client.download_object(ref.bucket, ref.object_path, expected_sha256=ref.sha256)
+            total_bytes += len(blob)
+            if total_bytes > max_aggregate_bytes:
+                raise HTTPException(413, detail={"error": "study_size_exceeded", "limit_bytes": max_aggregate_bytes})
             blobs.append(blob)
+        except HTTPException:
+            raise
         except FileNotFoundError as e:
             raise HTTPException(404, detail={"error": "storage_object_not_found", "reason": str(e)}) from e
         except ValueError as e:

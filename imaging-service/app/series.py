@@ -331,8 +331,13 @@ def stack_volume(raw_files: list[bytes]) -> tuple[np.ndarray, tuple[float, float
         codes = ", ".join(p.code for p in report.problems) or "not volume_ready"
         raise ValueError(f"Refusing to stack unsafe series ({codes})")
 
-    planes = []
-    for _, ds in ordered:
+    # Preallocate 3D volume to avoid 2x heap duplication from temporary planes list + np.stack
+    nz = len(ordered)
+    rows = int(report.rows or 0)
+    cols = int(report.columns or 0)
+    vol = np.empty((nz, rows, cols), dtype=np.float32)
+
+    for i, (_, ds) in enumerate(ordered):
         try:
             arr = ds.pixel_array.astype(np.float32)
         except Exception:
@@ -347,9 +352,7 @@ def stack_volume(raw_files: list[bytes]) -> tuple[np.ndarray, tuple[float, float
             arr = arr[int(f_idx)]
         slope = float(getattr(ds, "RescaleSlope", 1.0) or 1.0)
         intercept = float(getattr(ds, "RescaleIntercept", 0.0) or 0.0)
-        planes.append(arr * slope + intercept)
-
-    vol = np.stack(planes, axis=0)  # (Z, Y, X)
+        vol[i] = arr * slope + intercept
     spacing_zyx = (report.slice_spacing_mm, report.pixel_spacing_mm[0], report.pixel_spacing_mm[1])
     return vol, spacing_zyx, report
 

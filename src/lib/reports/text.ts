@@ -508,7 +508,7 @@ export async function decodePdf(
             imageCount: imageStreams.length,
             ocrAttempted: true,
             ocrFailed: false,
-            confidence: ocrRes.confidence ?? 0.85,
+            confidence: ocrRes.confidence ?? null,
             warnings: pageWarnings,
           });
         } else {
@@ -588,7 +588,7 @@ export async function decodePdf(
             imageCount: 1,
             ocrAttempted: true,
             ocrFailed: false,
-            confidence: ocrRes.confidence ?? 0.85,
+            confidence: ocrRes.confidence ?? null,
             warnings: pageWarnings,
           });
         } else {

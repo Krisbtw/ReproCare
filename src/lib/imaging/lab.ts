@@ -61,9 +61,32 @@ function pullPlane<T extends Float32Array | Uint8Array>(
   const [width, height] = planeSize(dims, axis);
   const i = clampIndex(dims, axis, index);
   const data = make(width * height);
+  const [nx, ny, nz] = dims;
+
+  if (axis === 2) {
+    // Fast path: contiguous axial slice memory transfer
+    const offset = i * nx * ny;
+    data.set(src.subarray(offset, offset + width * height));
+    return { width, height, data };
+  }
+
+  if (axis === 1) {
+    // Fast path: row-contiguous coronal reformatting
+    for (let row = 0; row < height; row += 1) {
+      const z = nz - 1 - row;
+      const baseOffset = (i + ny * z) * nx;
+      data.set(src.subarray(baseOffset, baseOffset + width), row * width);
+    }
+    return { width, height, data };
+  }
+
+  // Sagittal reformatting (axis 0): precomputed column slice stride
   for (let row = 0; row < height; row += 1) {
+    const z = nz - 1 - row;
+    const zOffset = i + nx * ny * z;
+    const destRowOffset = row * width;
     for (let col = 0; col < width; col += 1) {
-      data[row * width + col] = src[sourceIndex(dims, axis, i, col, row)];
+      data[destRowOffset + col] = src[zOffset + nx * col];
     }
   }
   return { width, height, data };
