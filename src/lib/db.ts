@@ -94,7 +94,7 @@ export function resolveDatabaseConfig(
     env.POSTGRES_URL_NON_POOLING ??
     env.SUPABASE_POSTGRES_URL ??
     env.SUPABASE_DB_URL ??
-    (isProductionDatabaseRuntime(env) ? defaultSupabaseDatabaseUrl : "")
+    ""
   ).trim();
   if (!raw) {
     if (isProductionDatabaseRuntime(env)) {
@@ -317,7 +317,7 @@ function toSql(run: Run): Sql {
 
 function createPostgresSql(overrideConfig?: ResolvedDatabaseConfig): Promise<Sql> {
   globalRef.__pgSqlPromise__ ??= (async () => {
-    const cfg = overrideConfig ?? resolveDatabaseConfig();
+    const cfg = overrideConfig ?? resolveDatabaseConfig(process.env, databaseUrl);
     if (!cfg) {
       throw new Error(
         "Database configuration error: DATABASE_URL is not configured.",
