@@ -801,6 +801,15 @@ export async function executeGetWorkspace(sql: Sql, rawUserId: string): Promise<
     observationLinks: (await sql<Record<string, string | number | boolean | null>>`
       select * from report_observation_links where patient_id = any(${[...allowedPatientIds]}) order by created_at
     `.catch(() => [])),
+    // Discrepancy reviews keyed by the compared pair, so review history survives recomputes (which
+    // deactivate old discrepancy rows and write new ones).
+    discrepancyReviewHistory: (await sql<Record<string, string | number | boolean | null>>`
+      select r.id, r.status, r.note, r.created_at, r.user_id as reviewer, d.id as discrepancy_id, d.patient_id,
+             d.left_ref, d.right_ref, d.category, d.summary, d.engine_version, d.active
+      from reviews r join discrepancies d on d.id = r.target_id
+      where r.target_type = 'discrepancy' and d.patient_id = any(${[...allowedPatientIds]})
+      order by r.created_at
+    `.catch(() => [])),
   };
 }
 
@@ -1964,7 +1973,9 @@ export async function recomputeReproTrace(
   }
 
   let discrepanciesCount = 0;
-  for (const p of proposals) {
+  // Attribution covers decided pairs too: a clinician decision on the correspondence does not make the
+  // measurement difference disappear, and recompute deactivates all previous discrepancy rows above.
+  for (const p of allProposals) {
     if (!p.fromId || !p.toId) continue;
     if (p.category !== "likely_same" && p.category !== "uncertain") continue;
     const v1 = versions.find((v) => v.id === p.fromId);
@@ -3689,3 +3700,4 @@ export async function executeExplainPlain(
   }
 }
 export { executeSeedReproTraceDemo, executeRegisterReproTraceDemo } from "./reprotrace-demo-backend.ts";
+export { executeLoadSourceSeries } from "./source-image.ts";

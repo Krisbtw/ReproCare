@@ -7,6 +7,16 @@ import type { Workspace } from "@/lib/clinic/types";
 import type { Extraction } from "@/lib/reports/extract";
 import { buildEvidenceChain } from "@/lib/reports/provenance";
 import {
+  CONTEXT_WINDOW_DAYS,
+  buildEvidenceSummary,
+  buildFindingHistory,
+  buildPatientTimeline,
+  type EvidenceSummary,
+  type HistoryEvent,
+  type TimelineSource,
+  type TimelineWorkspace,
+} from "@/lib/clinic/timeline";
+import {
   assessReportObservation,
   observationFromExtraction,
   type CandidateVersion,
@@ -50,6 +60,18 @@ const SPATIAL_LABEL: Record<string, { text: string; tone: "pine" | "clay" | "ink
   coordinates_without_image: { text: "Coordinates without a linked source series", tone: "clay" },
 };
 
+const REVIEW_LABEL: Record<string, string> = {
+  verified: "Attribution confirmed",
+  rejected: "Attribution rejected",
+  needs_more_information: "Further review",
+};
+const REVIEW_ACTION = { verified: "Confirm attribution", rejected: "Reject attribution", needs_more_information: "Mark for further review" } as const;
+const DEFAULT_REVIEW_NOTE = {
+  verified: "Clinician agrees with the proposed attribution.",
+  rejected: "Clinician disagrees with the proposed attribution.",
+  needs_more_information: "More evidence needed before attributing this difference.",
+} as const;
+
 /** Requirement 1: navigable source evidence for one finding version. */
 export function EvidenceTrail({
   data,
@@ -60,7 +82,7 @@ export function EvidenceTrail({
   data: Workspace;
   versionId: string;
   onOpenReport: (reportId: string, start: number | null, end: number | null) => void;
-  onOpenSlice: (studyId: string, slice: number | null) => void;
+  onOpenSlice: (versionId: string, studyId: string, seriesId: string, slice: number | null, demoExamKey: string | null) => void;
 }) {
   const chain = buildEvidenceChain(data as never, versionId);
   const spatial = SPATIAL_LABEL[chain.spatialStatus];
@@ -89,11 +111,18 @@ export function EvidenceTrail({
         <li>Patient-space position: {chain.imageAnchor?.centroidLps ? `[${chain.imageAnchor.centroidLps.map((x) => x.toFixed(1)).join(", ")}] mm (${chain.imageAnchor.coordinateFrame})` : "none stored"}</li>
         <li>Registrations touching this series: {chain.registrationIds.length || "none"}</li>
       </ol>
-      {chain.study && chain.imageAnchor && (demoKey ? (
-        <Btn tone="ghost" testId="open-source-slice" onClick={() => onOpenSlice(chain.study!.id, chain.imageAnchor!.sliceIndex)}>Open source slice in Volume lab</Btn>
+      {chain.study && chain.series ? (
+        <div className="space-y-1">
+          <Btn tone="ghost" testId="open-source-slice" onClick={() => onOpenSlice(versionId, chain.study!.id, chain.series!.id, chain.imageAnchor?.sliceIndex ?? null, demoKey)}>
+            Open original DICOM in Volume lab
+          </Btn>
+          <p className="text-xs text-muted">
+            Retrieves the stored instances through authorized, SHA-256-verified storage. If none were uploaded, the lab says so{demoKey ? " (synthetic demo: falls back to a labelled regeneration)" : ""}.
+          </p>
+        </div>
       ) : (
-        <p className="text-xs text-muted">Source pixels for this series are not stored here, so the slice cannot be reopened. The stored slice index is shown above.</p>
-      ))}
+        <p className="text-xs text-muted">No source series is recorded for this finding version, so there is no original image to open.</p>
+      )}
       {chain.gaps.length > 0 && (
         <ul className="list-disc pl-5 text-xs text-clay">{chain.gaps.map((g) => <li key={g}>{g}</li>)}</ul>
       )}
@@ -245,6 +274,7 @@ export function TraceReview({
   seedDemo,
   registerDemo,
   onOpenVersion,
+  review,
 }: {
   data: Workspace;
   patient: Bag;
@@ -256,6 +286,7 @@ export function TraceReview({
   seedDemo: () => Promise<unknown>;
   registerDemo: (patientId: string) => Promise<unknown>;
   onOpenVersion: (versionId: string) => void;
+  review?: (input: { targetType: "discrepancy"; targetId: string; status: "verified" | "rejected" | "needs_more_information"; note: string }) => Promise<unknown>;
 }) {
   const pid = s(patient, "id");
   const [note, setNote] = useState("");
@@ -365,15 +396,156 @@ export function TraceReview({
       </div>
       <h2 className="text-2xl">Discrepancies</h2>
       <div className="grid gap-3">
-        {discs.map((d) => (
-          <article key={s(d, "id")} className="rounded-lg border border-line bg-card p-4">
-            <Chip tone="clay">{s(d, "category").replaceAll("_", " ")}</Chip>
-            <h3 className="mt-2 text-lg">{s(d, "summary")}</h3>
-            <p className="text-sm text-ink-soft">{s(d, "detail")}</p>
-          </article>
-        ))}
+        {discs.map((d) => {
+          const pairHist = (data.discrepancyReviewHistory ?? []).filter((r) => s(r, "left_ref") === s(d, "left_ref") && s(r, "right_ref") === s(d, "right_ref") && s(d, "left_ref") !== "");
+          const history: Bag[] = pairHist.length ? (pairHist as Bag[]) : (data.reviews as unknown as Bag[]).filter((r) => s(r, "target_type") === "discrepancy" && s(r, "target_id") === s(d, "id"));
+          const latest = [...history].reverse().find((r) => !s(r, "discrepancy_id") || s(r, "discrepancy_id") === s(d, "id"));
+          return (
+            <article key={s(d, "id")} className="space-y-2 rounded-lg border border-line bg-card p-4" data-testid="discrepancy-card">
+              <div className="flex flex-wrap gap-2">
+                <Chip tone="clay">{s(d, "category").replaceAll("_", " ")}</Chip>
+                <Chip>Rule-based attribution · not clinically validated</Chip>
+                {latest && <Chip tone="pine">{REVIEW_LABEL[s(latest, "status")] ?? s(latest, "status")}</Chip>}
+              </div>
+              <h3 className="text-lg">{s(d, "summary")}</h3>
+              <p className="text-sm text-ink-soft">{s(d, "detail")}</p>
+              <p className="text-xs text-muted">
+                Compared: {s(d, "left_ref") || "source not recorded"} ↔ {s(d, "right_ref") || "source not recorded"} · {s(d, "engine_version")}
+              </p>
+              {history.length > 0 && (
+                <ul className="text-xs text-ink-soft">
+                  {history.map((r) => (
+                    <li key={s(r, "id")}>{s(r, "created_at").slice(0, 16)} · {REVIEW_LABEL[s(r, "status")] ?? s(r, "status")} · {s(r, "note")}{s(r, "discrepancy_id") && s(r, "discrepancy_id") !== s(d, "id") ? ` (on an earlier computation: ${s(r, "category").replaceAll("_", " ")})` : ""}</li>
+                  ))}
+                </ul>
+              )}
+              {clinician && review && (
+                <div className="flex flex-wrap gap-2">
+                  {(["verified", "rejected", "needs_more_information"] as const).map((st) => (
+                    <Btn
+                      key={st}
+                      tone={st === "verified" ? "pine" : "ghost"}
+                      disabled={busy}
+                      onClick={() => run(() => review({ targetType: "discrepancy", targetId: s(d, "id"), status: st, note: note.trim() || DEFAULT_REVIEW_NOTE[st] }))}
+                    >
+                      {REVIEW_ACTION[st]}
+                    </Btn>
+                  ))}
+                </div>
+              )}
+            </article>
+          );
+        })}
+        {clinician && discs.length > 0 && <p className="text-xs text-muted">The note field above is stored as the clinical annotation with each review. Original discrepancy rows are never edited.</p>}
         {discs.length === 0 && <p className="text-sm text-muted">No discrepancy rule fired for this record.</p>}
       </div>
     </div>
+  );
+}
+
+const SOURCE_LABEL: Record<TimelineSource, string> = {
+  imaging_examination: "Imaging",
+  report: "Report",
+  finding_record: "Finding record",
+  patient_reported: "Patient-reported",
+  laboratory_record: "Lab record",
+  clinician_decision: "Clinician decision",
+};
+
+/** Requirement 6: one dated list of examinations and context, each item with its source. */
+export function PatientTimeline({ data, patientId }: { data: Workspace; patientId: string }) {
+  const items = useMemo(() => buildPatientTimeline(data as unknown as TimelineWorkspace, patientId), [data, patientId]);
+  const studyDate = (id: string) => s((data.studies as Bag[]).find((st) => s(st, "id") === id), "study_date").slice(0, 10);
+  if (items.length === 0) return null;
+  return (
+    <article className="space-y-2 rounded-lg border border-line bg-card p-4" data-testid="patient-timeline">
+      <h2 className="text-xl">Examination timeline with context</h2>
+      <p className="text-xs text-muted">
+        Items are placed by date only. Being close in time does not mean one caused the other. Patient-reported items are not clinician-confirmed.
+      </p>
+      <ol className="space-y-1 text-sm">
+        {items.map((i) => (
+          <li key={`${i.kind}-${i.refId}`} className={`flex flex-wrap gap-x-2 ${i.kind === "examination" ? "font-medium text-ink" : "text-ink-soft"}`}>
+            <span className="tabular-nums text-muted">{i.date}</span>
+            <Chip tone={i.source === "patient_reported" ? "clay" : i.source === "clinician_decision" ? "pine" : "ink"}>{SOURCE_LABEL[i.source]}</Chip>
+            {i.synthetic && <Chip>Synthetic</Chip>}
+            <span>{i.title}</span>
+            {i.detail && <span className="text-xs text-muted">· {i.detail}</span>}
+            {i.nearExaminations.length > 0 && (
+              <span className="text-xs text-muted">· within {CONTEXT_WINDOW_DAYS} days of exam {i.nearExaminations.map(studyDate).join(", ")}</span>
+            )}
+          </li>
+        ))}
+      </ol>
+    </article>
+  );
+}
+
+const HISTORY_LABEL: Record<HistoryEvent["kind"], string> = {
+  version: "Version",
+  evidence: "Evidence",
+  review: "Verification",
+  correspondence: "Proposal",
+  decision: "Decision",
+  discrepancy: "Discrepancy",
+  discrepancy_review: "Discrepancy review",
+};
+
+/** Requirement 5: full history of one finding (and findings a clinician accepted as the same). */
+export function FindingHistory({ data, findingId }: { data: Workspace; findingId: string }) {
+  const h = useMemo(() => buildFindingHistory(data as unknown as TimelineWorkspace, findingId), [data, findingId]);
+  const code = (fid: string) => s((data.findings as Bag[]).find((f) => s(f, "id") === fid), "code");
+  return (
+    <article className="space-y-2 rounded-lg border border-line bg-card p-4" data-testid="finding-history">
+      <h2 className="text-xl">Finding history</h2>
+      {h.relatedFindingIds.length > 0 && (
+        <p className="text-xs text-muted">
+          Includes {h.relatedFindingIds.map(code).join(", ")}, linked by an accepted correspondence. Records stay separate; nothing was merged.
+        </p>
+      )}
+      <ol className="space-y-1 text-sm">
+        {h.events.map((e) => (
+          <li key={`${e.kind}-${e.refId}`} className="text-ink-soft">
+            <span className="tabular-nums text-muted">{e.at.slice(0, 16).replace("T", " ")}</span> · <span className="text-ink">{HISTORY_LABEL[e.kind]}</span>
+            {e.findingId !== findingId && e.versionId ? ` (${code(e.findingId)})` : ""} · {e.title}
+            {e.detail && <span className="block text-xs text-muted">{e.detail}</span>}
+          </li>
+        ))}
+        {h.events.length === 0 && <li className="text-muted">No recorded history.</li>}
+      </ol>
+    </article>
+  );
+}
+
+const SUMMARY_SECTIONS: { key: keyof Omit<EvidenceSummary, "versionId">; title: string; tone: "pine" | "clay" | "ink"; empty: string }[] = [
+  { key: "clinicianVerified", title: "Clinician-verified", tone: "pine", empty: "Nothing verified by a clinician yet." },
+  { key: "extractedStatements", title: "Extracted report statements (not yet verified)", tone: "ink", empty: "None." },
+  { key: "algorithmSuggestions", title: "Algorithm suggestions (rule-based or classical; not confirmed)", tone: "clay", empty: "None." },
+  { key: "unresolvedDiscrepancies", title: "Unresolved discrepancies", tone: "clay", empty: "None open." },
+  { key: "patientReported", title: "Patient-reported and recorded context near this exam", tone: "ink", empty: "None recorded within 30 days." },
+  { key: "missingEvidence", title: "Missing or unavailable evidence", tone: "clay", empty: "No gaps found." },
+];
+
+/** Requirement 7: what is known about this finding version, split by kind of source. */
+export function EvidenceSummaryPanel({ data, versionId }: { data: Workspace; versionId: string }) {
+  const sum = useMemo(() => buildEvidenceSummary(data as unknown as TimelineWorkspace, versionId), [data, versionId]);
+  return (
+    <article className="space-y-3 rounded-lg border border-line bg-card p-4" data-testid="evidence-summary">
+      <h2 className="text-xl">What the record says, by source</h2>
+      <p className="text-xs text-muted">Built only from stored records. It gives no diagnosis or treatment advice, and nearby context is not presented as a cause.</p>
+      {SUMMARY_SECTIONS.map((sec) => (
+        <section key={sec.key} className="space-y-1">
+          <Chip tone={sec.tone}>{sec.title}</Chip>
+          <ul className="list-disc pl-5 text-sm text-ink-soft">
+            {sum[sec.key].map((i, n) => (
+              <li key={`${i.ref ?? "x"}-${n}`}>
+                {i.text} <span className="text-xs text-muted">({i.source})</span>
+              </li>
+            ))}
+            {sum[sec.key].length === 0 && <li className="list-none text-xs text-muted">{sec.empty}</li>}
+          </ul>
+        </section>
+      ))}
+    </article>
   );
 }

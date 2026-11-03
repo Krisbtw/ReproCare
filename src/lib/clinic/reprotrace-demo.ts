@@ -150,3 +150,25 @@ export const DEMO_REPORTS: Record<DemoExam["key"], string[]> = {
     "Impression: Known anterior intramural fibroid, slightly larger.",
   ],
 };
+
+/**
+ * SYNTHETIC patient-reported context around the two demo examinations. Values are invented for the
+ * demonstration only and carry no clinical meaning; nothing links them causally to the imaging finding.
+ */
+export const DEMO_CONTEXT = {
+  symptoms: [
+    { on: "2025-02-26", region: "pelvis", intensity: 5, cycleDay: 2, text: "SYNTHETIC: cramping pain on day 2 of period (patient-reported)." },
+    { on: "2025-03-08", region: "pelvis", intensity: 3, cycleDay: 12, text: "SYNTHETIC: pelvic pressure (patient-reported)." },
+    { on: "2025-08-30", region: "pelvis", intensity: 6, cycleDay: 3, text: "SYNTHETIC: heavier cramping with period (patient-reported)." },
+    { on: "2025-09-10", region: "bladder", intensity: 4, cycleDay: 14, text: "SYNTHETIC: urinary frequency (patient-reported)." },
+  ],
+  cycles: [
+    { start: "2025-02-25", length: 28, flow: "heavy" },
+    { start: "2025-03-25", length: 29, flow: "heavy" },
+    { start: "2025-08-28", length: 27, flow: "heavy" },
+  ],
+  labs: [
+    { on: "2025-03-05", analyte: "Haemoglobin", value: "11.8", unit: "g/dL", ref: "12.0–15.5" },
+    { on: "2025-09-05", analyte: "Haemoglobin", value: "11.2", unit: "g/dL", ref: "12.0–15.5" },
+  ],
+};

@@ -453,6 +453,8 @@ export type Workspace = {
   reprotraceRuns?: Array<Record<string, string | number | boolean | null>>;
   /** Clinician decisions on extracted report observations (append-only). */
   observationLinks?: Array<Record<string, string | number | boolean | null>>;
+  /** Discrepancy reviews joined to the compared pair (left_ref/right_ref), across recomputes. */
+  discrepancyReviewHistory?: Array<Record<string, string | number | boolean | null>>;
 };
 
 export type ExportPayload = {

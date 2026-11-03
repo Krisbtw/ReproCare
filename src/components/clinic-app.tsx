@@ -50,9 +50,9 @@ import { AnatomyStage, type AnatomyItem } from "./anatomy-stage";
 import { CourseView } from "./course-view";
 import { ResearchView } from "./research-view";
 import { SliceBoard } from "./slice-board";
-import { VolumeLab } from "./volume-lab";
+import { VolumeLab, type SourceRequest } from "./volume-lab";
 import { ReportsView } from "./reports-view";
-import { EvidenceTrail, TraceReview, demoExamKeyForStudy } from "./reprotrace-panels";
+import { EvidenceSummaryPanel, EvidenceTrail, FindingHistory, PatientTimeline, TraceReview } from "./reprotrace-panels";
 import { LongitudinalTrends, type FindingHistoryPoint, type DiscrepancyItem } from "./longitudinal-trends";
 import type { SliceMark } from "@/lib/imaging/phantom";
 import type { Workspace } from "@/lib/clinic/types";
@@ -177,7 +177,7 @@ export function ClinicApp() {
   // Must be declared before any early return (React hook order).
   const [lens, setLens] = useState<string | null>(null);
   const [reportFocus, setReportFocus] = useState<{ reportId: string; start: number | null; end: number | null; nonce: number } | null>(null);
-  const [labDemo, setLabDemo] = useState<{ examKey: string; slice: number | null; nonce: number } | null>(null);
+  const [labDemo, setLabDemo] = useState<SourceRequest | null>(null);
   const [studioVersion, setStudioVersion] = useState<{ id: string; nonce: number } | null>(null);
 
   async function reload() {
@@ -330,10 +330,8 @@ export function ClinicApp() {
                 setReportFocus({ reportId, start, end, nonce: Date.now() });
                 setView("reports");
               }}
-              onOpenSlice={(studyId, slice) => {
-                const examKey = demoExamKeyForStudy(studyId);
-                if (!examKey) return;
-                setLabDemo({ examKey, slice, nonce: Date.now() });
+              onOpenSlice={(versionId, _studyId, seriesId, slice, examKey) => {
+                setLabDemo({ examKey, slice, nonce: Date.now(), patientId: s(patient, "id"), findingVersionId: versionId, seriesId });
                 setView("lab");
               }}
             />
@@ -352,6 +350,10 @@ export function ClinicApp() {
                 onRecord={(task) => run(task)}
                 recordFinding={(input) => saveLabMeasurement({ data: input })}
                 openDemo={labDemo}
+                onOpenEvidence={(id) => {
+                  setStudioVersion({ id, nonce: Date.now() });
+                  setView("studio");
+                }}
               />
             </div>
           )}
@@ -387,6 +389,7 @@ export function ClinicApp() {
               decide={(input) => decideCorrespondence({ data: input })}
               seedDemo={() => seedReproTraceDemo()}
               registerDemo={(patientId) => registerReproTraceDemo({ data: patientId })}
+              review={(input) => addReview({ data: input })}
               onOpenVersion={(id) => {
                 setStudioVersion({ id, nonce: Date.now() });
                 setView("studio");
@@ -732,7 +735,7 @@ function Studio({
   run: (task: () => Promise<unknown>) => Promise<void>;
   focusVersion?: { id: string; nonce: number } | null;
   onOpenReport?: (reportId: string, start: number | null, end: number | null) => void;
-  onOpenSlice?: (studyId: string, slice: number | null) => void;
+  onOpenSlice?: (versionId: string, studyId: string, seriesId: string, slice: number | null, demoExamKey: string | null) => void;
 }) {
   const studies = (data.studies as Bag[]).filter((st) => s(st, "patient_id") === s(patient, "id"));
   const [studyId, setStudyId] = useState(s(studies[studies.length - 1], "id"));
@@ -1140,8 +1143,14 @@ function Studio({
           data={data}
           versionId={s(chosen, "id")}
           onOpenReport={(reportId, start, end) => onOpenReport?.(reportId, start, end)}
-          onOpenSlice={(studyId, slice) => onOpenSlice?.(studyId, slice)}
+          onOpenSlice={(...a) => onOpenSlice?.(...a)}
         />
+      )}
+      {chosen && (
+        <>
+          <EvidenceSummaryPanel data={data} versionId={s(chosen, "id")} />
+          <FindingHistory data={data} findingId={s(chosen, "finding_id")} />
+        </>
       )}
       {chosen && trendHistory.length > 0 && (
         <div className="mt-6">
@@ -1326,6 +1335,7 @@ function Context({
         <h1 className="text-3xl">Symptoms, cycles, and labs</h1>
         <p className="max-w-2xl text-sm text-ink-soft">Patient-reported entries stay labeled as such. Nothing here diagnoses PCOS, endometriosis, or any other condition. The 2023 international PCOS guideline is the reason ovarian appearance is not treated as a diagnosis by itself.</p>
       </header>
+      <PatientTimeline data={data} patientId={pid} />
       {pcos && (
         <aside role="note" aria-label="PCOS context" className="rounded-lg border border-line bg-card p-4 text-sm">
           <p className="font-medium text-ink">{pcos.headline}</p>

@@ -783,3 +783,13 @@ export const getUnifiedPatientHistoryServer = createServerFn({ method: "POST" })
     const sql = await b.getSql();
     return b.executeGetUnifiedPatientHistory(sql, context.userId, patientId);
   });
+
+/** Original DICOM instances behind a finding's image anchor, via authorized integrity-checked storage. */
+export const loadSourceSeries = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: { patientId: string; findingVersionId?: string | null; seriesId?: string | null }) => input)
+  .handler(async ({ context, data }) => {
+    const b = await import("./server.backend.ts");
+    const sql = await b.getSql();
+    return b.executeLoadSourceSeries(sql, context.userId, data);
+  });

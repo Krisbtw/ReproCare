@@ -1,4 +1,14 @@
 import { DEMO_EXAMS, buildDemoSeriesFiles } from "@/lib/clinic/reprotrace-demo";
+import { loadSourceSeries } from "@/lib/clinic/server";
+
+export type SourceRequest = {
+  nonce: number;
+  slice: number | null;
+  examKey?: string | null;
+  patientId?: string | null;
+  findingVersionId?: string | null;
+  seriesId?: string | null;
+};
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { loadDicomParser, type DataSetLike } from "@/lib/dicom/codec";
 import { loadSeries, type LoadedSeries } from "@/lib/dicom/series-loader";
@@ -251,14 +261,21 @@ export function VolumeLab({
   onRecord,
   recordFinding,
   openDemo,
+  onOpenEvidence,
 }: {
-  /** Request to open a SYNTHETIC ReproTrace demo series at a stored source slice (from an evidence trail). */
-  openDemo?: { examKey: string; slice: number | null; nonce: number } | null;
+  /**
+   * Request (from an evidence trail) to open a finding's source series at its anchored slice. Stored
+   * DICOM instances are retrieved first; examKey enables a labelled synthetic-demo regeneration fallback.
+   */
+  openDemo?: SourceRequest | null;
+  /** Back-navigation from the opened source image to the finding evidence trail (report quote, provenance). */
+  onOpenEvidence?: (findingVersionId: string) => void;
   findings?: FindingChoice[];
   patientId?: string;
   onRecord?: (task: () => Promise<unknown>) => Promise<void>;
   recordFinding?: (input: RecordFindingInput) => Promise<unknown>;
 }) {
+  const [sourceNote, setSourceNote] = useState<{ origin: "stored" | "regenerated" | "unavailable"; text: string } | null>(null);
   const [opened, setOpened] = useState<Opened | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
   // A refused series still shows its report, so the person can see what to fix.
@@ -500,13 +517,54 @@ export function VolumeLab({
 
   useEffect(() => {
     if (!openDemo) return;
-    const exam = DEMO_EXAMS.find((e) => e.key === openDemo.examKey);
-    if (!exam) return;
     void (async () => {
+      setSourceNote(null);
+      // 1. Original stored DICOM instances through the authorized, SHA-256-verified storage path.
+      if (openDemo.patientId && (openDemo.findingVersionId || openDemo.seriesId)) {
+        setStatus("Retrieving the original DICOM instances from imaging storage…");
+        await tick();
+        try {
+          const r = await loadSourceSeries({
+            data: { patientId: openDemo.patientId, findingVersionId: openDemo.findingVersionId ?? null, seriesId: openDemo.seriesId ?? null },
+          });
+          if (r.available) {
+            const items = r.files.map((f) => {
+              const bin = atob(f.base64);
+              const bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+              return { name: f.name, bytes };
+            });
+            await ingest(items, "upload");
+            const slice = r.sliceIndex ?? openDemo.slice;
+            if (slice != null) setCursor((c) => [c[0], c[1], slice]);
+            setSourceNote({
+              origin: "stored",
+              text: `Original stored DICOM: ${r.integrity.verified} instance(s), SHA-256 verified${r.integrity.failed ? `, ${r.integrity.failed} failed` : ""}. Anchored slice ${slice ?? "not recorded"}${r.sopInstanceUid ? ` · SOP …${r.sopInstanceUid.slice(-10)}` : ""}${r.frameNumber != null ? ` · frame ${r.frameNumber}` : ""}. Finding position: ${r.centroidLps ? `[${r.centroidLps.map((x) => x.toFixed(1)).join(", ")}] mm (${r.coordinateFrame ?? "frame?"})` : "no patient-space coordinate stored"}.`,
+            });
+            return;
+          }
+          if (!openDemo.examKey) {
+            setStatus(null);
+            setSourceNote({ origin: "unavailable", text: `Source image unavailable: ${r.reason ?? "no stored instances"}` });
+            return;
+          }
+          setSourceNote({ origin: "regenerated", text: `Stored instances unavailable (${r.reason}). Showing the SYNTHETIC series regenerated from its generator parameters instead.` });
+        } catch (e) {
+          if (!openDemo.examKey) {
+            setStatus(null);
+            setSourceNote({ origin: "unavailable", text: `Source image could not be retrieved: ${e instanceof Error ? e.message : "error"}` });
+            return;
+          }
+        }
+      }
+      // 2. Synthetic demo fallback: deterministic regeneration, labelled as such.
+      const exam = DEMO_EXAMS.find((e) => e.key === openDemo.examKey);
+      if (!exam) return;
       setStatus("Regenerating the synthetic demo series…");
       await tick();
       await ingest(buildDemoSeriesFiles(exam), "sample");
       if (openDemo.slice != null) setCursor((c) => [c[0], c[1], openDemo.slice as number]);
+      setSourceNote((n) => n ?? { origin: "regenerated", text: "SYNTHETIC series regenerated from generator parameters." });
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openDemo?.nonce]);
@@ -959,6 +1017,19 @@ export function VolumeLab({
         {status && (
           <p role="status" className="text-sm text-pine" data-testid="lab-status">
             {status}
+          </p>
+        )}
+        {sourceNote && (
+          <p
+            className={`rounded-md px-3 py-2 text-sm ${sourceNote.origin === "stored" ? "bg-pine-soft text-pine" : "bg-clay-soft text-clay"}`}
+            data-testid="lab-source-note"
+          >
+            {sourceNote.text}
+            {openDemo?.findingVersionId && onOpenEvidence && (
+              <button type="button" className="ml-2 underline" data-testid="lab-back-to-evidence" onClick={() => onOpenEvidence(openDemo.findingVersionId as string)}>
+                Back to finding evidence and report quote
+              </button>
+            )}
           </p>
         )}
         {error && (

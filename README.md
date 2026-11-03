@@ -55,23 +55,30 @@ ReproCare does **not** autonomously diagnose, prescribe, or claim regulatory cle
 
 ---
 
-## 3. Verification & Test Results (`593 / 593` Automated Tests Passing)
+## 3. Verification & Test Results
 
 ```bash
 # 1. Verify authentication invariant gate
 npm run check:auth
 
-# 2. Run all 39 TypeScript application test suites (282 passing tests, including end-to-end hackathon demo test)
+# 2. Run the TypeScript application test suites
 npm run test:app
 
-# 3. Run all 9 scaffold, migration advisory-lock & production Dockerfile test suites (200 passing tests)
+# 3. Run the scaffold, migration advisory-lock & production Dockerfile test suites
 npm run test:scaffold
 
-# 4. Run all 13 Python imaging-service & 3D U-Net test suites (111 passing tests)
+# 4. Run the Python imaging-service test suites
 cd imaging-service && ANATOMYBRIDGE_DEV_NO_AUTH=1 python -m pytest tests/ -v --tb=short
 ```
 
-### Verified Test Summary (2026-11-02)
+### Verified Test Summary (2026-11-03, local Windows run)
+- **TypeScript Application Tests (`test:app`)**: **322 passed, 0 failed, 0 skipped** (includes `src/lib/clinic/reprotrace-workflow.test.ts`, 11 tests, and `src/lib/reprotrace/scenarios.test.ts`, 16 tests).
+- **Scaffold Tests (`test:scaffold`)**: **201 passed, 0 failed**.
+- **TypeScript strict check (`tsc --noEmit`)** clean; **`npm run build`** succeeds.
+- **Python tests**: not re-run on 2026-11-03 (no Python interpreter on the verifying machine). Last recorded result below.
+- **CI / Docker / Vercel / Supabase**: not re-verified on 2026-11-03.
+
+### Earlier Test Summary (2026-11-02, historical)
 - **TypeScript Application Tests (`test:app`)**: **282 passed, 0 failed** across 39 `.test.ts` files (including `src/lib/clinic/hackathon-demo-e2e.test.ts`).
 - **Scaffold & Production Architecture Tests (`test:scaffold`)**: **200 passed, 0 failed** across 9 `scripts/*.test.mjs` files.
 - **Python Medical Imaging & AI Tests (`pytest`)**: **111 passed, 0 failed** across 13 `imaging-service/tests/test_*.py` files.

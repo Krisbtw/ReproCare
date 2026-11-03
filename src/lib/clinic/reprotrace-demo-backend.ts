@@ -16,6 +16,24 @@ import {
   requireVerifiedClinicianOrAdmin,
 } from "./server.backend.ts";
 import { writeAuditEvent } from "../imaging/storage.ts";
+import { buildDemoSeriesFiles, DEMO_CONTEXT } from "./reprotrace-demo.ts";
+import { storeSeriesInstances } from "./source-image.ts";
+
+/** SYNTHETIC patient-reported context (symptoms, cycles, one lab) around the two demo examinations. */
+async function seedDemoContext(sql: Sql, userId: string, patientId: string) {
+  for (const [i, s] of DEMO_CONTEXT.symptoms.entries()) {
+    await sql`insert into symptoms (id, user_id, patient_id, recorded_on, region, intensity, cycle_day, description, source)
+      values (${kid(userId, `rt-sym-${i}`)}, ${userId}, ${patientId}, ${s.on}, ${s.region}, ${s.intensity}, ${s.cycleDay}, ${s.text}, ${"patient_reported"})`;
+  }
+  for (const [i, c] of DEMO_CONTEXT.cycles.entries()) {
+    await sql`insert into cycles (id, user_id, patient_id, start_date, length_days, flow, note)
+      values (${kid(userId, `rt-cyc-${i}`)}, ${userId}, ${patientId}, ${c.start}, ${c.length}, ${c.flow}, ${"SYNTHETIC patient-reported cycle"})`;
+  }
+  for (const [i, l] of DEMO_CONTEXT.labs.entries()) {
+    await sql`insert into labs (id, user_id, patient_id, observed_on, analyte, value_text, unit, reference_text, source_note)
+      values (${kid(userId, `rt-lab-${i}`)}, ${userId}, ${patientId}, ${l.on}, ${l.analyte}, ${l.value}, ${l.unit}, ${l.ref}, ${"SYNTHETIC laboratory value (demo only)"})`;
+  }
+}
 
 const kid = (userId: string, key: string) => `${userId}:${key}`;
 
@@ -82,10 +100,25 @@ export async function executeSeedReproTraceDemo(sql: Sql, rawUserId: string) {
         ${`synthetic-series:${ex.key}`}
       )`;
   }
+  await seedDemoContext(sql, userId, patientId);
   await sql`update profiles set active_patient_id = ${patientId} where user_id = ${userId}`;
+  // Store the generated DICOM bytes as ordinary imaging objects so source-image navigation uses the same
+  // authorized, integrity-checked storage path as uploaded examinations.
+  const storage: string[] = [];
+  for (const ex of DEMO_EXAMS) {
+    const r = await storeSeriesInstances(sql, userId, {
+      patientId,
+      studyId: kid(userId, ex.key),
+      seriesId: kid(userId, ex.seriesKey),
+      files: buildDemoSeriesFiles(ex),
+      sopUid: (i) => `${ex.spec.sopRoot}.${1000 + i}`,
+      note: "SYNTHETIC generated DICOM instance (ReproTrace demo).",
+    });
+    storage.push(r.error ? `${ex.key}: ${r.stored} stored, then failed (${r.error})` : `${ex.key}: ${r.stored} instances stored`);
+  }
   await writeAuditEvent(sql, userId, "seed_reprotrace_demo", "patient", patientId,
-    "Synthetic ReproTrace demo patient loaded. No correspondence was seeded; run Recompute to compute it.");
-  return { ok: true, patientId, created: true };
+    `Synthetic ReproTrace demo patient loaded. No correspondence was seeded; run Recompute to compute it. Imaging storage: ${storage.join("; ")}.`);
+  return { ok: true, patientId, created: true, storage };
 }
 
 /**

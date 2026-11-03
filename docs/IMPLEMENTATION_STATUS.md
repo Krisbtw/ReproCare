@@ -1,6 +1,6 @@
 # ReproCare / AnatomyBridge — Implementation Status & Acceptance Matrix
 
-**Last Updated:** 2026-11-02  
+**Last Updated:** 2026-11-03  
 **Repository:** [Krisbtw/ReproCare](https://github.com/Krisbtw/ReproCare)
 
 ---
@@ -39,3 +39,39 @@
   1. **Workstream 2B/2D (Real 300-Patient UMD Training Run):** Requires mounting the external [UMD Figshare NIfTI dataset](https://pmc.ncbi.nlm.nih.gov/articles/PMC11035617/) on a PyTorch GPU/CPU training machine and executing `python train_umd.py --data-dir /path/to/umd --output-checkpoint models/umd_unet3d.pt`.
   2. **Workstream 5E & 6A (Multi-Center Clinical Validation):** Requires Institutional Ethics Committee (IEC) approval and prospective multi-scanner clinical MRI and scanned-report validation cohorts.
   3. **Workstream 8 (Regulatory & Legal Sign-Off):** Requires formal regulatory classification confirmation and licensing under CDSCO MDR-2017 and legal review of DPDP Act 2023 / Rules 2025 compliance before any clinical use.
+
+---
+
+## ReproTrace prototype completion (2026-11-03)
+
+Status of the seven ReproTrace capabilities. Software status only: **nothing here is clinically validated**. Rule thresholds are unvalidated heuristics.
+
+| Req | Capability | Status | Evidence |
+| :-- | :-- | :-- | :-- |
+| 1 | Anatomical evidence linking | Prototype complete | `reports/candidates.ts`, `observation-links.ts`, `provenance.ts`. Original DICOM reopens through `clinic/source-image.ts` (authorized, SHA-256-verified, audited; no URLs exposed). A series with no stored pixels is reported as unavailable. Tests: `reprotrace-workflow.test.ts`. |
+| 2 | Cross-exam correspondence | Prototype complete | `reprotrace/engine.ts`; live `recomputeCorrespondence` writes `reprotrace_runs`; 10 scenarios in `reprotrace/scenarios.test.ts`. |
+| 3 | Discrepancy & uncertainty | Prototype complete | The existing 7-category attribution runs on every recompute, including pairs already decided. Review UI (confirm / reject / further review + annotation) uses append-only `reviews`. Review history is keyed by the compared pair, so it survives recomputes. |
+| 4 | Spatially anchored 3D | Prototype complete (synthetic) | Volume Lab opens the stored series at the anchored slice and shows SOP UID + LPS position, with a link back to the evidence trail / report quote. No new geometry checks this round; existing ones in `dicom/interoperability.test.ts` and `imaging/patient-coords.test.ts`. |
+| 5 | Longitudinal evidence | Prototype complete | `clinic/timeline.ts#buildFindingHistory` (Studio "Finding history"): versions, evidence, verifications, proposals, decisions, discrepancies, reviews. Accepted links relate findings without merging them. |
+| 6 | Patient-reported context | Prototype complete | `buildPatientTimeline` (Context → "Examination timeline with context"). Every item has its source; proximity to an exam (±30 days) is shown but never presented as a cause. |
+| 7 | Evidence-grounded communication | Prototype complete | `buildEvidenceSummary` (Studio panel): verified / extracted / algorithm suggestion / unresolved discrepancy / context / missing evidence, each item with its source reference. |
+
+**Synthetic demo patient** ("ReproTrace demo (synthetic)", ReproTrace → Load demo):
+- two generated MRI series, stored as ordinary imaging objects
+- two reports
+- symptoms, cycles and haemoglobin values, all labelled SYNTHETIC
+- no seeded correspondences
+
+Finding geometry is the generator's ground truth (`synthetic_phantom_ground_truth`), not a segmentation.
+
+**Not available:**
+- validated or trained U-Net weights
+- clinical validation
+
+**Not verified 2026-11-03:**
+- production migration 0015 on Supabase
+- Supabase bucket configuration
+- Vercel deployment
+- Docker
+- CI
+- Python tests

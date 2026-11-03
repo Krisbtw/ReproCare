@@ -5,12 +5,17 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { PGlite } from "@electric-sql/pglite";
 import type { Sql } from "../db.ts";
 import {
+  executeAddReview,
   executeDecideCorrespondence,
+  executeGetWorkspace,
+  executeLoadSourceSeries,
   executeRecomputeReproTrace,
   executeRegisterReproTraceDemo,
   executeResolveReportObservation,
@@ -19,6 +24,7 @@ import {
 } from "./server.backend.ts";
 import { DEMO_REPORTS } from "./reprotrace-demo.ts";
 import { buildEvidenceChain } from "../reports/provenance.ts";
+import { buildEvidenceSummary, buildFindingHistory, buildPatientTimeline, type TimelineWorkspace } from "./timeline.ts";
 
 const FILES = [
   "0002_anatomybridge.sql",
@@ -37,6 +43,7 @@ const FILES = [
 ];
 const SQL_ALL = FILES.map((f) => readFileSync(new URL(`../../../migrations/${f}`, import.meta.url), "utf8")).join("\n");
 
+process.env.REPROCARE_IMAGING_STORAGE_DIR = mkdtempSync(join(tmpdir(), "reprotrace-src-"));
 const pg = new PGlite();
 const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
   let q = strings[0];
@@ -213,4 +220,81 @@ test("RBAC: patient cannot recompute or resolve observations", async () => {
     () => executeResolveReportObservation(sql, "pat_demo", { reportId: "x", observationIndex: 0, decision: "leave_unlinked", note: "nope" }),
     /Unauthorized/,
   );
+});
+
+test("Req 1.4: source image reopens from stored DICOM (authorized, SHA-256 verified), not regenerated", async () => {
+  await ready;
+  const r = await executeLoadSourceSeries(sql, DR, { patientId: PID, findingVersionId: V1 });
+  assert.equal(r.available, true, r.reason ?? "");
+  assert.equal(r.seriesId, `${DR}:rtdemo-ex1-s`);
+  assert.ok(r.files.length > 10);
+  assert.equal(r.integrity.failed, 0);
+  assert.equal(r.sliceIndex, 10);
+  assert.deepEqual(r.centroidLps, [6, -4, 0]);
+  assert.ok(r.anchorFileIndex != null && r.files[r.anchorFileIndex].sopInstanceUid === r.sopInstanceUid, "anchor SOP is among stored instances");
+  const bytes = Buffer.from(r.files[0].base64, "base64");
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), r.files[0].sha256);
+  assert.equal(String.fromCharCode(...bytes.subarray(128, 132)), "DICM");
+  // Patient account / outsider cannot pull the pixels.
+  await assert.rejects(() => executeLoadSourceSeries(sql, "pat_demo", { patientId: PID, findingVersionId: V1 }));
+  // Series without stored pixels -> explicit unavailable, never fabricated.
+  await pg.exec(`insert into series (id, user_id, study_id, series_number, description, quality) values ('${DR}:bare', '${DR}', '${EX1}', 9, 'no pixels', 'adequate')`);
+  const bare = await executeLoadSourceSeries(sql, DR, { patientId: PID, seriesId: `${DR}:bare` });
+  assert.equal(bare.available, false);
+  assert.match(bare.reason ?? "", /No original DICOM/);
+});
+
+test("Req 6: synthetic patient-reported context is stored alongside the examinations", async () => {
+  await ready;
+  const sym = await rows<{ source: string; description: string }>("select source, description from symptoms where patient_id = $1", [PID]);
+  assert.ok(sym.length >= 2 && sym.every((s) => s.source === "patient_reported" && s.description.startsWith("SYNTHETIC")));
+  assert.ok((await rows("select id from cycles where patient_id = $1", [PID])).length >= 2);
+  assert.ok((await rows("select id from labs where patient_id = $1", [PID])).length >= 1);
+});
+
+test("Req 3: live recompute attributes the cross-exam difference with sources; clinician review is append-only", async () => {
+  await ready;
+  await executeRecomputeReproTrace(sql, DR, PID);
+  const d = (await rows<Record<string, unknown>>("select * from discrepancies where patient_id = $1 and active and left_ref = $2 and right_ref = $3", [PID, V1, V2]))[0];
+  assert.ok(d, "a discrepancy for the demo pair is computed live: " + JSON.stringify(await rows("select left_ref, right_ref, active, category from discrepancies where patient_id = $1", [PID])));
+  assert.ok(String(d.detail).length > 20, "reasoning is stored");
+  assert.notEqual(d.attribution_category ?? d.category, null);
+  await executeAddReview(sql, DR, { targetType: "discrepancy", targetId: String(d.id), status: "needs_more_information", note: "SYNTHETIC: check spacing first." });
+  await executeAddReview(sql, DR, { targetType: "discrepancy", targetId: String(d.id), status: "verified", note: "SYNTHETIC: attribution accepted." });
+  const hist = await rows<{ status: string }>("select status from reviews where target_type = 'discrepancy' and target_id = $1 order by created_at", [d.id]);
+  assert.deepEqual(hist.map((h) => h.status), ["needs_more_information", "verified"]);
+  const still = (await rows<{ detail: string }>("select detail from discrepancies where id = $1", [d.id]))[0];
+  assert.equal(still.detail, d.detail, "original attribution text untouched");
+  // Finding versions are not merged or rewritten by any of the above.
+  const vs = await rows("select id from finding_versions where id in ($1, $2)", [V1, V2]);
+  assert.equal(vs.length, 2);
+});
+
+test("Req 5/6/7: timeline, finding history and six-category summary are built from persisted records", async () => {
+  await ready;
+  const ws = (await executeGetWorkspace(sql, DR)) as unknown as TimelineWorkspace;
+  // Req 6: one timeline with sources; context near exam 1 is flagged as near, never as causal.
+  const tl = buildPatientTimeline(ws, PID);
+  const kinds = new Set(tl.map((i) => i.kind));
+  for (const k of ["examination", "report", "finding", "symptom", "cycle", "lab", "decision"]) assert.ok(kinds.has(k as never), `timeline has ${k}`);
+  const sym = tl.find((i) => i.kind === "symptom" && i.date === "2025-03-08")!;
+  assert.equal(sym.source, "patient_reported");
+  assert.deepEqual(sym.nearExaminations, [EX1]);
+  assert.ok(tl.every((i, j) => j === 0 || tl[j - 1].date <= i.date), "chronological");
+  assert.ok(!tl.some((i) => /caus|because|due to/i.test(i.detail + i.title)), "no causal language");
+
+  // Req 5: accepted correspondence relates F1 and F2 without merging; both version histories retrievable.
+  const h = buildFindingHistory(ws, `${DR}:rtdemo-f1`);
+  assert.deepEqual(h.relatedFindingIds, [`${DR}:rtdemo-f2`]);
+  const vs = h.events.filter((e) => e.kind === "version").map((e) => e.versionId).sort();
+  assert.deepEqual(vs, [V1, V2].sort());
+  for (const k of ["evidence", "correspondence", "decision", "discrepancy", "discrepancy_review"]) assert.ok(h.events.some((e) => e.kind === k), `history has ${k}`);
+
+  // Req 7: categories are separated; algorithm output is not presented as verified.
+  const sum = buildEvidenceSummary(ws, V1);
+  assert.ok(sum.clinicianVerified.some((i) => /linked by clinician/.test(i.text) && /p\.2/.test(i.source)), "verified quote with page");
+  assert.ok(sum.patientReported.some((i) => /patient-reported/.test(i.source)));
+  assert.ok(sum.patientReported.some((i) => /laboratory record/.test(i.source)), "lab kept distinct by source");
+  assert.ok(sum.missingEvidence.some((i) => /SYNTHETIC/.test(i.text)), "synthetic geometry disclosed");
+  assert.ok(!sum.clinicianVerified.some((i) => /rule-based engine/.test(i.source)));
 });
